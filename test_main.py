@@ -1,489 +1,303 @@
 """
-Data Cleaning Proxy API
------------------------
-Stateless, single-file FastAPI service that accepts a .csv or .xlsx upload
-and applies column-level cleaning rules defined in a JSON config.
-
-Config shape (passed as header X-Clean-Config or form field `config`):
-{
-  "columns": {
-    "email":  ["lowercase", "strip", "drop_empty"],
-    "age":    ["to_int",   "clamp:0:120"],
-    "name":   ["strip",    "title_case"],
-    "score":  ["to_float", "fill_mean"]
-  },
-  "output_format": "csv"   // "csv" | "json"  (default: csv)
-}
-
-Supported rules (applied left-to-right per cell):
-  strip        – remove leading/trailing whitespace
-  lowercase    – .lower()
-  uppercase    – .upper()
-  title_case   – .title()
-  drop_empty   – mark blank/null cells; rows where ANY drop_empty column is
-                 empty are removed after per-cell passes
-  to_int       – coerce to int, null on failure
-  to_float     – coerce to float, null on failure
-  fill_mean    – replace nulls with column mean  (numeric columns only)
-  fill_median  – replace nulls with column median
-  fill_value:X – replace nulls with literal X
-  clamp:lo:hi  – numeric clamp  (lo/hi may be empty to skip one bound)
-  regex:PAT:REPL – re.sub(PAT, REPL, value)
+test_main.py  –  test suite for the data cleaning proxy
+Run:  pytest test_main.py -v
+Deps: pip install pytest httpx fastapi openpyxl python-multipart
 """
 
-from __future__ import annotations
-
-import csv
-import datetime
 import io
 import json
-import math
-import re
-import statistics
-from typing import Any
+import csv
+import datetime
 
 import openpyxl
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+import pytest
+from fastapi.testclient import TestClient
+
+from main import app, clean_phone_ke, clean_name, clean_date
+
+client = TestClient(app)
 
 # ---------------------------------------------------------------------------
-# App
+# Helpers
 # ---------------------------------------------------------------------------
 
-app = FastAPI(
-    title="Data Cleaning Proxy",
-    description="Stateless in-memory CSV/XLSX cleaner driven by a JSON rule config.",
-    version="1.0.0",
-)
-
-# ---------------------------------------------------------------------------
-# Types
-# ---------------------------------------------------------------------------
-
-Row = dict[str, Any]
-Sheet = list[Row]
-
-# ---------------------------------------------------------------------------
-# Parsing helpers  (entirely in-memory – no disk I/O)
-# ---------------------------------------------------------------------------
-
-
-def _parse_csv(data: bytes) -> Sheet:
-    text = data.decode("utf-8-sig")          # handles BOM
-    reader = csv.DictReader(io.StringIO(text))
-    return [dict(row) for row in reader]
-
-
-def _parse_xlsx(data: bytes) -> Sheet:
-    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return []
-    headers = [str(c) if c is not None else f"col_{i}" for i, c in enumerate(rows[0])]
-    return [dict(zip(headers, row)) for row in rows[1:]]
-
-
-def parse_file(filename: str, data: bytes) -> Sheet:
-    lower = filename.lower()
-    if lower.endswith(".csv"):
-        return _parse_csv(data)
-    if lower.endswith(".xlsx"):
-        return _parse_xlsx(data)
-    raise HTTPException(
-        status_code=415,
-        detail="Unsupported file type. Only .csv and .xlsx are accepted.",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Rule engine
-# ---------------------------------------------------------------------------
-
-
-def _to_number(v: Any) -> float | None:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Typed rule implementations
-# ---------------------------------------------------------------------------
-
-# ── PHONE ────────────────────────────────────────────────────────────────────
-# Accepted Kenyan formats (input) → canonical output: 2547XXXXXXXX / 2541XXXXXXXX
-#
-#   07XXXXXXXX   →  2547XXXXXXXX   (10-digit local mobile)
-#   01XXXXXXXX   →  2541XXXXXXXX   (10-digit local landline/special)
-#   7XXXXXXXX    →  2547XXXXXXXX   (9-digit, missing leading 0)
-#   1XXXXXXXX    →  2541XXXXXXXX   (9-digit, missing leading 0)
-#   2547XXXXXXXX →  unchanged       (already canonical)
-#   2541XXXXXXXX →  unchanged
-#   anything else → None
-
-_KE_PHONE_RE = re.compile(r"^254[71]\d{8}$")
-
-
-def clean_phone_ke(value: Any) -> str | None:
-    """Normalise a Kenyan phone number to E.164-style 254XXXXXXXXX (12 digits)."""
-    if value is None:
-        return None
-
-    # Accept integer inputs (e.g. from Excel numeric cells)
-    raw = str(int(value)) if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
-
-    # Strip every non-digit character (spaces, dashes, plus, parentheses, etc.)
-    digits = re.sub(r"\D", "", raw)
-
-    if not digits:
-        return None
-
-    # Normalise leading country-code variants
-    if digits.startswith("0") and len(digits) == 10:
-        # 07XXXXXXXX or 01XXXXXXXX
-        digits = "254" + digits[1:]
-    elif len(digits) == 9 and digits[0] in ("7", "1"):
-        # 7XXXXXXXX or 1XXXXXXXX — missing leading zero
-        digits = "254" + digits
-    elif digits.startswith("254") and len(digits) == 12:
-        pass  # already canonical — validate below
-    else:
-        return None  # unrecognised format
-
-    # Final validation: must be 2547XXXXXXXX or 2541XXXXXXXX (12 digits total)
-    if _KE_PHONE_RE.match(digits):
-        return digits
-    return None
-
-
-# ── NAME ─────────────────────────────────────────────────────────────────────
-
-def clean_name(value: Any) -> str | None:
-    """Strip surrounding whitespace and apply title-case."""
-    if value is None:
-        return None
-    cleaned = str(value).strip()
-    return cleaned.title() if cleaned else None
-
-
-# ── DATE ─────────────────────────────────────────────────────────────────────
-
-# Excel date serial epoch (Windows 1900 date system, accounting for the
-# erroneous 1900 leap-year bug that Excel perpetuates).
-_EXCEL_EPOCH = datetime.date(1899, 12, 30)
-
-# String formats tried in order before falling back to dateutil
-_DATE_FORMATS = [
-    "%Y-%m-%d",    # ISO already
-    "%d/%m/%Y",    # DD/MM/YYYY  (common in Kenya / UK)
-    "%m/%d/%Y",    # MM/DD/YYYY  (US)
-    "%d-%m-%Y",    # DD-MM-YYYY
-    "%d.%m.%Y",    # DD.MM.YYYY
-    "%Y/%m/%d",    # YYYY/MM/DD
-    "%d %b %Y",    # 01 Jan 2024
-    "%d %B %Y",    # 01 January 2024
-    "%b %d, %Y",   # Jan 01, 2024
-    "%B %d, %Y",   # January 01, 2024
-]
-
-
-def clean_date(value: Any) -> str | None:
-    """Parse a date value and return it as an ISO-8601 string (YYYY-MM-DD), or None."""
-    if value is None:
-        return None
-
-    # ── Already a Python date/datetime (openpyxl returns these for date cells) ─
-    if isinstance(value, datetime.datetime):
-        return value.date().isoformat()
-    if isinstance(value, datetime.date):
-        return value.isoformat()
-
-    # ── Excel date serial number (integer or float like 45000.0) ─────────────
-    raw_str = str(value).strip()
-    if re.match(r"^\d{1,6}(\.\d+)?$", raw_str):
-        try:
-            serial = int(float(raw_str))
-            # Plausible Excel serial range: 1 (1900-01-01) – 2958465 (9999-12-31)
-            if 1 <= serial <= 2958465:
-                parsed = _EXCEL_EPOCH + datetime.timedelta(days=serial)
-                # Sanity-check: reject implausibly old dates (< 1900) returned by
-                # very small serials that are more likely plain integers.
-                if parsed.year >= 1900:
-                    return parsed.isoformat()
-        except (ValueError, OverflowError):
-            pass
-
-    # ── String formats ────────────────────────────────────────────────────────
-    for fmt in _DATE_FORMATS:
-        try:
-            return datetime.datetime.strptime(raw_str, fmt).date().isoformat()
-        except ValueError:
-            continue
-
-    # Unrecognised — return None rather than corrupt data
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Typed-rule dispatcher  +  PASS_THROUGH fallback
-# ---------------------------------------------------------------------------
-
-_TYPED_RULES = {"PHONE", "NAME", "DATE"}
-
-
-def apply_typed_rule(rule: str, value: Any) -> Any:
-    """
-    Dispatch one of the three semantic rules.  Returns the cleaned value, or
-    None when the input cannot be normalised to the expected format.
-    """
-    if rule == "PHONE":
-        return clean_phone_ke(value)
-    if rule == "NAME":
-        return clean_name(value)
-    if rule == "DATE":
-        return clean_date(value)
-    # Fallback: delegate to the legacy per-token engine
-    return apply_rule(rule, value)
-
-
-def process_row(row: Row, column_rules: dict[str, list[str]]) -> Row:
-    """
-    Apply cleaning rules to every field in *row*.
-
-    • Columns present in *column_rules* are processed through their rule list
-      (typed rules take precedence; legacy rules are applied token-by-token).
-    • Columns NOT in *column_rules* receive PASS_THROUGH treatment:
-      convert to str and strip — value is otherwise left untouched.
-    """
-    out: Row = {}
-    for col, value in row.items():
-        rules = column_rules.get(col)
-        if rules is None:
-            # PASS_THROUGH: coerce to str, strip whitespace, preserve value
-            out[col] = str(value).strip() if value is not None else value
-        else:
-            current = value
-            for rule in rules:
-                if rule in _TYPED_RULES:
-                    current = apply_typed_rule(rule, current)
-                    # Typed rules are terminal within their semantic domain;
-                    # subsequent rules still run (e.g. a drop_empty after PHONE).
-                else:
-                    current = apply_rule(rule, current)
-            out[col] = current
-    return out
-
-
-def apply_rule(rule: str, value: Any) -> Any:
-    """Apply a single rule token to a scalar value."""
-    if rule == "strip":
-        return str(value).strip() if value is not None else value
-    if rule == "lowercase":
-        return str(value).lower() if value is not None else value
-    if rule == "uppercase":
-        return str(value).upper() if value is not None else value
-    if rule == "title_case":
-        return str(value).title() if value is not None else value
-    if rule == "to_int":
-        n = _to_number(value)
-        return int(n) if n is not None else None
-    if rule == "to_float":
-        return _to_number(value)
-    if rule == "drop_empty":
-        # Sentinel – handled at sheet level; return value unchanged here
-        return value
-    if rule.startswith("fill_value:"):
-        fill = rule.split(":", 1)[1]
-        return fill if (value is None or str(value).strip() == "") else value
-    if rule.startswith("clamp:"):
-        parts = rule.split(":")
-        lo = _to_number(parts[1]) if len(parts) > 1 and parts[1] != "" else None
-        hi = _to_number(parts[2]) if len(parts) > 2 and parts[2] != "" else None
-        n = _to_number(value)
-        if n is None:
-            return value
-        if lo is not None:
-            n = max(lo, n)
-        if hi is not None:
-            n = min(hi, n)
-        return n
-    if rule.startswith("regex:"):
-        _, pattern, replacement = rule.split(":", 2)
-        return re.sub(pattern, replacement, str(value)) if value is not None else value
-    # Unknown rules are ignored gracefully
-    return value
-
-
-def _column_numerics(sheet: Sheet, col: str) -> list[float]:
-    return [
-        float(row[col])
-        for row in sheet
-        if col in row and row[col] is not None and _to_number(row[col]) is not None
-    ]
-
-
-def apply_fill_stat(sheet: Sheet, col: str, stat: str) -> Sheet:
-    nums = _column_numerics(sheet, col)
-    if not nums:
-        return sheet
-    if stat == "fill_mean":
-        fill = statistics.mean(nums)
-    elif stat == "fill_median":
-        fill = statistics.median(nums)
-    else:
-        return sheet
-    for row in sheet:
-        v = row.get(col)
-        if v is None or str(v).strip() == "":
-            row[col] = fill
-    return sheet
-
-
-def clean_sheet(sheet: Sheet, column_rules: dict[str, list[str]]) -> Sheet:
-    """Apply all rules to every row; return the cleaned sheet."""
-
-    # ── Pass 1: per-cell rules (skip stat-fills, handled in pass 2) ──────────
-    stat_rules = {"fill_mean", "fill_median"}
-
-    # Build a view of column_rules that excludes deferred stat-fill tokens so
-    # process_row does not run them prematurely.  PASS_THROUGH columns (those
-    # absent from column_rules) are handled inside process_row automatically.
-    rules_pass1: dict[str, list[str]] = {
-        col: [r for r in rules if r not in stat_rules]
-        for col, rules in column_rules.items()
-    }
-    sheet = [process_row(row, rules_pass1) for row in sheet]
-
-    # ── Pass 2: column-level stat fills ──────────────────────────────────────
-    for col, rules in column_rules.items():
-        for rule in rules:
-            if rule in stat_rules:
-                sheet = apply_fill_stat(sheet, col, rule)
-
-    # ── Pass 3: drop rows where a drop_empty column is blank/null ────────────
-    drop_cols = {
-        col for col, rules in column_rules.items() if "drop_empty" in rules
-    }
-    if drop_cols:
-        sheet = [
-            row for row in sheet
-            if not any(
-                col in row and (row[col] is None or str(row[col]).strip() == "")
-                for col in drop_cols
-            )
-        ]
-
-    return sheet
-
-
-# ---------------------------------------------------------------------------
-# Serialisers
-# ---------------------------------------------------------------------------
-
-
-def _to_csv_bytes(sheet: Sheet) -> bytes:
-    if not sheet:
-        return b""
+def make_csv(rows: list[dict]) -> bytes:
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=list(sheet[0].keys()), lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(sheet)
+    w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()), lineterminator="\n")
+    w.writeheader()
+    w.writerows(rows)
     return buf.getvalue().encode()
 
 
-def _sanitise_for_json(sheet: Sheet) -> Sheet:
-    """Replace non-finite floats so json.dumps doesn't choke."""
-    clean = []
-    for row in sheet:
-        clean.append(
-            {
-                k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
-                for k, v in row.items()
-            }
-        )
-    return clean
+def make_xlsx(rows: list[dict]) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    headers = list(rows[0].keys())
+    ws.append(headers)
+    for row in rows:
+        ws.append([row[h] for h in headers])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
-# ---------------------------------------------------------------------------
-# Config resolution  (header takes precedence over form field)
-# ---------------------------------------------------------------------------
-
-
-def resolve_config(
-    header_config: str | None,
-    form_config: str | None,
-) -> dict:
-    raw = header_config or form_config
-    if not raw:
-        return {"columns": {}, "output_format": "csv"}
-    try:
-        cfg = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid JSON config: {exc}") from exc
-    cfg.setdefault("columns", {})
-    cfg.setdefault("output_format", "csv")
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# Endpoint
-# ---------------------------------------------------------------------------
-
-
-@app.post(
-    "/clean",
-    summary="Upload and clean a CSV or XLSX file",
-    responses={
-        200: {"description": "Cleaned file (CSV or JSON)"},
-        415: {"description": "Unsupported file type"},
-        422: {"description": "Validation / config error"},
-    },
-)
-async def clean_file(
-    file: UploadFile = File(..., description=".csv or .xlsx file to clean"),
-    config: str | None = Form(
-        default=None,
-        description="JSON cleaning config (overridden by X-Clean-Config header if present)",
-    ),
-    x_clean_config: str | None = Header(
-        default=None,
-        alias="X-Clean-Config",
-        description="JSON cleaning config (takes precedence over form field)",
-    ),
-):
-    # ── Read file bytes in-memory ─────────────────────────────────────────────
-    raw = await file.read()
-
-    # ── Parse ─────────────────────────────────────────────────────────────────
-    sheet = parse_file(file.filename or "", raw)
-
-    # ── Config ────────────────────────────────────────────────────────────────
-    cfg = resolve_config(x_clean_config, config)
-    column_rules: dict[str, list[str]] = cfg["columns"]
-    output_format: str = cfg["output_format"].lower()
-
-    # ── Clean ─────────────────────────────────────────────────────────────────
-    cleaned = clean_sheet(sheet, column_rules)
-
-    # ── Respond ───────────────────────────────────────────────────────────────
-    if output_format == "json":
-        return JSONResponse(content=_sanitise_for_json(cleaned))
-
-    csv_bytes = _to_csv_bytes(cleaned)
-    return StreamingResponse(
-        io.BytesIO(csv_bytes),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=cleaned.csv"},
+def post(file_bytes: bytes, config: dict, filename="data.csv"):
+    return client.post(
+        "/clean",
+        files={"file": (filename, file_bytes, "text/csv")},
+        data={"config": json.dumps(config)},
     )
 
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
+def parse_response_csv(response) -> list[dict]:
+    return list(csv.DictReader(io.StringIO(response.text)))
 
 
-@app.get("/health", include_in_schema=False)
-async def health():
-    return {"status": "ok"}
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+def test_health():
+    assert client.get("/health").json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def test_csv_parsed():
+    data = make_csv([{"name": "alice", "age": "30"}])
+    r = post(data, {"columns": {}, "output_format": "json"})
+    assert r.status_code == 200
+    assert r.json()[0]["name"] == "alice"
+
+
+def test_xlsx_parsed():
+    data = make_xlsx([{"name": "bob", "age": "25"}])
+    r = client.post(
+        "/clean",
+        files={"file": ("data.xlsx", data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"config": json.dumps({"columns": {}, "output_format": "json"})},
+    )
+    assert r.status_code == 200
+    assert r.json()[0]["name"] == "bob"
+
+
+def test_unsupported_file_type():
+    r = client.post(
+        "/clean",
+        files={"file": ("data.txt", b"hello", "text/plain")},
+        data={"config": json.dumps({"columns": {}})},
+    )
+    assert r.status_code == 415
+
+
+# ---------------------------------------------------------------------------
+# String rules (legacy)
+# ---------------------------------------------------------------------------
+
+def test_strip_and_lowercase():
+    data = make_csv([{"email": "  ALICE@Example.COM  "}])
+    r = post(data, {"columns": {"email": ["strip", "lowercase"]}, "output_format": "json"})
+    assert r.json()[0]["email"] == "alice@example.com"
+
+
+def test_title_case():
+    data = make_csv([{"name": "  john doe  "}])
+    r = post(data, {"columns": {"name": ["strip", "title_case"]}, "output_format": "json"})
+    assert r.json()[0]["name"] == "John Doe"
+
+
+# ---------------------------------------------------------------------------
+# Type coercion + clamp (legacy)
+# ---------------------------------------------------------------------------
+
+def test_to_int_and_clamp():
+    data = make_csv([{"age": "150"}, {"age": "-5"}, {"age": "25"}])
+    r = post(data, {"columns": {"age": ["to_int", "clamp:0:120"]}, "output_format": "json"})
+    ages = [row["age"] for row in r.json()]
+    assert ages == [120, 0, 25]
+
+
+def test_to_float_bad_value_becomes_null():
+    data = make_csv([{"score": "abc"}])
+    r = post(data, {"columns": {"score": ["to_float"]}, "output_format": "json"})
+    assert r.json()[0]["score"] is None
+
+
+# ---------------------------------------------------------------------------
+# drop_empty (legacy)
+# ---------------------------------------------------------------------------
+
+def test_drop_empty_removes_rows():
+    data = make_csv([
+        {"email": "a@b.com", "name": "Alice"},
+        {"email": "",        "name": "Bob"},
+        {"email": "c@d.com", "name": "Carol"},
+    ])
+    r = post(data, {"columns": {"email": ["drop_empty"]}, "output_format": "json"})
+    rows = r.json()
+    assert len(rows) == 2
+    assert all(row["email"] != "" for row in rows)
+
+
+# ---------------------------------------------------------------------------
+# fill_mean / fill_value (legacy)
+# ---------------------------------------------------------------------------
+
+def test_fill_mean():
+    data = make_csv([{"score": "10"}, {"score": ""}, {"score": "20"}])
+    r = post(data, {"columns": {"score": ["to_float", "fill_mean"]}, "output_format": "json"})
+    scores = [row["score"] for row in r.json()]
+    assert scores[1] == 15.0
+
+
+def test_fill_value():
+    data = make_csv([{"status": ""}, {"status": "active"}])
+    r = post(data, {"columns": {"status": ["fill_value:unknown"]}, "output_format": "json"})
+    assert r.json()[0]["status"] == "unknown"
+    assert r.json()[1]["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# regex rule (legacy)
+# ---------------------------------------------------------------------------
+
+def test_regex_rule():
+    data = make_csv([{"phone": "  +254-700-123456  "}])
+    r = post(data, {"columns": {"phone": ["strip", "regex:[^0-9]:"]},"output_format": "json"})
+    assert r.json()[0]["phone"] == "254700123456"
+
+
+# ---------------------------------------------------------------------------
+# Output formats (legacy)
+# ---------------------------------------------------------------------------
+
+def test_csv_output():
+    data = make_csv([{"name": "alice"}])
+    r = post(data, {"columns": {}, "output_format": "csv"})
+    assert r.status_code == 200
+    assert "text/csv" in r.headers["content-type"]
+    rows = parse_response_csv(r)
+    assert rows[0]["name"] == "alice"
+
+
+def test_json_output():
+    data = make_csv([{"name": "alice"}])
+    r = post(data, {"columns": {}, "output_format": "json"})
+    assert r.status_code == 200
+    assert r.json()[0]["name"] == "alice"
+
+
+# ---------------------------------------------------------------------------
+# Config via header (legacy)
+# ---------------------------------------------------------------------------
+
+def test_header_config_overrides_form():
+    data = make_csv([{"email": "  BOB@TEST.COM  "}])
+    header_cfg = json.dumps({"columns": {"email": ["strip", "lowercase"]}, "output_format": "json"})
+    form_cfg   = json.dumps({"columns": {}, "output_format": "json"})
+    r = client.post(
+        "/clean",
+        files={"file": ("data.csv", data, "text/csv")},
+        data={"config": form_cfg},
+        headers={"X-Clean-Config": header_cfg},
+    )
+    assert r.json()[0]["email"] == "bob@test.com"
+
+
+# ---------------------------------------------------------------------------
+# Invalid config (legacy)
+# ---------------------------------------------------------------------------
+
+def test_invalid_json_config_returns_422():
+    data = make_csv([{"name": "alice"}])
+    r = client.post(
+        "/clean",
+        files={"file": ("data.csv", data, "text/csv")},
+        data={"config": "not-valid-json"},
+    )
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# PHONE – unit tests
+# ---------------------------------------------------------------------------
+
+def test_phone_07_format():         assert clean_phone_ke("0712345678")    == "254712345678"
+def test_phone_01_format():         assert clean_phone_ke("0112345678")    == "254112345678"
+def test_phone_9digit_7():          assert clean_phone_ke("712345678")     == "254712345678"
+def test_phone_9digit_1():          assert clean_phone_ke("112345678")     == "254112345678"
+def test_phone_already_canonical(): assert clean_phone_ke("254712345678")  == "254712345678"
+def test_phone_with_spaces():       assert clean_phone_ke("  0712 345 678  ") == "254712345678"
+def test_phone_with_dashes():       assert clean_phone_ke("+254-712-345-678") == "254712345678"
+def test_phone_integer_input():     assert clean_phone_ke(712345678)       == "254712345678"
+def test_phone_invalid_short():     assert clean_phone_ke("12345")         is None
+def test_phone_invalid_prefix():    assert clean_phone_ke("0912345678")    is None
+def test_phone_none():              assert clean_phone_ke(None)            is None
+
+
+# ---------------------------------------------------------------------------
+# NAME – unit tests
+# ---------------------------------------------------------------------------
+
+def test_name_basic():       assert clean_name("  john doe  ")  == "John Doe"
+def test_name_all_caps():    assert clean_name("JANE SMITH")    == "Jane Smith"
+def test_name_already_ok():  assert clean_name("Alice Wanjiru") == "Alice Wanjiru"
+def test_name_none():        assert clean_name(None)            is None
+
+
+# ---------------------------------------------------------------------------
+# DATE – unit tests
+# ---------------------------------------------------------------------------
+
+def test_date_iso():           assert clean_date("2024-03-15")                       == "2024-03-15"
+def test_date_dmy_slash():     assert clean_date("15/03/2024")                       == "2024-03-15"
+def test_date_excel_serial():  assert clean_date("45366")                            == "2024-03-15"
+def test_date_none():          assert clean_date(None)                               is None
+def test_date_invalid():       assert clean_date("not-a-date")                       is None
+def test_date_python_date():   assert clean_date(datetime.date(2024, 3, 15))         == "2024-03-15"
+def test_date_python_datetime():assert clean_date(datetime.datetime(2024, 3, 15, 12, 0)) == "2024-03-15"
+
+
+# ---------------------------------------------------------------------------
+# Typed rules – integration via /clean endpoint
+# ---------------------------------------------------------------------------
+
+def test_endpoint_phone_rule():
+    data = make_csv([{"phone": "0712345678"}, {"phone": "bad"}, {"phone": "254712345678"}])
+    r = post(data, {"columns": {"phone": ["PHONE"]}, "output_format": "json"})
+    rows = r.json()
+    assert rows[0]["phone"] == "254712345678"
+    assert rows[1]["phone"] is None
+    assert rows[2]["phone"] == "254712345678"
+
+
+def test_endpoint_name_rule():
+    data = make_csv([{"name": "  wanjiru mwangi  "}])
+    r = post(data, {"columns": {"name": ["NAME"]}, "output_format": "json"})
+    assert r.json()[0]["name"] == "Wanjiru Mwangi"
+
+
+def test_endpoint_date_rule():
+    data = make_csv([{"dob": "15/03/2024"}])
+    r = post(data, {"columns": {"dob": ["DATE"]}, "output_format": "json"})
+    assert r.json()[0]["dob"] == "2024-03-15"
+
+
+def test_endpoint_pass_through_columns():
+    # 'notes' is not in column_rules — should pass through stripped
+    data = make_csv([{"name": "alice", "notes": "  some note  "}])
+    r = post(data, {"columns": {"name": ["NAME"]}, "output_format": "json"})
+    row = r.json()[0]
+    assert row["name"] == "Alice"
+    assert row["notes"] == "some note"
+
+
+def test_phone_drop_empty_combo():
+    # PHONE + drop_empty: invalid phones become None, those rows are dropped
+    data = make_csv([{"phone": "0712345678"}, {"phone": "bad"}])
+    r = post(data, {"columns": {"phone": ["PHONE", "drop_empty"]}, "output_format": "json"})
+    rows = r.json()
+    assert len(rows) == 1
+    assert rows[0]["phone"] == "254712345678"

@@ -34,16 +34,21 @@ Supported rules (applied left-to-right per cell):
 from __future__ import annotations
 
 import csv
+import datetime
 import io
 import json
+import logging
 import math
 import re
 import statistics
 from typing import Any
 
+import httpx
 import openpyxl
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # App
@@ -105,6 +110,174 @@ def _to_number(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Typed rule implementations
+# ---------------------------------------------------------------------------
+
+# ── PHONE ────────────────────────────────────────────────────────────────────
+# Accepted Kenyan formats (input) → canonical output: 2547XXXXXXXX / 2541XXXXXXXX
+#
+#   07XXXXXXXX   →  2547XXXXXXXX   (10-digit local mobile)
+#   01XXXXXXXX   →  2541XXXXXXXX   (10-digit local landline/special)
+#   7XXXXXXXX    →  2547XXXXXXXX   (9-digit, missing leading 0)
+#   1XXXXXXXX    →  2541XXXXXXXX   (9-digit, missing leading 0)
+#   2547XXXXXXXX →  unchanged       (already canonical)
+#   2541XXXXXXXX →  unchanged
+#   anything else → None
+
+_KE_PHONE_RE = re.compile(r"^254[71]\d{8}$")
+
+
+def clean_phone_ke(value: Any) -> str | None:
+    """Normalise a Kenyan phone number to E.164-style 254XXXXXXXXX (12 digits)."""
+    if value is None:
+        return None
+
+    # Accept integer inputs (e.g. from Excel numeric cells)
+    raw = str(int(value)) if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
+
+    # Strip every non-digit character (spaces, dashes, plus, parentheses, etc.)
+    digits = re.sub(r"\D", "", raw)
+
+    if not digits:
+        return None
+
+    # Normalise leading country-code variants
+    if digits.startswith("0") and len(digits) == 10:
+        # 07XXXXXXXX or 01XXXXXXXX
+        digits = "254" + digits[1:]
+    elif len(digits) == 9 and digits[0] in ("7", "1"):
+        # 7XXXXXXXX or 1XXXXXXXX — missing leading zero
+        digits = "254" + digits
+    elif digits.startswith("254") and len(digits) == 12:
+        pass  # already canonical — validate below
+    else:
+        return None  # unrecognised format
+
+    # Final validation: must be 2547XXXXXXXX or 2541XXXXXXXX (12 digits total)
+    if _KE_PHONE_RE.match(digits):
+        return digits
+    return None
+
+
+# ── NAME ─────────────────────────────────────────────────────────────────────
+
+def clean_name(value: Any) -> str | None:
+    """Strip surrounding whitespace and apply title-case."""
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned.title() if cleaned else None
+
+
+# ── DATE ─────────────────────────────────────────────────────────────────────
+
+# Excel date serial epoch (Windows 1900 date system, accounting for the
+# erroneous 1900 leap-year bug that Excel perpetuates).
+_EXCEL_EPOCH = datetime.date(1899, 12, 30)
+
+# String formats tried in order before falling back to dateutil
+_DATE_FORMATS = [
+    "%Y-%m-%d",    # ISO already
+    "%d/%m/%Y",    # DD/MM/YYYY  (common in Kenya / UK)
+    "%m/%d/%Y",    # MM/DD/YYYY  (US)
+    "%d-%m-%Y",    # DD-MM-YYYY
+    "%d.%m.%Y",    # DD.MM.YYYY
+    "%Y/%m/%d",    # YYYY/MM/DD
+    "%d %b %Y",    # 01 Jan 2024
+    "%d %B %Y",    # 01 January 2024
+    "%b %d, %Y",   # Jan 01, 2024
+    "%B %d, %Y",   # January 01, 2024
+]
+
+
+def clean_date(value: Any) -> str | None:
+    """Parse a date value and return it as an ISO-8601 string (YYYY-MM-DD), or None."""
+    if value is None:
+        return None
+
+    # ── Already a Python date/datetime (openpyxl returns these for date cells) ─
+    if isinstance(value, datetime.datetime):
+        return value.date().isoformat()
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+
+    # ── Excel date serial number (integer or float like 45000.0) ─────────────
+    raw_str = str(value).strip()
+    if re.match(r"^\d{1,6}(\.\d+)?$", raw_str):
+        try:
+            serial = int(float(raw_str))
+            # Plausible Excel serial range: 1 (1900-01-01) – 2958465 (9999-12-31)
+            if 1 <= serial <= 2958465:
+                parsed = _EXCEL_EPOCH + datetime.timedelta(days=serial)
+                # Sanity-check: reject implausibly old dates (< 1900) returned by
+                # very small serials that are more likely plain integers.
+                if parsed.year >= 1900:
+                    return parsed.isoformat()
+        except (ValueError, OverflowError):
+            pass
+
+    # ── String formats ────────────────────────────────────────────────────────
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.datetime.strptime(raw_str, fmt).date().isoformat()
+        except ValueError:
+            continue
+
+    # Unrecognised — return None rather than corrupt data
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Typed-rule dispatcher  +  PASS_THROUGH fallback
+# ---------------------------------------------------------------------------
+
+_TYPED_RULES = {"PHONE", "NAME", "DATE"}
+
+
+def apply_typed_rule(rule: str, value: Any) -> Any:
+    """
+    Dispatch one of the three semantic rules.  Returns the cleaned value, or
+    None when the input cannot be normalised to the expected format.
+    """
+    if rule == "PHONE":
+        return clean_phone_ke(value)
+    if rule == "NAME":
+        return clean_name(value)
+    if rule == "DATE":
+        return clean_date(value)
+    # Fallback: delegate to the legacy per-token engine
+    return apply_rule(rule, value)
+
+
+def process_row(row: Row, column_rules: dict[str, list[str]]) -> Row:
+    """
+    Apply cleaning rules to every field in *row*.
+
+    • Columns present in *column_rules* are processed through their rule list
+      (typed rules take precedence; legacy rules are applied token-by-token).
+    • Columns NOT in *column_rules* receive PASS_THROUGH treatment:
+      convert to str and strip — value is otherwise left untouched.
+    """
+    out: Row = {}
+    for col, value in row.items():
+        rules = column_rules.get(col)
+        if rules is None:
+            # PASS_THROUGH: coerce to str, strip whitespace, preserve value
+            out[col] = str(value).strip() if value is not None else value
+        else:
+            current = value
+            for rule in rules:
+                if rule in _TYPED_RULES:
+                    current = apply_typed_rule(rule, current)
+                    # Typed rules are terminal within their semantic domain;
+                    # subsequent rules still run (e.g. a drop_empty after PHONE).
+                else:
+                    current = apply_rule(rule, current)
+            out[col] = current
+    return out
 
 
 def apply_rule(rule: str, value: Any) -> Any:
@@ -178,14 +351,14 @@ def clean_sheet(sheet: Sheet, column_rules: dict[str, list[str]]) -> Sheet:
     # ── Pass 1: per-cell rules (skip stat-fills, handled in pass 2) ──────────
     stat_rules = {"fill_mean", "fill_median"}
 
-    for row in sheet:
-        for col, rules in column_rules.items():
-            if col not in row:
-                continue
-            for rule in rules:
-                if rule in stat_rules:
-                    continue           # deferred
-                row[col] = apply_rule(rule, row[col])
+    # Build a view of column_rules that excludes deferred stat-fill tokens so
+    # process_row does not run them prematurely.  PASS_THROUGH columns (those
+    # absent from column_rules) are handled inside process_row automatically.
+    rules_pass1: dict[str, list[str]] = {
+        col: [r for r in rules if r not in stat_rules]
+        for col, rules in column_rules.items()
+    }
+    sheet = [process_row(row, rules_pass1) for row in sheet]
 
     # ── Pass 2: column-level stat fills ──────────────────────────────────────
     for col, rules in column_rules.items():
@@ -259,6 +432,48 @@ def resolve_config(
 
 
 # ---------------------------------------------------------------------------
+# Webhook dispatcher  (runs in background after 202 is returned to client)
+# ---------------------------------------------------------------------------
+
+
+async def _dispatch_webhook(url: str, payload: list[Row]) -> None:
+    """
+    POST the cleaned JSON payload to *url* using a dedicated async client.
+
+    Failures are logged but never re-raised — the caller (our API container)
+    must not crash because a client's destination server is unreachable.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            log.info(
+                "Webhook delivered: url=%s status=%s rows=%d",
+                url,
+                response.status_code,
+                len(payload),
+            )
+    except httpx.TimeoutException:
+        log.error("Webhook timed out: url=%s", url)
+    except httpx.HTTPStatusError as exc:
+        log.error(
+            "Webhook rejected by destination: url=%s status=%s body=%.200s",
+            url,
+            exc.response.status_code,
+            exc.response.text,
+        )
+    except httpx.RequestError as exc:
+        # Covers connection refused, DNS failure, SSL errors, etc.
+        log.error("Webhook request error: url=%s error=%r", url, exc)
+    except Exception as exc:  # noqa: BLE001 – intentional catch-all
+        log.exception("Unexpected error dispatching webhook: url=%s error=%r", url, exc)
+
+
+# ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
 
@@ -267,12 +482,14 @@ def resolve_config(
     "/clean",
     summary="Upload and clean a CSV or XLSX file",
     responses={
-        200: {"description": "Cleaned file (CSV or JSON)"},
+        200: {"description": "Cleaned file returned synchronously (CSV or JSON) — no X-Webhook-URL supplied"},
+        202: {"description": "Processing queued; cleaned payload will be POSTed to X-Webhook-URL"},
         415: {"description": "Unsupported file type"},
         422: {"description": "Validation / config error"},
     },
 )
 async def clean_file(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description=".csv or .xlsx file to clean"),
     config: str | None = Form(
         default=None,
@@ -282,6 +499,14 @@ async def clean_file(
         default=None,
         alias="X-Clean-Config",
         description="JSON cleaning config (takes precedence over form field)",
+    ),
+    x_webhook_url: str | None = Header(
+        default=None,
+        alias="X-Webhook-URL",
+        description=(
+            "When present, the endpoint returns 202 immediately and POSTs the "
+            "cleaned JSON array to this URL in the background."
+        ),
     ),
 ):
     # ── Read file bytes in-memory ─────────────────────────────────────────────
@@ -297,10 +522,22 @@ async def clean_file(
 
     # ── Clean ─────────────────────────────────────────────────────────────────
     cleaned = clean_sheet(sheet, column_rules)
+    sanitised = _sanitise_for_json(cleaned)
 
-    # ── Respond ───────────────────────────────────────────────────────────────
+    # ── Webhook mode: enqueue background dispatch and return 202 immediately ──
+    if x_webhook_url:
+        background_tasks.add_task(_dispatch_webhook, x_webhook_url, sanitised)
+        log.info(
+            "Job queued: rows=%d webhook=%s", len(sanitised), x_webhook_url
+        )
+        return JSONResponse(
+            status_code=202,
+            content={"status": "queued", "rows_processed": len(sanitised)},
+        )
+
+    # ── Synchronous mode: respond directly (original behaviour) ──────────────
     if output_format == "json":
-        return JSONResponse(content=_sanitise_for_json(cleaned))
+        return JSONResponse(content=sanitised)
 
     csv_bytes = _to_csv_bytes(cleaned)
     return StreamingResponse(
