@@ -43,7 +43,7 @@ def make_xlsx(rows: list[dict]) -> bytes:
 
 def post(file_bytes: bytes, config: dict, filename="data.csv"):
     return client.post(
-        "/clean",
+        "/api/v1/clean",
         files={"file": (filename, file_bytes, "text/csv")},
         data={"config": json.dumps(config)},
     )
@@ -75,7 +75,7 @@ def test_csv_parsed():
 def test_xlsx_parsed():
     data = make_xlsx([{"name": "bob", "age": "25"}])
     r = client.post(
-        "/clean",
+        "/api/v1/clean",
         files={"file": ("data.xlsx", data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         data={"config": json.dumps({"columns": {}, "output_format": "json"})},
     )
@@ -85,7 +85,7 @@ def test_xlsx_parsed():
 
 def test_unsupported_file_type():
     r = client.post(
-        "/clean",
+        "/api/v1/clean",
         files={"file": ("data.txt", b"hello", "text/plain")},
         data={"config": json.dumps({"columns": {}})},
     )
@@ -198,7 +198,7 @@ def test_header_config_overrides_form():
     header_cfg = json.dumps({"columns": {"email": ["strip", "lowercase"]}, "output_format": "json"})
     form_cfg   = json.dumps({"columns": {}, "output_format": "json"})
     r = client.post(
-        "/clean",
+        "/api/v1/clean",
         files={"file": ("data.csv", data, "text/csv")},
         data={"config": form_cfg},
         headers={"X-Clean-Config": header_cfg},
@@ -213,7 +213,7 @@ def test_header_config_overrides_form():
 def test_invalid_json_config_returns_422():
     data = make_csv([{"name": "alice"}])
     r = client.post(
-        "/clean",
+        "/api/v1/clean",
         files={"file": ("data.csv", data, "text/csv")},
         data={"config": "not-valid-json"},
     )

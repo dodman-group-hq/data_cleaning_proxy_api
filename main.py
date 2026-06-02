@@ -45,7 +45,8 @@ from typing import Any
 
 import httpx
 import openpyxl
-from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 log = logging.getLogger(__name__)
@@ -55,9 +56,25 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="Data Cleaning Proxy",
-    description="Stateless in-memory CSV/XLSX cleaner driven by a JSON rule config.",
+    title="Dodman · Data Cleaning Proxy",
+    description=(
+        "Stateless in-memory CSV/XLSX cleaner driven by a JSON rule config.\n\n"
+        "**Interactive docs:** `/docs` (Swagger UI) · `/redoc` (ReDoc)"
+    ),
     version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
+
+# Allow requests from any origin — covers browsers opening index.html via
+# file://, localhost, or any custom dev port without triggering CORS preflight
+# blocks.  Tighten allow_origins to specific domains in production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
@@ -432,6 +449,16 @@ def resolve_config(
 
 
 # ---------------------------------------------------------------------------
+# Versioned router
+# ---------------------------------------------------------------------------
+# Routes are defined on this router and mounted by the app under a versioned
+# prefix (e.g. /api/v1).  To add a v2, create a new router in a separate
+# module and call app.include_router(v2_router, prefix="/api/v2").
+
+router = APIRouter(prefix="/api/v1", tags=["v1"])
+
+
+# ---------------------------------------------------------------------------
 # Webhook dispatcher  (runs in background after 202 is returned to client)
 # ---------------------------------------------------------------------------
 
@@ -478,7 +505,7 @@ async def _dispatch_webhook(url: str, payload: list[Row]) -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.post(
+@router.post(
     "/clean",
     summary="Upload and clean a CSV or XLSX file",
     responses={
@@ -554,4 +581,21 @@ async def clean_file(
 
 @app.get("/health", include_in_schema=False)
 async def health():
+    """Root-level liveness probe (load balancers, Render health checks)."""
     return {"status": "ok"}
+
+
+@router.get("/health", include_in_schema=True, summary="API v1 liveness probe")
+async def health_v1():
+    """Versioned liveness probe — confirms the v1 router is mounted."""
+    return {"status": "ok", "version": "1.0.0", "docs": "/docs"}
+
+
+# ---------------------------------------------------------------------------
+# Mount versioned router
+# ---------------------------------------------------------------------------
+# Add future versions here:
+#   from routers import v2
+#   app.include_router(v2.router, prefix="/api/v2")
+
+app.include_router(router)

@@ -27,7 +27,7 @@ def make_csv(rows: list[dict]) -> bytes:
 
 def post_with_webhook(file_bytes: bytes, config: dict, webhook_url: str, filename="data.csv"):
     return client.post(
-        "/clean",
+        "/api/v1/clean",
         files={"file": (filename, file_bytes, "text/csv")},
         data={"config": json.dumps(config)},
         headers={"X-Webhook-URL": webhook_url},
@@ -37,7 +37,7 @@ def post_with_webhook(file_bytes: bytes, config: dict, webhook_url: str, filenam
 def post_sync(file_bytes: bytes, config: dict, filename="data.csv"):
     """No webhook header — original synchronous path."""
     return client.post(
-        "/clean",
+        "/api/v1/clean",
         files={"file": (filename, file_bytes, "text/csv")},
         data={"config": json.dumps(config)},
     )
