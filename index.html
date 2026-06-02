@@ -198,11 +198,11 @@
       </div>
       <!-- API Key -->
       <div>
-        <label class="block text-xs text-dim mb-1.5 tracking-wider uppercase">API Key <span class="text-muted">(optional)</span></label>
+        <label class="block text-xs text-dim mb-1.5 tracking-wider uppercase">API Key <span class="text-amber-400">*</span></label>
         <input
           id="api-key"
           type="password"
-          placeholder="sk-••••••••••••••••"
+          placeholder="dk_live_••••••••••••••••"
           class="field-input w-full bg-void border border-border rounded px-3 py-2.5 text-sm text-ghost font-mono placeholder-muted transition-all duration-150"
         />
       </div>
@@ -592,7 +592,18 @@ async function submitJob() {
     } else {
       document.getElementById('error-alert').classList.remove('hidden');
       document.getElementById('error-detail').textContent =
-        `HTTP ${res.status} · ${body.detail ?? body.message ?? 'Unexpected response'}`;
+        (() => {
+        const d = body.detail;
+        if (!d) return `HTTP ${res.status} · ${body.message ?? 'Unexpected response'}`;
+        if (typeof d === 'string') return `HTTP ${res.status} · ${d}`;
+        // FastAPI validation errors → array of {loc, msg}
+        if (Array.isArray(d)) {
+          return `HTTP ${res.status} · ` + d.map(e => `${e.loc?.slice(-1)[0] ?? 'field'}: ${e.msg}`).join('; ');
+        }
+        // Our structured error object { error: { code, message } }
+        if (d.error?.message) return `HTTP ${res.status} · [${d.error.code}] ${d.error.message}`;
+        return `HTTP ${res.status} · ${JSON.stringify(d)}`;
+      })();
       setStatus('ERROR');
     }
   } catch (err) {

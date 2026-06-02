@@ -6,3 +6,4 @@ openpyxl
 python-multipart
 asyncpg
 python-dotenv
+slowapi
