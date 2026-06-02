@@ -35,22 +35,30 @@ from __future__ import annotations
 
 import csv
 import datetime
+import hashlib
 import io
 import json
 import logging
 import math
+import os
 import re
+import secrets
 import statistics
 from typing import Any
+from dotenv import load_dotenv
 
+import asyncpg
 import httpx
 import openpyxl
-from fastapi import APIRouter, BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Security, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 log = logging.getLogger(__name__)
 
+# Load the .env file explicitly
+load_dotenv()
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -78,11 +86,321 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# Versioned router
+# ---------------------------------------------------------------------------
+# Routes are defined on this router and mounted by the app under a versioned
+# prefix (e.g. /api/v1).  To add a v2, create a new router in a separate
+# module and call app.include_router(v2_router, prefix="/api/v2").
+
+router = APIRouter(prefix="/api/v1", tags=["v1"])
+
+# ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
 
 Row = dict[str, Any]
 Sheet = list[Row]
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Loaded from environment — set these in your Render dashboard or .env file.
+# TENANT_DATABASE_URL : asyncpg-compatible Neon connection string
+# INTERNAL_SERVICE_SECRET : shared secret that protects key-management endpoints
+# Required at startup; the app will not start if they are absent.
+
+TENANT_DATABASE_URL     = os.getenv("TENANT_DATABASE_URL", "")
+INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
+
+# ---------------------------------------------------------------------------
+# Database — connection pool (initialised on startup, torn down on shutdown)
+# ---------------------------------------------------------------------------
+
+_pool: asyncpg.Pool | None = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    """Return the live connection pool, raising clearly if it is unavailable."""
+    if _pool is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database pool not initialised — check TENANT_DATABASE_URL.",
+        )
+    return _pool
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _pool
+    if not TENANT_DATABASE_URL:
+        log.warning(
+            "TENANT_DATABASE_URL not set — auth endpoints will return 503. "
+            "Set the env var and restart to enable API key validation."
+        )
+        return
+    try:
+        _pool = await asyncpg.create_pool(
+            TENANT_DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            command_timeout=10,
+        )
+        await _bootstrap_schema(_pool)
+        log.info("Database pool ready. Docs: http://localhost:8000/docs")
+    except Exception as exc:
+        log.error("Failed to connect to database: %r", exc)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    if _pool:
+        await _pool.close()
+
+
+# ---------------------------------------------------------------------------
+# Schema bootstrap  (idempotent — safe to run on every startup)
+# ---------------------------------------------------------------------------
+
+_BOOTSTRAP_SQL = """
+CREATE TABLE IF NOT EXISTS api_keys (
+    id            BIGSERIAL PRIMARY KEY,
+    label         TEXT        NOT NULL,
+    key_hash      TEXT        NOT NULL UNIQUE,
+    key_prefix    TEXT        NOT NULL,
+    tier          TEXT        NOT NULL DEFAULT 'free'
+                              CHECK (tier IN ('free', 'starter', 'pro')),
+    is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at  TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash   ON api_keys (key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys (is_active);
+"""
+
+
+async def _bootstrap_schema(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(_BOOTSTRAP_SQL)
+    log.info("Schema bootstrap complete.")
+
+
+# ---------------------------------------------------------------------------
+# API key helpers
+# ---------------------------------------------------------------------------
+
+_KEY_PREFIX = "dk_live_"
+_KEY_BYTES  = 32        # 256 bits of entropy → 43-char base64url suffix
+
+
+def _generate_raw_key() -> str:
+    """Return a brand-new plaintext API key.  Shown to the user exactly once."""
+    return _KEY_PREFIX + secrets.token_urlsafe(_KEY_BYTES)
+
+
+def _hash_key(raw: str) -> str:
+    """SHA-256 hex digest — what we store; never the plaintext."""
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Authentication dependency
+# ---------------------------------------------------------------------------
+
+_bearer = HTTPBearer(auto_error=False)
+
+# Tiers ranked lowest → highest for future capability checks
+TIER_RANK = {"free": 0, "starter": 1, "pro": 2}
+
+
+class APIKeyRecord:
+    """Lightweight value object returned by verify_api_key."""
+    __slots__ = ("id", "label", "tier", "key_prefix")
+
+    def __init__(self, id: int, label: str, tier: str, key_prefix: str) -> None:
+        self.id         = id
+        self.label      = label
+        self.tier       = tier
+        self.key_prefix = key_prefix
+
+
+async def verify_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> APIKeyRecord:
+    """
+    FastAPI Security dependency.
+
+    Extracts the Bearer token from the Authorization header, hashes it, and
+    validates it against the api_keys table.  Updates last_used_at on every
+    successful hit so you have activity data for billing and churn detection.
+
+    Raises 401 for missing/invalid/inactive keys — never leaks which condition
+    triggered the rejection (timing-safe comparison via constant-time hash lookup).
+    Credentials are validated BEFORE touching the DB so obviously bad requests
+    never reach the connection pool.
+    """
+    _UNAUTH = HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "code":    "INVALID_API_KEY",
+                "message": "Missing or invalid API key. "
+                           "Pass your key as: Authorization: Bearer dk_live_...",
+            }
+        },
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    if credentials is None or not credentials.credentials:
+        raise _UNAUTH
+
+    raw     = credentials.credentials
+    hashed  = _hash_key(raw)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, label, tier, key_prefix, is_active
+            FROM   api_keys
+            WHERE  key_hash = $1
+            LIMIT  1
+            """,
+            hashed,
+        )
+
+    if row is None or not row["is_active"]:
+        raise _UNAUTH
+
+    # Fire-and-forget last_used_at update — don't block the response on it
+    async def _touch() -> None:
+        try:
+            async with (await get_pool()).acquire() as conn:
+                await conn.execute(
+                    "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
+                    row["id"],
+                )
+        except Exception:
+            pass  # non-critical
+
+    import asyncio
+    asyncio.ensure_future(_touch())
+
+    return APIKeyRecord(
+        id=row["id"],
+        label=row["label"],
+        tier=row["tier"],
+        key_prefix=row["key_prefix"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal admin guard  (protects key-management endpoints)
+# ---------------------------------------------------------------------------
+
+def verify_internal_secret(
+    x_internal_secret: str | None = Header(default=None, alias="X-Internal-Secret"),
+) -> None:
+    """
+    Dependency that checks the X-Internal-Secret header matches
+    INTERNAL_SERVICE_SECRET.  Used to protect admin-only endpoints that
+    should never be reachable by external clients.
+    """
+    if not INTERNAL_SERVICE_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="INTERNAL_SERVICE_SECRET not configured on this server.",
+        )
+    if not secrets.compare_digest(
+        x_internal_secret or "",
+        INTERNAL_SERVICE_SECRET,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": {"code": "FORBIDDEN", "message": "Invalid internal secret."}},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Key-management endpoint  (internal only)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/keys",
+    summary="Issue a new API key",
+    description=(
+        "**Internal endpoint** — requires `X-Internal-Secret` header.\n\n"
+        "Creates a new API key, stores its SHA-256 hash, and returns the "
+        "**plaintext key exactly once**.  Store it immediately — it cannot "
+        "be recovered if lost."
+    ),
+    tags=["admin"],
+    status_code=201,
+)
+async def create_api_key(
+    label: str = Form(..., description="Human-readable owner label, e.g. 'Acme Corp'"),
+    tier:  str = Form(default="free", description="Tier: free | starter | pro"),
+    _: None = Depends(verify_internal_secret),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    if tier not in TIER_RANK:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid tier '{tier}'. Must be one of: free, starter, pro.",
+        )
+
+    raw    = _generate_raw_key()
+    hashed = _hash_key(raw)
+    prefix = raw[:16]          # "dk_live_XXXXXXX" — safe to store/display
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO api_keys (label, key_hash, key_prefix, tier)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, created_at
+            """,
+            label, hashed, prefix, tier,
+        )
+
+    log.info("API key issued: id=%s label=%r tier=%s prefix=%s", row["id"], label, tier, prefix)
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "id":         row["id"],
+            "label":      label,
+            "tier":       tier,
+            "key_prefix": prefix,
+            "api_key":    raw,          # plaintext — shown once, never stored
+            "created_at": row["created_at"].isoformat(),
+            "warning":    "Store this key immediately. It will not be shown again.",
+        },
+    )
+
+
+@router.patch(
+    "/keys/{key_id}/deactivate",
+    summary="Deactivate an API key",
+    description="**Internal endpoint** — requires `X-Internal-Secret` header.",
+    tags=["admin"],
+)
+async def deactivate_api_key(
+    key_id: int,
+    _: None = Depends(verify_internal_secret),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE api_keys SET is_active = FALSE WHERE id = $1",
+            key_id,
+        )
+    if result == "UPDATE 0":
+        raise HTTPException(status_code=404, detail=f"Key id={key_id} not found.")
+    log.info("API key deactivated: id=%s", key_id)
+    return JSONResponse(content={"id": key_id, "is_active": False})
+
 
 # ---------------------------------------------------------------------------
 # Parsing helpers  (entirely in-memory – no disk I/O)
@@ -449,16 +767,6 @@ def resolve_config(
 
 
 # ---------------------------------------------------------------------------
-# Versioned router
-# ---------------------------------------------------------------------------
-# Routes are defined on this router and mounted by the app under a versioned
-# prefix (e.g. /api/v1).  To add a v2, create a new router in a separate
-# module and call app.include_router(v2_router, prefix="/api/v2").
-
-router = APIRouter(prefix="/api/v1", tags=["v1"])
-
-
-# ---------------------------------------------------------------------------
 # Webhook dispatcher  (runs in background after 202 is returned to client)
 # ---------------------------------------------------------------------------
 
@@ -535,6 +843,7 @@ async def clean_file(
             "cleaned JSON array to this URL in the background."
         ),
     ),
+    api_key: APIKeyRecord = Security(verify_api_key),
 ):
     # ── Read file bytes in-memory ─────────────────────────────────────────────
     raw = await file.read()
@@ -555,7 +864,8 @@ async def clean_file(
     if x_webhook_url:
         background_tasks.add_task(_dispatch_webhook, x_webhook_url, sanitised)
         log.info(
-            "Job queued: rows=%d webhook=%s", len(sanitised), x_webhook_url
+            "Job queued: rows=%d webhook=%s key=%s tier=%s",
+            len(sanitised), x_webhook_url, api_key.key_prefix, api_key.tier,
         )
         return JSONResponse(
             status_code=202,

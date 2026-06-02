@@ -4,3 +4,5 @@ fastapi
 uvicorn
 openpyxl
 python-multipart
+asyncpg
+python-dotenv

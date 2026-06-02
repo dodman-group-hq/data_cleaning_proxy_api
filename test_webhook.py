@@ -12,7 +12,11 @@ import pytest
 import httpx
 from fastapi.testclient import TestClient
 
-from main import app, _dispatch_webhook
+from main import app, _dispatch_webhook, verify_api_key, APIKeyRecord
+
+# Auth mock
+_MOCK_KEY = APIKeyRecord(id=1, label="test", tier="pro", key_prefix="dk_live_test")
+app.dependency_overrides[verify_api_key] = lambda: _MOCK_KEY
 
 client = TestClient(app)
 

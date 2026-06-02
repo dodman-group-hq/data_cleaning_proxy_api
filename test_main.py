@@ -12,8 +12,18 @@ import datetime
 import openpyxl
 import pytest
 from fastapi.testclient import TestClient
+from unittest.mock import patch, AsyncMock, MagicMock
 
-from main import app, clean_phone_ke, clean_name, clean_date
+from main import app, clean_phone_ke, clean_name, clean_date, verify_api_key, APIKeyRecord
+
+# ---------------------------------------------------------------------------
+# Auth mock — inject a fake pro-tier key so all existing tests pass without
+# a real database connection.
+# ---------------------------------------------------------------------------
+
+_MOCK_KEY = APIKeyRecord(id=1, label="test", tier="pro", key_prefix="dk_live_test")
+
+app.dependency_overrides[verify_api_key] = lambda: _MOCK_KEY
 
 client = TestClient(app)
 
