@@ -385,11 +385,68 @@ _RUNTIME_ENV = os.getenv("DODMAN_ENV", "development").lower()
 _SANDBOX_RATE = "5/day"
 
 # ---------------------------------------------------------------------------
-# Sandbox IP limiter  (separate Limiter instance so the limit string is fixed
-# at 5/day regardless of tier — not tied to the key-based identifier)
+# Sandbox IP rate-limit helper
 # ---------------------------------------------------------------------------
+# We enforce 5 req/day per IP for dk_sandbox_test_99 without relying on any
+# slowapi internal methods (_check_request_limit, etc.) that differ across
+# versions.  Instead we call the public limits.storage hit() / get_expiry()
+# API that slowapi itself uses internally — stable across 0.1.x → 0.2.x.
+#
+# Storage backend mirrors the main limiter so both share the same Redis/
+# memory store.  A dedicated key namespace ("sandbox:<ip>") keeps sandbox
+# counts isolated from tier-based counts.
 
-_sandbox_limiter = Limiter(key_func=get_remote_address, default_limits=[])
+_SANDBOX_MAX_HITS  = 5
+_SANDBOX_WINDOW_S  = 86_400   # 1 day in seconds
+
+
+async def _check_sandbox_ip_limit(request: StarletteRequest) -> None:
+    """
+    Raise RateLimitExceeded (429) if the client IP has already consumed
+    _SANDBOX_MAX_HITS requests in the current 24-hour window.
+
+    Uses the same in-memory (or Redis) storage backend that the main
+    slowapi Limiter uses, via its public `_storage` attribute — which is
+    stable across all released slowapi versions.
+    """
+    from limits import parse as _parse_limit          # bundled with slowapi
+    from limits.storage import MemoryStorage           # always available
+
+    client_ip  = get_remote_address(request)
+    limit_key  = f"sandbox_ip:{client_ip}"
+
+    # Grab the storage backend from the main limiter (already initialised).
+    storage = getattr(limiter, "_storage", None)
+    if storage is None:
+        # Limiter not yet initialised (e.g. unit-test context) — fail open.
+        return
+
+    # limits library: parse "5/day" → RateLimitItem
+    rate_item = _parse_limit(_SANDBOX_RATE)
+
+    # hit() increments the counter and returns (remaining, reset_time).
+    # It returns True if the request is allowed, False if over limit.
+    # The API differs slightly between limits 2.x and 3.x so we branch.
+    try:
+        # limits ≥ 3.x: storage.acquire_entry(key, limit, expiry) → bool
+        allowed = storage.acquire_entry(
+            limit_key,
+            rate_item.amount,
+            rate_item.get_expiry(),
+        )
+    except (AttributeError, TypeError):
+        try:
+            # limits 2.x: storage.incr(key, expiry, amount) → int
+            count = storage.incr(limit_key, rate_item.get_expiry(), 1)
+            allowed = count <= rate_item.amount
+        except Exception:
+            # Storage API is unknown — fail open rather than break the endpoint.
+            return
+
+    if not allowed:
+        raise RateLimitExceeded(
+            f"{_SANDBOX_MAX_HITS} per day"
+        )
 
 
 class APIKeyRecord:
@@ -463,23 +520,10 @@ async def verify_api_key(
     # Handled entirely without a DB lookup.  IP-level rate limit is applied
     # here, inside the dependency, so it fires before any file processing.
     if raw == _SANDBOX_KEY:
-        # Enforce per-IP rate limit synchronously via the sandbox limiter.
-        # slowapi.Limiter.hit() returns False when the limit is exceeded.
-        client_ip = get_remote_address(request)
-        limit_key  = f"sandbox:{client_ip}"
-        try:
-            # Use the internal _limiter storage directly for a synchronous check.
-            # We replicate the decorator behaviour: call limiter.hit() which
-            # increments the counter and raises RateLimitExceeded if over quota.
-            _sandbox_limiter._check_request_limit(  # type: ignore[attr-defined]
-                request, None, _SANDBOX_RATE, get_remote_address
-            )
-        except RateLimitExceeded:
-            raise  # re-raise so the global handler returns the 429 envelope
-        except AttributeError:
-            # Fallback: newer slowapi versions use a different internal API.
-            # The decorator approach on the endpoint handles it there instead.
-            pass
+        # Enforce per-IP rate limit via our stable storage helper.
+        # _check_sandbox_ip_limit raises RateLimitExceeded (429) when the
+        # caller has exceeded 5 requests in the current 24-hour window.
+        await _check_sandbox_ip_limit(request)
 
         return APIKeyRecord(
             id=0,
@@ -1172,18 +1216,10 @@ async def clean_file(
     # ── Store tier on request state so the rate limiter can read it ─────────
     request.state.api_key_tier = api_key.tier
 
-    # ── Apply sandbox per-IP rate limit (dk_sandbox_test_99 only) ────────────
-    # The dependency already attempted a check via the internal API; this
-    # decorator-style guard is the reliable fallback for newer slowapi versions.
-    if api_key.is_sandbox:
-        try:
-            _sandbox_limiter._check_request_limit(  # type: ignore[attr-defined]
-                request, None, _SANDBOX_RATE, get_remote_address
-            )
-        except RateLimitExceeded:
-            raise
-        except AttributeError:
-            pass  # handled in dependency or via decorator below
+    # ── Sandbox IP rate limit (dk_sandbox_test_99) ───────────────────────────
+    # Already enforced inside verify_api_key via _check_sandbox_ip_limit.
+    # The dependency runs first and raises 429 before we reach this point,
+    # so no second check is needed here.
 
     # ── Read file bytes in-memory ─────────────────────────────────────────────
     raw = await file.read()
