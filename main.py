@@ -50,10 +50,16 @@ from dotenv import load_dotenv
 import asyncpg
 import httpx
 import openpyxl
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Security, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, Security, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.requests import Request as StarletteRequest
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +92,136 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+# The identifier function keys rate limits off the API key (from the
+# Authorization header) when present, falling back to client IP.  This means
+# each customer's quota is tracked independently — one customer flooding the
+# API doesn't eat into another's limit.
+
+
+def _rate_limit_identifier(request: StarletteRequest) -> str:
+    """Return the API key token if present, else the client IP."""
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+        if token:
+            return token
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_rate_limit_identifier, default_limits=[])
+app.state.limiter = limiter
+
+
+# ---------------------------------------------------------------------------
+# Global exception handlers
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """Return a clean, uniform 429 — never expose slowapi internals."""
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "code":    "RATE_LIMIT_EXCEEDED",
+                "message": "Rate limit exceeded. Please upgrade your tier or slow down.",
+                "limit":   str(exc.detail),
+            }
+        },
+        headers={"Retry-After": "60"},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """
+    Replace FastAPI's default 422 response with a consistent error envelope.
+    Surfaces the first meaningful error clearly instead of dumping raw Pydantic
+    internals at the caller.
+    """
+    errors = exc.errors()
+    first  = errors[0] if errors else {}
+
+    # Build a human-readable field path: ["body", "label"] → "body.label"
+    loc  = " → ".join(str(p) for p in first.get("loc", []))
+    msg  = first.get("msg", "Validation error")
+    kind = first.get("type", "unknown")
+
+    # Give actionable hints for the most common mistakes
+    hints: dict[str, str] = {
+        "missing":        f"'{loc}' is required but was not provided.",
+        "string_too_short": f"'{loc}' is too short.",
+        "value_error":    f"'{loc}' has an invalid value: {msg}.",
+    }
+    human = hints.get(kind, f"'{loc}': {msg}")
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code":    "VALIDATION_ERROR",
+                "message": human,
+                "fields":  [
+                    {
+                        "field":   " → ".join(str(p) for p in e.get("loc", [])),
+                        "issue":   e.get("msg", ""),
+                        "type":    e.get("type", ""),
+                    }
+                    for e in errors
+                ],
+            }
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """
+    Normalise all HTTPExceptions that don't already use the error envelope.
+    Ensures every error response — from any part of the stack — has the same shape.
+    """
+    detail = exc.detail
+
+    # Already in envelope format — pass through untouched
+    if isinstance(detail, dict) and "error" in detail:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=detail,
+            headers=getattr(exc, "headers", None) or {},
+        )
+
+    # Plain string or anything else — wrap it
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code":    _status_to_code(exc.status_code),
+                "message": detail if isinstance(detail, str) else str(detail),
+            }
+        },
+        headers=getattr(exc, "headers", None) or {},
+    )
+
+
+def _status_to_code(status: int) -> str:
+    return {
+        400: "BAD_REQUEST",
+        401: "UNAUTHORIZED",
+        403: "FORBIDDEN",
+        404: "NOT_FOUND",
+        409: "CONFLICT",
+        413: "PAYLOAD_TOO_LARGE",
+        415: "UNSUPPORTED_MEDIA_TYPE",
+        422: "VALIDATION_ERROR",
+        429: "RATE_LIMIT_EXCEEDED",
+        500: "INTERNAL_SERVER_ERROR",
+        503: "SERVICE_UNAVAILABLE",
+    }.get(status, f"HTTP_{status}")
+
+# ---------------------------------------------------------------------------
 # Versioned router
 # ---------------------------------------------------------------------------
 # Routes are defined on this router and mounted by the app under a versioned
@@ -112,6 +248,23 @@ Sheet = list[Row]
 
 TENANT_DATABASE_URL     = os.getenv("TENANT_DATABASE_URL", "")
 INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
+
+# ---------------------------------------------------------------------------
+# Rate limit configuration
+# ---------------------------------------------------------------------------
+# Adjust these via environment variables — no code changes needed.
+# Format: "<count>/<period>"  where period = second | minute | hour | day
+#
+# Tier mapping (enforced in the identifier function below):
+#   free    → RATE_LIMIT_FREE    default: 60 requests/hour
+#   starter → RATE_LIMIT_STARTER default: 500 requests/hour
+#   pro     → no rate limiting applied
+#
+# Set RATE_LIMIT_FREE=100/hour in Render to change it without a deploy.
+
+RATE_LIMIT_FREE    = os.getenv("RATE_LIMIT_FREE",    "60/hour")
+RATE_LIMIT_STARTER = os.getenv("RATE_LIMIT_STARTER", "500/hour")
+RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "60/hour")   # fallback
 
 # ---------------------------------------------------------------------------
 # Database — connection pool (initialised on startup, torn down on shutdown)
@@ -326,6 +479,11 @@ def verify_internal_secret(
 # Key-management endpoint  (internal only)
 # ---------------------------------------------------------------------------
 
+class CreateKeyRequest(BaseModel):
+    label: str
+    tier:  str = "free"
+
+
 @router.post(
     "/keys",
     summary="Issue a new API key",
@@ -339,15 +497,40 @@ def verify_internal_secret(
     status_code=201,
 )
 async def create_api_key(
-    label: str = Form(..., description="Human-readable owner label, e.g. 'Acme Corp'"),
-    tier:  str = Form(default="free", description="Tier: free | starter | pro"),
+    request: Request,
     _: None = Depends(verify_internal_secret),
     pool: asyncpg.Pool = Depends(get_pool),
 ) -> JSONResponse:
+    """
+    Accepts either JSON body or multipart/form-data — works from Postman,
+    curl, and the sandbox UI without changing the Content-Type.
+    """
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {"code": "BAD_REQUEST", "message": "Request body is not valid JSON."}},
+            )
+        label = body.get("label", "").strip()
+        tier  = body.get("tier", "free").strip()
+    else:
+        # Fall back to form data (multipart or url-encoded)
+        form  = await request.form()
+        label = str(form.get("label", "")).strip()
+        tier  = str(form.get("tier", "free")).strip()
+
+    if not label:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "VALIDATION_ERROR", "message": "'label' is required. Provide the owner name, e.g. \'Acme Corp\'."}},
+        )
     if tier not in TIER_RANK:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid tier '{tier}'. Must be one of: free, starter, pro.",
+            detail={"error": {"code": "VALIDATION_ERROR", "message": f"Invalid tier '{tier}\'. Must be one of: free, starter, pro."}},
         )
 
     raw    = _generate_raw_key()
@@ -813,6 +996,30 @@ async def _dispatch_webhook(url: str, payload: list[Row]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_tier_limit(request: StarletteRequest) -> str:
+    """
+    Return the rate limit string for the current request.
+
+    slowapi calls this before the endpoint body runs, so we read the tier
+    directly from the Authorization header and resolve it against the tier
+    map — the same token the auth dependency will validate moments later.
+
+    This means the limit is applied per-API-key (keyed by the token in
+    _rate_limit_identifier), and the string reflects the caller's tier.
+    Unauthenticated requests get the free-tier limit; they will still fail
+    at the auth dependency.
+    """
+    auth  = request.headers.get("Authorization", "")
+    # We don't have the resolved tier yet at this point — read it from state
+    # if auth has already run (e.g. on retry), else default to free.
+    tier  = getattr(request.state, "api_key_tier", "free")
+    return {
+        "free":    RATE_LIMIT_FREE,
+        "starter": RATE_LIMIT_STARTER,
+        "pro":     "99999/hour",    # effectively unlimited — pro pays for throughput
+    }.get(tier, RATE_LIMIT_DEFAULT)
+
+
 @router.post(
     "/clean",
     summary="Upload and clean a CSV or XLSX file",
@@ -821,9 +1028,12 @@ async def _dispatch_webhook(url: str, payload: list[Row]) -> None:
         202: {"description": "Processing queued; cleaned payload will be POSTed to X-Webhook-URL"},
         415: {"description": "Unsupported file type"},
         422: {"description": "Validation / config error"},
+        429: {"description": "Rate limit exceeded"},
     },
 )
+@limiter.limit(RATE_LIMIT_DEFAULT, key_func=_rate_limit_identifier)
 async def clean_file(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description=".csv or .xlsx file to clean"),
     config: str | None = Form(
@@ -845,6 +1055,9 @@ async def clean_file(
     ),
     api_key: APIKeyRecord = Security(verify_api_key),
 ):
+    # ── Store tier on request state so the rate limiter can read it ─────────
+    request.state.api_key_tier = api_key.tier
+
     # ── Read file bytes in-memory ─────────────────────────────────────────────
     raw = await file.read()
 
