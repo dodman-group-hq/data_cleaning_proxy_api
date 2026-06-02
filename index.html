@@ -188,11 +188,14 @@
     <div class="p-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
       <!-- Webhook URL -->
       <div class="sm:col-span-2">
-        <label class="block text-xs text-dim mb-1.5 tracking-wider uppercase">X-Webhook-URL <span class="text-amber-400">*</span></label>
+        <label class="block text-xs text-dim mb-1.5 tracking-wider uppercase">
+          X-Webhook-URL
+          <span class="text-muted normal-case tracking-normal ml-1">(optional — leave blank for direct download)</span>
+        </label>
         <input
           id="webhook-url"
           type="url"
-          placeholder="https://your-server.com/webhook"
+          placeholder="https://your-server.com/webhook  ·  leave blank to stream file download"
           class="field-input w-full bg-void border border-border rounded px-3 py-2.5 text-sm text-ghost font-mono placeholder-muted transition-all duration-150"
         />
       </div>
@@ -312,7 +315,7 @@
       <svg id="btn-icon" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
         <path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M12 5l7 7-7 7" />
       </svg>
-      <span id="btn-label">Process &amp; Stream Data</span>
+      <span id="btn-label">Process &amp; Download File</span>
     </button>
   </div>
 
@@ -533,46 +536,42 @@ document.getElementById('output-format').addEventListener('change', updatePrevie
 
 // ─── Submit ───────────────────────────────────────────────────────────────────
 async function submitJob() {
-  const webhookUrl = document.getElementById('webhook-url').value.trim();
-  const apiKey     = document.getElementById('api-key').value.trim();
+  const webhookUrl  = document.getElementById('webhook-url').value.trim();
+  const apiKey      = document.getElementById('api-key').value.trim();
+  const outputFmt   = document.getElementById('output-format').value; // 'json' | 'csv'
 
-  if (!currentFile) {
-    flashError('No file selected.'); return;
-  }
-  if (!webhookUrl) {
-    document.getElementById('webhook-url').focus();
-    document.getElementById('webhook-url').style.borderColor = '#fb7185';
-    setTimeout(() => document.getElementById('webhook-url').style.borderColor = '', 1500);
-    return;
-  }
+  if (!currentFile) { flashError('No file selected.'); return; }
 
-  // Build form data
+  // Build form data — output_format is always sent as a form field so the
+  // backend resolves it with highest priority over the config body value.
   const cfg      = buildConfig();
   const formData = new FormData();
   formData.append('file', currentFile);
   formData.append('config', JSON.stringify(cfg));
+  formData.append('output_format', outputFmt);
 
-  // Build headers
-  const headers = { 'X-Webhook-URL': webhookUrl };
-  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  // Build headers — webhook URL is now optional
+  const headers = {};
+  if (webhookUrl) headers['X-Webhook-URL'] = webhookUrl;
+  if (apiKey)     headers['Authorization'] = `Bearer ${apiKey}`;
 
   // UI: loading state
   setBtnLoading(true);
   setStatus('POSTING');
   hideAlerts();
   responseSection.classList.remove('hidden');
-  document.getElementById('response-json').innerHTML = '<span class="text-dim animate-pulse">Awaiting response…</span>';
+  document.getElementById('response-json').innerHTML =
+    '<span class="text-dim animate-pulse">Awaiting response…</span>';
 
   const t0 = performance.now();
   try {
-    const res  = await fetch(ENDPOINT, { method: 'POST', headers, body: formData });
-    const ms   = Math.round(performance.now() - t0);
-    const body = await res.json().catch(() => ({}));
+    const res = await fetch(ENDPOINT, { method: 'POST', headers, body: formData });
+    const ms  = Math.round(performance.now() - t0);
 
-    // Status badge
+    // ── Status badge ────────────────────────────────────────────────────────────────────
     const badge = document.getElementById('resp-status-badge');
     badge.textContent = res.status;
-    if (res.status === 202) {
+    if (res.ok) {
       badge.className = 'text-xs font-mono px-2 py-0.5 rounded border text-emerald-400 border-emerald-500/40 bg-emerald-500/10';
       document.getElementById('resp-dot').className = 'w-1.5 h-1.5 rounded-full bg-emerald-400';
     } else {
@@ -581,31 +580,84 @@ async function submitJob() {
     }
     document.getElementById('resp-time').textContent = `${ms}ms`;
 
-    // JSON preview
-    document.getElementById('response-json').innerHTML = syntaxHighlight(JSON.stringify(body, null, 2));
-
+    // ── 202 Webhook-queued path ───────────────────────────────────────────────────────────
     if (res.status === 202) {
+      const body = await res.json().catch(() => ({}));
+      document.getElementById('response-json').innerHTML =
+        syntaxHighlight(JSON.stringify(body, null, 2));
       document.getElementById('success-alert').classList.remove('hidden');
+      const dropped = body.rows_dropped != null
+        ? ` · ${body.rows_dropped} rows dropped by sandbox limit`
+        : '';
       document.getElementById('success-detail').textContent =
-        `${body.rows_processed ?? '?'} rows queued → routed to webhook destination`;
+        `${body.rows_processed ?? '?'} rows queued → routed to webhook destination${dropped}`;
       setStatus('QUEUED');
+
+    // ── 200 Direct-download streaming path ──────────────────────────────────────────────────
+    // The server streams CSV or JSON bytes with Content-Disposition: attachment.
+    // We read the response body as a raw Blob, build an in-memory object URL,
+    // attach it to a temporary <a> element, and click it to trigger the OS
+    // "Save File" dialog — all without a page navigation.
+    } else if (res.status === 200) {
+      const blob     = await res.blob();
+      const ext      = outputFmt === 'csv' ? 'csv' : 'json';
+      const filename = `cleaned_file.${ext}`;
+      const mimeType = outputFmt === 'csv' ? 'text/csv' : 'application/json';
+
+      const objectUrl = URL.createObjectURL(new Blob([blob], { type: mimeType }));
+      const anchor    = document.createElement('a');
+      anchor.href     = objectUrl;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      // Release the temporary object URL after 10 s — enough time for any browser
+      // to start the download without leaking memory.
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+
+      // Truncation notice (surfaced via X-Rows-Truncated response header)
+      const truncatedCount = res.headers.get('X-Rows-Truncated');
+
+      // Build an in-panel preview from the already-consumed blob text.
+      const text = await blob.text();
+      let previewHtml;
+      if (outputFmt === 'json') {
+        try {
+          previewHtml = syntaxHighlight(
+            JSON.stringify(JSON.parse(text), null, 2).slice(0, 8000)
+          );
+        } catch {
+          previewHtml = escHtml(text.slice(0, 8000));
+        }
+      } else {
+        previewHtml = `<span class="text-dim">// CSV preview (first 4000 chars)\n\n</span>${escHtml(text.slice(0, 4000))}`;
+      }
+      document.getElementById('response-json').innerHTML = previewHtml;
+
+      document.getElementById('success-alert').classList.remove('hidden');
+      let detail = `Download started → ${filename}`;
+      if (truncatedCount) detail += ` · ${truncatedCount} rows dropped (sandbox limit)`;
+      document.getElementById('success-detail').textContent = detail;
+      setStatus('DONE');
+
+    // ── Error path ────────────────────────────────────────────────────────────────────────────────
     } else {
+      const body = await res.json().catch(() => ({}));
+      document.getElementById('response-json').innerHTML =
+        syntaxHighlight(JSON.stringify(body, null, 2));
       document.getElementById('error-alert').classList.remove('hidden');
-      document.getElementById('error-detail').textContent =
-        (() => {
+      document.getElementById('error-detail').textContent = (() => {
         const d = body.detail;
         if (!d) return `HTTP ${res.status} · ${body.message ?? 'Unexpected response'}`;
         if (typeof d === 'string') return `HTTP ${res.status} · ${d}`;
-        // FastAPI validation errors → array of {loc, msg}
-        if (Array.isArray(d)) {
+        if (Array.isArray(d))
           return `HTTP ${res.status} · ` + d.map(e => `${e.loc?.slice(-1)[0] ?? 'field'}: ${e.msg}`).join('; ');
-        }
-        // Our structured error object { error: { code, message } }
         if (d.error?.message) return `HTTP ${res.status} · [${d.error.code}] ${d.error.message}`;
         return `HTTP ${res.status} · ${JSON.stringify(d)}`;
       })();
       setStatus('ERROR');
     }
+
   } catch (err) {
     const ms = Math.round(performance.now() - t0);
     document.getElementById('resp-time').textContent = `${ms}ms`;
@@ -627,6 +679,7 @@ async function submitJob() {
   // Scroll response into view
   responseSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
+
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function clearFile() {
@@ -665,6 +718,7 @@ function setStatus(s) {
     READY:   'bg-emerald-400',
     POSTING: 'bg-amber-400 blink',
     QUEUED:  'bg-emerald-400',
+    DONE:    'bg-emerald-400',
     ERROR:   'bg-rose-400',
   };
   dot.className = `w-1.5 h-1.5 rounded-full ${colors[s] || 'bg-dim'}`;
@@ -682,7 +736,7 @@ function setBtnLoading(loading) {
   } else {
     btn.disabled = false;
     btn.classList.remove('opacity-70', 'cursor-not-allowed');
-    lbl.textContent = 'Process & Stream Data';
+    lbl.textContent = 'Process & Download File';
     ico.innerHTML = `<path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M12 5l7 7-7 7" />`;
   }
 }

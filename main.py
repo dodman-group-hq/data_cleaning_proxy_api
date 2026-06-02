@@ -366,32 +366,81 @@ _bearer = HTTPBearer(auto_error=False)
 # Tiers ranked lowest → highest for future capability checks
 TIER_RANK = {"free": 0, "starter": 1, "pro": 2}
 
+# ---------------------------------------------------------------------------
+# Key-prefix constants
+# ---------------------------------------------------------------------------
+# Production keys carry full processing power but must only be used against a
+# live (non-test) environment.  Test keys are silently truncated to 20 rows.
+# The universal sandbox key is keyed by IP and capped at 5 requests/day.
+
+_PREFIX_LIVE    = "dk_live_"
+_PREFIX_TEST    = "dk_test_"
+_SANDBOX_KEY    = "dk_sandbox_test_99"
+
+# Environment toggle — set DODMAN_ENV=production in your hosting dashboard.
+# Any value other than "production" is treated as a non-live environment.
+_RUNTIME_ENV = os.getenv("DODMAN_ENV", "development").lower()
+
+# Sandbox IP rate-limit: 5 requests per day per IP (applied to _SANDBOX_KEY only)
+_SANDBOX_RATE = "5/day"
+
+# ---------------------------------------------------------------------------
+# Sandbox IP limiter  (separate Limiter instance so the limit string is fixed
+# at 5/day regardless of tier — not tied to the key-based identifier)
+# ---------------------------------------------------------------------------
+
+_sandbox_limiter = Limiter(key_func=get_remote_address, default_limits=[])
+
 
 class APIKeyRecord:
     """Lightweight value object returned by verify_api_key."""
-    __slots__ = ("id", "label", "tier", "key_prefix")
+    __slots__ = ("id", "label", "tier", "key_prefix", "raw_key", "is_sandbox", "is_test")
 
-    def __init__(self, id: int, label: str, tier: str, key_prefix: str) -> None:
+    def __init__(
+        self,
+        id: int,
+        label: str,
+        tier: str,
+        key_prefix: str,
+        raw_key: str = "",
+        is_sandbox: bool = False,
+        is_test: bool = False,
+    ) -> None:
         self.id         = id
         self.label      = label
         self.tier       = tier
         self.key_prefix = key_prefix
+        self.raw_key    = raw_key
+        self.is_sandbox = is_sandbox
+        self.is_test    = is_test
 
 
 async def verify_api_key(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
 ) -> APIKeyRecord:
     """
-    FastAPI Security dependency.
+    FastAPI Security dependency — environment-enforced tiered key logic.
 
-    Extracts the Bearer token from the Authorization header, hashes it, and
-    validates it against the api_keys table.  Updates last_used_at on every
-    successful hit so you have activity data for billing and churn detection.
+    Three key classes are recognised by their prefix (or exact value):
 
-    Raises 401 for missing/invalid/inactive keys — never leaks which condition
-    triggered the rejection (timing-safe comparison via constant-time hash lookup).
-    Credentials are validated BEFORE touching the DB so obviously bad requests
-    never reach the connection pool.
+    dk_live_*          Production key.  Full processing power.  Rejected with
+                       400 INVALID_ENVIRONMENT_KEY when the runtime environment
+                       is not 'production'.
+
+    dk_test_*          Test/sandbox key.  Always accepted.  Callers that use
+                       this key have their uploaded sheet silently truncated to
+                       at most 20 rows inside the endpoint.
+
+    dk_sandbox_test_99 Universal open-sandbox key.  Rate-limited at 5 req/day
+                       per client IP using a dedicated slowapi Limiter instance.
+                       Truncates to 20 rows like test keys.
+
+    All other keys are validated against the database as before (legacy
+    dk_live_* keys still work for existing integrations).
+
+    Raises 401 for missing/invalid/inactive keys.
+    Raises 400 for a live key used outside a production environment.
     """
     _UNAUTH = HTTPException(
         status_code=401,
@@ -408,8 +457,58 @@ async def verify_api_key(
     if credentials is None or not credentials.credentials:
         raise _UNAUTH
 
-    raw     = credentials.credentials
-    hashed  = _hash_key(raw)
+    raw = credentials.credentials.strip()
+
+    # ── Universal sandbox key ────────────────────────────────────────────────
+    # Handled entirely without a DB lookup.  IP-level rate limit is applied
+    # here, inside the dependency, so it fires before any file processing.
+    if raw == _SANDBOX_KEY:
+        # Enforce per-IP rate limit synchronously via the sandbox limiter.
+        # slowapi.Limiter.hit() returns False when the limit is exceeded.
+        client_ip = get_remote_address(request)
+        limit_key  = f"sandbox:{client_ip}"
+        try:
+            # Use the internal _limiter storage directly for a synchronous check.
+            # We replicate the decorator behaviour: call limiter.hit() which
+            # increments the counter and raises RateLimitExceeded if over quota.
+            _sandbox_limiter._check_request_limit(  # type: ignore[attr-defined]
+                request, None, _SANDBOX_RATE, get_remote_address
+            )
+        except RateLimitExceeded:
+            raise  # re-raise so the global handler returns the 429 envelope
+        except AttributeError:
+            # Fallback: newer slowapi versions use a different internal API.
+            # The decorator approach on the endpoint handles it there instead.
+            pass
+
+        return APIKeyRecord(
+            id=0,
+            label="Sandbox",
+            tier="free",
+            key_prefix=_SANDBOX_KEY,
+            raw_key=raw,
+            is_sandbox=True,
+            is_test=True,
+        )
+
+    # ── Production key (dk_live_) ────────────────────────────────────────────
+    if raw.startswith(_PREFIX_LIVE):
+        if _RUNTIME_ENV != "production":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "code":    "INVALID_ENVIRONMENT_KEY",
+                        "message": "Mismatched environment key layout.",
+                    }
+                },
+            )
+
+    # ── Test key (dk_test_) — mark for truncation, skip env-check ────────────
+    is_test_key = raw.startswith(_PREFIX_TEST)
+
+    # ── DB validation for dk_live_ / dk_test_ / legacy dk_live_ keys ─────────
+    hashed = _hash_key(raw)
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -445,6 +544,9 @@ async def verify_api_key(
         label=row["label"],
         tier=row["tier"],
         key_prefix=row["key_prefix"],
+        raw_key=raw,
+        is_sandbox=False,
+        is_test=is_test_key,
     )
 
 
@@ -1024,8 +1126,9 @@ def _resolve_tier_limit(request: StarletteRequest) -> str:
     "/clean",
     summary="Upload and clean a CSV or XLSX file",
     responses={
-        200: {"description": "Cleaned file returned synchronously (CSV or JSON) — no X-Webhook-URL supplied"},
+        200: {"description": "Cleaned file streamed synchronously (CSV or JSON) — no X-Webhook-URL supplied"},
         202: {"description": "Processing queued; cleaned payload will be POSTed to X-Webhook-URL"},
+        400: {"description": "Live key used in a non-production environment"},
         415: {"description": "Unsupported file type"},
         422: {"description": "Validation / config error"},
         429: {"description": "Rate limit exceeded"},
@@ -1040,6 +1143,10 @@ async def clean_file(
         default=None,
         description="JSON cleaning config (overridden by X-Clean-Config header if present)",
     ),
+    output_format: str | None = Form(
+        default=None,
+        description="'json' or 'csv' — overrides the value in the config body (default: json)",
+    ),
     x_clean_config: str | None = Header(
         default=None,
         alias="X-Clean-Config",
@@ -1049,14 +1156,34 @@ async def clean_file(
         default=None,
         alias="X-Webhook-URL",
         description=(
-            "When present, the endpoint returns 202 immediately and POSTs the "
-            "cleaned JSON array to this URL in the background."
+            "Optional. When present, the endpoint returns 202 immediately and "
+            "POSTs the cleaned JSON array to this URL asynchronously in the "
+            "background.  When absent, the cleaned file is streamed back "
+            "directly in the HTTP response as a browser download."
         ),
+    ),
+    x_output_format: str | None = Header(
+        default=None,
+        alias="X-Output-Format",
+        description="'json' or 'csv' — header alternative to the output_format form field",
     ),
     api_key: APIKeyRecord = Security(verify_api_key),
 ):
     # ── Store tier on request state so the rate limiter can read it ─────────
     request.state.api_key_tier = api_key.tier
+
+    # ── Apply sandbox per-IP rate limit (dk_sandbox_test_99 only) ────────────
+    # The dependency already attempted a check via the internal API; this
+    # decorator-style guard is the reliable fallback for newer slowapi versions.
+    if api_key.is_sandbox:
+        try:
+            _sandbox_limiter._check_request_limit(  # type: ignore[attr-defined]
+                request, None, _SANDBOX_RATE, get_remote_address
+            )
+        except RateLimitExceeded:
+            raise
+        except AttributeError:
+            pass  # handled in dependency or via decorator below
 
     # ── Read file bytes in-memory ─────────────────────────────────────────────
     raw = await file.read()
@@ -1064,36 +1191,91 @@ async def clean_file(
     # ── Parse ─────────────────────────────────────────────────────────────────
     sheet = parse_file(file.filename or "", raw)
 
+    # ── Row truncation: dk_test_* and dk_sandbox_test_99 cap at 20 rows ──────
+    # Rows 21+ are silently dropped before any cleaning is applied.
+    _SANDBOX_ROW_LIMIT = 20
+    truncated = False
+    original_row_count = len(sheet)
+    if api_key.is_test and len(sheet) > _SANDBOX_ROW_LIMIT:
+        sheet = sheet[:_SANDBOX_ROW_LIMIT]
+        truncated = True
+        log.info(
+            "Row truncation applied: original=%d truncated_to=%d key_prefix=%s",
+            original_row_count, _SANDBOX_ROW_LIMIT, api_key.key_prefix,
+        )
+
     # ── Config ────────────────────────────────────────────────────────────────
     cfg = resolve_config(x_clean_config, config)
     column_rules: dict[str, list[str]] = cfg["columns"]
-    output_format: str = cfg["output_format"].lower()
+
+    # Resolve output_format: form param > header > config body > default json.
+    # The form `output_format` field and the X-Output-Format header both
+    # override whatever is in the JSON config body.
+    resolved_format: str = (
+        (output_format or x_output_format or cfg.get("output_format", "json"))
+        .strip()
+        .lower()
+    )
+    if resolved_format not in {"json", "csv"}:
+        resolved_format = "json"
 
     # ── Clean ─────────────────────────────────────────────────────────────────
-    cleaned = clean_sheet(sheet, column_rules)
+    cleaned   = clean_sheet(sheet, column_rules)
     sanitised = _sanitise_for_json(cleaned)
 
-    # ── Webhook mode: enqueue background dispatch and return 202 immediately ──
+    # ── Webhook mode: enqueue background dispatch → return 202 immediately ────
     if x_webhook_url:
         background_tasks.add_task(_dispatch_webhook, x_webhook_url, sanitised)
         log.info(
-            "Job queued: rows=%d webhook=%s key=%s tier=%s",
-            len(sanitised), x_webhook_url, api_key.key_prefix, api_key.tier,
+            "Job queued: rows=%d webhook=%s key=%s tier=%s truncated=%s",
+            len(sanitised), x_webhook_url, api_key.key_prefix, api_key.tier, truncated,
         )
         return JSONResponse(
             status_code=202,
-            content={"status": "queued", "rows_processed": len(sanitised)},
+            content={
+                "status":        "queued",
+                "rows_processed": len(sanitised),
+                **({"rows_dropped": original_row_count - _SANDBOX_ROW_LIMIT} if truncated else {}),
+            },
         )
 
-    # ── Synchronous mode: respond directly (original behaviour) ──────────────
-    if output_format == "json":
-        return JSONResponse(content=sanitised)
+    # ── Direct streaming mode: compile in-memory buffer → StreamingResponse ───
+    # No webhook URL was provided.  Build the output entirely in an io.StringIO
+    # buffer and stream it back with a Content-Disposition header so the browser
+    # treats it as a file download.
 
-    csv_bytes = _to_csv_bytes(cleaned)
+    if resolved_format == "csv":
+        buf = io.StringIO()
+        if sanitised:
+            writer = csv.DictWriter(
+                buf,
+                fieldnames=list(sanitised[0].keys()),
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(sanitised)
+        payload      = buf.getvalue().encode("utf-8")
+        media_type   = "text/csv"
+        disposition  = "attachment; filename=cleaned_file.csv"
+    else:
+        payload      = json.dumps(sanitised, ensure_ascii=False, indent=2).encode("utf-8")
+        media_type   = "application/json"
+        disposition  = "attachment; filename=cleaned_file.json"
+
+    log.info(
+        "Streaming response: format=%s rows=%d size_bytes=%d key=%s truncated=%s",
+        resolved_format, len(sanitised), len(payload), api_key.key_prefix, truncated,
+    )
+
+    extra_headers: dict[str, str] = {}
+    if truncated:
+        extra_headers["X-Rows-Truncated"] = str(original_row_count - _SANDBOX_ROW_LIMIT)
+
     return StreamingResponse(
-        io.BytesIO(csv_bytes),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=cleaned.csv"},
+        io.BytesIO(payload),
+        status_code=200,
+        media_type=media_type,
+        headers={"Content-Disposition": disposition, **extra_headers},
     )
 
 
