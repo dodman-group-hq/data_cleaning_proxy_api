@@ -1,38 +1,28 @@
 """
-Data Cleaning Proxy API
------------------------
-Stateless, single-file FastAPI service that accepts a .csv or .xlsx upload
-and applies column-level cleaning rules defined in a JSON config.
+Dodman · Data Cleaning Proxy API  v2.0
+---------------------------------------
+Stateless, single-file FastAPI service — cleaned rows returned directly or
+routed to a webhook.  Now includes:
 
-Config shape (passed as header X-Clean-Config or form field `config`):
-{
-  "columns": {
-    "email":  ["lowercase", "strip", "drop_empty"],
-    "age":    ["to_int",   "clamp:0:120"],
-    "name":   ["strip",    "title_case"],
-    "score":  ["to_float", "fill_mean"]
-  },
-  "output_format": "csv"   // "csv" | "json"  (default: csv)
-}
+  • Unified asyncpg schema (users / api_keys / billing_ledger)
+  • dk_test_ / dk_live_ prefix enforcement with environment mismatch guard
+  • Per-request billing telemetry (perf_counter → billing_ledger via BackgroundTasks)
+  • request_id middleware + global error envelope on every response
+  • Cookie-based auth (signup / login / logout) with passlib bcrypt
+  • Dashboard route serving a Jinja2 HTML template
 
-Supported rules (applied left-to-right per cell):
-  strip        – remove leading/trailing whitespace
-  lowercase    – .lower()
-  uppercase    – .upper()
-  title_case   – .title()
-  drop_empty   – mark blank/null cells; rows where ANY drop_empty column is
-                 empty are removed after per-cell passes
-  to_int       – coerce to int, null on failure
-  to_float     – coerce to float, null on failure
-  fill_mean    – replace nulls with column mean  (numeric columns only)
-  fill_median  – replace nulls with column median
-  fill_value:X – replace nulls with literal X
-  clamp:lo:hi  – numeric clamp  (lo/hi may be empty to skip one bound)
-  regex:PAT:REPL – re.sub(PAT, REPL, value)
+Env vars (set in .env or hosting dashboard):
+  TENANT_DATABASE_URL       asyncpg-compatible Neon/Postgres connection string
+  INTERNAL_SERVICE_SECRET   Shared secret for admin-only endpoints
+  SESSION_SECRET_KEY        Secret for signing session cookies (min 32 chars)
+  DODMAN_ENV                "production" enables sk_live_ keys  (default: development)
+  RATE_LIMIT_FREE           default 60/hour
+  RATE_LIMIT_STARTER        default 500/hour
 """
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import datetime
 import hashlib
@@ -44,64 +34,113 @@ import os
 import re
 import secrets
 import statistics
-from typing import Any
-from dotenv import load_dotenv
+import time
+import uuid
+from typing import Any, Callable
 
 import asyncpg
 import httpx
 import openpyxl
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, Security, UploadFile
+from dotenv import load_dotenv
+from fastapi import (
+    APIRouter, BackgroundTasks, Cookie, Depends, FastAPI,
+    File, Form, Header, HTTPException, Request, Response, Security, UploadFile,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from fastapi.templating import Jinja2Templates
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 
+load_dotenv()
 log = logging.getLogger(__name__)
 
-# Load the .env file explicitly
-load_dotenv()
 # ---------------------------------------------------------------------------
-# App
+# Configuration
 # ---------------------------------------------------------------------------
 
-app = FastAPI(
-    title="Dodman · Data Cleaning Proxy",
-    description=(
-        "Stateless in-memory CSV/XLSX cleaner driven by a JSON rule config.\n\n"
-        "**Interactive docs:** `/docs` (Swagger UI) · `/redoc` (ReDoc)"
-    ),
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-)
+TENANT_DATABASE_URL     = os.getenv("TENANT_DATABASE_URL", "")
+INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
+SESSION_SECRET_KEY      = os.getenv("SESSION_SECRET_KEY", secrets.token_hex(32))
+_RUNTIME_ENV            = os.getenv("DODMAN_ENV", "development").lower()
 
-# Allow requests from any origin — covers browsers opening index.html via
-# file://, localhost, or any custom dev port without triggering CORS preflight
-# blocks.  Tighten allow_origins to specific domains in production.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["*"],
-)
+RATE_LIMIT_FREE     = os.getenv("RATE_LIMIT_FREE",    "60/hour")
+RATE_LIMIT_STARTER  = os.getenv("RATE_LIMIT_STARTER", "500/hour")
+RATE_LIMIT_DEFAULT  = os.getenv("RATE_LIMIT_DEFAULT", "60/hour")
+
+# ---------------------------------------------------------------------------
+# Key-prefix constants
+# ---------------------------------------------------------------------------
+
+_PREFIX_LIVE     = "dk_live_"
+_PREFIX_TEST     = "dk_test_"
+_SANDBOX_KEY     = "dk_sandbox_test_99"        # legacy open-sandbox key
+_KEY_BYTES       = 32                           # 256 bits entropy
+
+_SANDBOX_MAX_HITS = 5
+_SANDBOX_RATE     = "5/day"
+
+# ---------------------------------------------------------------------------
+# Password hashing
+# ---------------------------------------------------------------------------
+
+_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def _hash_password(plain: str) -> str:
+    return _pwd_ctx.hash(plain)
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return _pwd_ctx.verify(plain, hashed)
+
+
+# ---------------------------------------------------------------------------
+# Session token helpers  (simple signed token — no JWT dep required)
+# ---------------------------------------------------------------------------
+
+def _make_session_token(user_id: str) -> str:
+    """
+    Create a tamper-evident session token:
+      <user_id>:<nonce>:<hmac_hex>
+    The HMAC uses SESSION_SECRET_KEY so we can validate it without a DB lookup.
+    """
+    import hmac as _hmac
+    nonce   = secrets.token_urlsafe(16)
+    payload = f"{user_id}:{nonce}"
+    sig     = _hmac.new(SESSION_SECRET_KEY.encode(), payload.encode(), "sha256").hexdigest()
+    return f"{payload}:{sig}"
+
+
+def _decode_session_token(token: str) -> str | None:
+    """Return the user_id if the token is valid, else None."""
+    import hmac as _hmac
+    try:
+        parts = token.split(":")
+        if len(parts) != 3:
+            return None
+        user_id, nonce, sig = parts
+        payload  = f"{user_id}:{nonce}"
+        expected = _hmac.new(SESSION_SECRET_KEY.encode(), payload.encode(), "sha256").hexdigest()
+        if not _hmac.compare_digest(sig, expected):
+            return None
+        return user_id
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Rate limiter
 # ---------------------------------------------------------------------------
-# The identifier function keys rate limits off the API key (from the
-# Authorization header) when present, falling back to client IP.  This means
-# each customer's quota is tracked independently — one customer flooding the
-# API doesn't eat into another's limit.
-
 
 def _rate_limit_identifier(request: StarletteRequest) -> str:
-    """Return the API key token if present, else the client IP."""
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
@@ -111,99 +150,58 @@ def _rate_limit_identifier(request: StarletteRequest) -> str:
 
 
 limiter = Limiter(key_func=_rate_limit_identifier, default_limits=[])
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Dodman · Data Cleaning Proxy",
+    description=(
+        "Stateless in-memory CSV/XLSX cleaner driven by a JSON rule config.\n\n"
+        "**Interactive docs:** `/docs` · `/redoc`"
+    ),
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
+
 app.state.limiter = limiter
 
+# Templates — rendered for the dashboard route
+templates = Jinja2Templates(directory="templates")
 
-# ---------------------------------------------------------------------------
-# Global exception handlers
-# ---------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST", "GET", "OPTIONS", "PATCH", "DELETE"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
 
+# ===========================================================================
+# Module 3 — request_id middleware + global error envelope
+# ===========================================================================
 
-@app.exception_handler(RateLimitExceeded)
-async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    """Return a clean, uniform 429 — never expose slowapi internals."""
-    return JSONResponse(
-        status_code=429,
-        content={
-            "error": {
-                "code":    "RATE_LIMIT_EXCEEDED",
-                "message": "Rate limit exceeded. Please upgrade your tier or slow down.",
-                "limit":   str(exc.detail),
-            }
-        },
-        headers={"Retry-After": "60"},
-    )
-
-
-@app.exception_handler(RequestValidationError)
-async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+class RequestIdMiddleware(BaseHTTPMiddleware):
     """
-    Replace FastAPI's default 422 response with a consistent error envelope.
-    Surfaces the first meaningful error clearly instead of dumping raw Pydantic
-    internals at the caller.
+    Attach a unique request_id UUID to every incoming request so that error
+    envelopes, logs, and traces share a common correlation handle.
     """
-    errors = exc.errors()
-    first  = errors[0] if errors else {}
-
-    # Build a human-readable field path: ["body", "label"] → "body.label"
-    loc  = " → ".join(str(p) for p in first.get("loc", []))
-    msg  = first.get("msg", "Validation error")
-    kind = first.get("type", "unknown")
-
-    # Give actionable hints for the most common mistakes
-    hints: dict[str, str] = {
-        "missing":        f"'{loc}' is required but was not provided.",
-        "string_too_short": f"'{loc}' is too short.",
-        "value_error":    f"'{loc}' has an invalid value: {msg}.",
-    }
-    human = hints.get(kind, f"'{loc}': {msg}")
-
-    return JSONResponse(
-        status_code=422,
-        content={
-            "error": {
-                "code":    "VALIDATION_ERROR",
-                "message": human,
-                "fields":  [
-                    {
-                        "field":   " → ".join(str(p) for p in e.get("loc", [])),
-                        "issue":   e.get("msg", ""),
-                        "type":    e.get("type", ""),
-                    }
-                    for e in errors
-                ],
-            }
-        },
-    )
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        request_id = str(uuid.uuid4())
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 
 
-@app.exception_handler(HTTPException)
-async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    """
-    Normalise all HTTPExceptions that don't already use the error envelope.
-    Ensures every error response — from any part of the stack — has the same shape.
-    """
-    detail = exc.detail
+app.add_middleware(RequestIdMiddleware)
 
-    # Already in envelope format — pass through untouched
-    if isinstance(detail, dict) and "error" in detail:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content=detail,
-            headers=getattr(exc, "headers", None) or {},
-        )
 
-    # Plain string or anything else — wrap it
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": {
-                "code":    _status_to_code(exc.status_code),
-                "message": detail if isinstance(detail, str) else str(detail),
-            }
-        },
-        headers=getattr(exc, "headers", None) or {},
-    )
+def _get_request_id(request: Request) -> str:
+    return getattr(request.state, "request_id", "unknown")
 
 
 def _status_to_code(status: int) -> str:
@@ -221,60 +219,118 @@ def _status_to_code(status: int) -> str:
         503: "SERVICE_UNAVAILABLE",
     }.get(status, f"HTTP_{status}")
 
-# ---------------------------------------------------------------------------
-# Versioned router
-# ---------------------------------------------------------------------------
-# Routes are defined on this router and mounted by the app under a versioned
-# prefix (e.g. /api/v1).  To add a v2, create a new router in a separate
-# module and call app.include_router(v2_router, prefix="/api/v2").
 
-router = APIRouter(prefix="/api/v1", tags=["v1"])
+def _error_envelope(
+    code: str,
+    message: str,
+    request_id: str,
+    extra: dict | None = None,
+) -> dict:
+    payload: dict[str, Any] = {
+        "error": {
+            "code":       code,
+            "message":    message,
+            "request_id": request_id,
+        }
+    }
+    if extra:
+        payload["error"].update(extra)
+    return payload
 
-# ---------------------------------------------------------------------------
-# Types
-# ---------------------------------------------------------------------------
 
-Row = dict[str, Any]
-Sheet = list[Row]
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content=_error_envelope(
+            "RATE_LIMIT_EXCEEDED",
+            "Rate limit exceeded. Please upgrade your tier or slow down.",
+            _get_request_id(request),
+            {"limit": str(exc.detail)},
+        ),
+        headers={"Retry-After": "60"},
+    )
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
-# Loaded from environment — set these in your Render dashboard or .env file.
-# TENANT_DATABASE_URL : asyncpg-compatible Neon connection string
-# INTERNAL_SERVICE_SECRET : shared secret that protects key-management endpoints
-# Required at startup; the app will not start if they are absent.
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = exc.errors()
+    first  = errors[0] if errors else {}
+    loc    = " → ".join(str(p) for p in first.get("loc", []))
+    msg    = first.get("msg", "Validation error")
+    kind   = first.get("type", "unknown")
+    hints: dict[str, str] = {
+        "missing":          f"'{loc}' is required but was not provided.",
+        "string_too_short": f"'{loc}' is too short.",
+        "value_error":      f"'{loc}' has an invalid value: {msg}.",
+    }
+    human = hints.get(kind, f"'{loc}': {msg}")
+    return JSONResponse(
+        status_code=422,
+        content=_error_envelope(
+            "VALIDATION_FAILED",
+            human,
+            _get_request_id(request),
+            {
+                "fields": [
+                    {
+                        "field": " → ".join(str(p) for p in e.get("loc", [])),
+                        "issue": e.get("msg", ""),
+                        "type":  e.get("type", ""),
+                    }
+                    for e in errors
+                ]
+            },
+        ),
+    )
 
-TENANT_DATABASE_URL     = os.getenv("TENANT_DATABASE_URL", "")
-INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
 
-# ---------------------------------------------------------------------------
-# Rate limit configuration
-# ---------------------------------------------------------------------------
-# Adjust these via environment variables — no code changes needed.
-# Format: "<count>/<period>"  where period = second | minute | hour | day
-#
-# Tier mapping (enforced in the identifier function below):
-#   free    → RATE_LIMIT_FREE    default: 60 requests/hour
-#   starter → RATE_LIMIT_STARTER default: 500 requests/hour
-#   pro     → no rate limiting applied
-#
-# Set RATE_LIMIT_FREE=100/hour in Render to change it without a deploy.
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    detail     = exc.detail
+    request_id = _get_request_id(request)
 
-RATE_LIMIT_FREE    = os.getenv("RATE_LIMIT_FREE",    "60/hour")
-RATE_LIMIT_STARTER = os.getenv("RATE_LIMIT_STARTER", "500/hour")
-RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "60/hour")   # fallback
+    # Already fully enveloped — inject request_id and pass through
+    if isinstance(detail, dict) and "error" in detail:
+        detail["error"].setdefault("request_id", request_id)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=detail,
+            headers=getattr(exc, "headers", None) or {},
+        )
 
-# ---------------------------------------------------------------------------
-# Database — connection pool (initialised on startup, torn down on shutdown)
-# ---------------------------------------------------------------------------
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_envelope(
+            _status_to_code(exc.status_code),
+            detail if isinstance(detail, str) else str(detail),
+            request_id,
+        ),
+        headers=getattr(exc, "headers", None) or {},
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    log.exception("Unhandled exception on %s %s", request.method, request.url)
+    return JSONResponse(
+        status_code=500,
+        content=_error_envelope(
+            "INTERNAL_SERVER_ERROR",
+            "An unexpected error occurred. Our team has been notified.",
+            _get_request_id(request),
+        ),
+    )
+
+
+# ===========================================================================
+# Database — connection pool
+# ===========================================================================
 
 _pool: asyncpg.Pool | None = None
 
 
 async def get_pool() -> asyncpg.Pool:
-    """Return the live connection pool, raising clearly if it is unavailable."""
     if _pool is None:
         raise HTTPException(
             status_code=503,
@@ -283,24 +339,77 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 
+# ---------------------------------------------------------------------------
+# Schema bootstrap  (idempotent — mirrors the SQL migration file)
+# ---------------------------------------------------------------------------
+
+_BOOTSTRAP_SQL = """
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+CREATE TABLE IF NOT EXISTS users (
+    id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    email         VARCHAR(320) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID         REFERENCES users(id) ON DELETE SET NULL,
+    key_hash      VARCHAR(64)  NOT NULL UNIQUE,
+    key_prefix    VARCHAR(32)  NOT NULL,
+    label         TEXT         NOT NULL DEFAULT '',
+    environment   VARCHAR(8)   NOT NULL DEFAULT 'test'
+                               CHECK (environment IN ('test', 'live')),
+    tier          VARCHAR(16)  NOT NULL DEFAULT 'free'
+                               CHECK (tier IN ('free', 'starter', 'pro')),
+    is_active     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    last_used_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash   ON api_keys (key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user   ON api_keys (user_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys (is_active);
+CREATE INDEX IF NOT EXISTS idx_api_keys_env    ON api_keys (environment);
+
+CREATE TABLE IF NOT EXISTS billing_ledger (
+    id          BIGSERIAL    PRIMARY KEY,
+    api_key_id  UUID         REFERENCES api_keys(id) ON DELETE SET NULL,
+    key_prefix  VARCHAR(32)  NOT NULL DEFAULT '',
+    timestamp   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    rows_in     INT          NOT NULL DEFAULT 0,
+    rows_out    INT          NOT NULL DEFAULT 0,
+    file_type   VARCHAR(8)   NOT NULL DEFAULT '',
+    duration_ms INT          NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_api_key   ON billing_ledger (api_key_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_timestamp ON billing_ledger (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_prefix    ON billing_ledger (key_prefix);
+"""
+
+
+async def _bootstrap_schema(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(_BOOTSTRAP_SQL)
+    log.info("Schema bootstrap complete.")
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _pool
     if not TENANT_DATABASE_URL:
-        log.warning(
-            "TENANT_DATABASE_URL not set — auth endpoints will return 503. "
-            "Set the env var and restart to enable API key validation."
-        )
+        log.warning("TENANT_DATABASE_URL not set — DB features disabled.")
         return
     try:
         _pool = await asyncpg.create_pool(
             TENANT_DATABASE_URL,
-            min_size=1,
-            max_size=5,
-            command_timeout=10,
+            min_size=2,
+            max_size=10,
+            command_timeout=15,
         )
         await _bootstrap_schema(_pool)
-        log.info("Database pool ready. Docs: http://localhost:8000/docs")
+        log.info("Database pool ready.  Docs: http://localhost:8000/docs")
     except Exception as exc:
         log.error("Failed to connect to database: %r", exc)
 
@@ -311,203 +420,138 @@ async def _shutdown() -> None:
         await _pool.close()
 
 
-# ---------------------------------------------------------------------------
-# Schema bootstrap  (idempotent — safe to run on every startup)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Module 2 — Billing telemetry (BackgroundTask)
+# ===========================================================================
 
-_BOOTSTRAP_SQL = """
-CREATE TABLE IF NOT EXISTS api_keys (
-    id            BIGSERIAL PRIMARY KEY,
-    label         TEXT        NOT NULL,
-    key_hash      TEXT        NOT NULL UNIQUE,
-    key_prefix    TEXT        NOT NULL,
-    tier          TEXT        NOT NULL DEFAULT 'free'
-                              CHECK (tier IN ('free', 'starter', 'pro')),
-    is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_used_at  TIMESTAMPTZ
-);
+async def _write_billing_ledger(
+    pool:       asyncpg.Pool,
+    api_key_id: str | None,
+    key_prefix: str,
+    rows_in:    int,
+    rows_out:   int,
+    file_type:  str,
+    duration_ms: int,
+) -> None:
+    """
+    Fire-and-forget ledger insert.  Called via BackgroundTasks so it never
+    blocks the HTTP response.  Failures are logged but never propagated.
+    """
+    try:
+        # api_key_id must be a UUID or NULL; sandbox keys have no DB row.
+        key_uuid: Any = None
+        if api_key_id:
+            try:
+                key_uuid = uuid.UUID(str(api_key_id))
+            except ValueError:
+                key_uuid = None
 
-CREATE INDEX IF NOT EXISTS idx_api_keys_hash   ON api_keys (key_hash);
-CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys (is_active);
-"""
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO billing_ledger
+                    (api_key_id, key_prefix, rows_in, rows_out, file_type, duration_ms)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                key_uuid,
+                key_prefix,
+                rows_in,
+                rows_out,
+                file_type,
+                duration_ms,
+            )
+    except Exception:
+        log.exception("billing_ledger insert failed — non-fatal")
 
 
-async def _bootstrap_schema(pool: asyncpg.Pool) -> None:
-    async with pool.acquire() as conn:
-        await conn.execute(_BOOTSTRAP_SQL)
-    log.info("Schema bootstrap complete.")
-
-
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # API key helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-_KEY_PREFIX = "dk_live_"
-_KEY_BYTES  = 32        # 256 bits of entropy → 43-char base64url suffix
-
-
-def _generate_raw_key() -> str:
-    """Return a brand-new plaintext API key.  Shown to the user exactly once."""
-    return _KEY_PREFIX + secrets.token_urlsafe(_KEY_BYTES)
+def _generate_raw_key(environment: str) -> str:
+    prefix = _PREFIX_LIVE if environment == "live" else _PREFIX_TEST
+    return prefix + secrets.token_urlsafe(_KEY_BYTES)
 
 
 def _hash_key(raw: str) -> str:
-    """SHA-256 hex digest — what we store; never the plaintext."""
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# Authentication dependency
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Module 2 — Prefix enforcement + authentication dependency
+# ===========================================================================
 
 _bearer = HTTPBearer(auto_error=False)
-
-# Tiers ranked lowest → highest for future capability checks
 TIER_RANK = {"free": 0, "starter": 1, "pro": 2}
-
-# ---------------------------------------------------------------------------
-# Key-prefix constants
-# ---------------------------------------------------------------------------
-# Production keys carry full processing power but must only be used against a
-# live (non-test) environment.  Test keys are silently truncated to 20 rows.
-# The universal sandbox key is keyed by IP and capped at 5 requests/day.
-
-_PREFIX_LIVE    = "dk_live_"
-_PREFIX_TEST    = "dk_test_"
-_SANDBOX_KEY    = "dk_sandbox_test_99"
-
-# Environment toggle — set DODMAN_ENV=production in your hosting dashboard.
-# Any value other than "production" is treated as a non-live environment.
-_RUNTIME_ENV = os.getenv("DODMAN_ENV", "development").lower()
-
-# Sandbox IP rate-limit: 5 requests per day per IP (applied to _SANDBOX_KEY only)
-_SANDBOX_RATE = "5/day"
-
-# ---------------------------------------------------------------------------
-# Sandbox IP rate-limit helper
-# ---------------------------------------------------------------------------
-# We enforce 5 req/day per IP for dk_sandbox_test_99 without relying on any
-# slowapi internal methods (_check_request_limit, etc.) that differ across
-# versions.  Instead we call the public limits.storage hit() / get_expiry()
-# API that slowapi itself uses internally — stable across 0.1.x → 0.2.x.
-#
-# Storage backend mirrors the main limiter so both share the same Redis/
-# memory store.  A dedicated key namespace ("sandbox:<ip>") keeps sandbox
-# counts isolated from tier-based counts.
-
-_SANDBOX_MAX_HITS  = 5
-_SANDBOX_WINDOW_S  = 86_400   # 1 day in seconds
-
-
-async def _check_sandbox_ip_limit(request: StarletteRequest) -> None:
-    """
-    Raise RateLimitExceeded (429) if the client IP has already consumed
-    _SANDBOX_MAX_HITS requests in the current 24-hour window.
-
-    Uses the same in-memory (or Redis) storage backend that the main
-    slowapi Limiter uses, via its public `_storage` attribute — which is
-    stable across all released slowapi versions.
-    """
-    from limits import parse as _parse_limit          # bundled with slowapi
-    from limits.storage import MemoryStorage           # always available
-
-    client_ip  = get_remote_address(request)
-    limit_key  = f"sandbox_ip:{client_ip}"
-
-    # Grab the storage backend from the main limiter (already initialised).
-    storage = getattr(limiter, "_storage", None)
-    if storage is None:
-        # Limiter not yet initialised (e.g. unit-test context) — fail open.
-        return
-
-    # limits library: parse "5/day" → RateLimitItem
-    rate_item = _parse_limit(_SANDBOX_RATE)
-
-    # hit() increments the counter and returns (remaining, reset_time).
-    # It returns True if the request is allowed, False if over limit.
-    # The API differs slightly between limits 2.x and 3.x so we branch.
-    try:
-        # limits ≥ 3.x: storage.acquire_entry(key, limit, expiry) → bool
-        allowed = storage.acquire_entry(
-            limit_key,
-            rate_item.amount,
-            rate_item.get_expiry(),
-        )
-    except (AttributeError, TypeError):
-        try:
-            # limits 2.x: storage.incr(key, expiry, amount) → int
-            count = storage.incr(limit_key, rate_item.get_expiry(), 1)
-            allowed = count <= rate_item.amount
-        except Exception:
-            # Storage API is unknown — fail open rather than break the endpoint.
-            return
-
-    if not allowed:
-        raise RateLimitExceeded(
-            f"{_SANDBOX_MAX_HITS} per day"
-        )
 
 
 class APIKeyRecord:
-    """Lightweight value object returned by verify_api_key."""
-    __slots__ = ("id", "label", "tier", "key_prefix", "raw_key", "is_sandbox", "is_test")
+    __slots__ = ("id", "label", "tier", "key_prefix", "environment",
+                 "raw_key", "is_sandbox", "is_test", "user_id")
 
     def __init__(
         self,
-        id: int,
-        label: str,
-        tier: str,
-        key_prefix: str,
-        raw_key: str = "",
-        is_sandbox: bool = False,
-        is_test: bool = False,
+        id:          Any,
+        label:       str,
+        tier:        str,
+        key_prefix:  str,
+        environment: str  = "test",
+        raw_key:     str  = "",
+        is_sandbox:  bool = False,
+        is_test:     bool = False,
+        user_id:     Any  = None,
     ) -> None:
-        self.id         = id
-        self.label      = label
-        self.tier       = tier
-        self.key_prefix = key_prefix
-        self.raw_key    = raw_key
-        self.is_sandbox = is_sandbox
-        self.is_test    = is_test
+        self.id          = id
+        self.label       = label
+        self.tier        = tier
+        self.key_prefix  = key_prefix
+        self.environment = environment
+        self.raw_key     = raw_key
+        self.is_sandbox  = is_sandbox
+        self.is_test     = is_test
+        self.user_id     = user_id
+
+
+async def _check_sandbox_ip_limit(request: StarletteRequest) -> None:
+    from limits import parse as _parse_limit
+
+    client_ip = get_remote_address(request)
+    limit_key = f"sandbox_ip:{client_ip}"
+    storage   = getattr(limiter, "_storage", None)
+    if storage is None:
+        return
+    rate_item = _parse_limit(_SANDBOX_RATE)
+    try:
+        allowed = storage.acquire_entry(limit_key, rate_item.amount, rate_item.get_expiry())
+    except (AttributeError, TypeError):
+        try:
+            count   = storage.incr(limit_key, rate_item.get_expiry(), 1)
+            allowed = count <= rate_item.amount
+        except Exception:
+            return
+    if not allowed:
+        raise RateLimitExceeded(f"{_SANDBOX_MAX_HITS} per day")
 
 
 async def verify_api_key(
-    request: Request,
+    request:     Request,
     credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
 ) -> APIKeyRecord:
     """
-    FastAPI Security dependency — environment-enforced tiered key logic.
+    Dependency: authenticates the Bearer token and enforces prefix/environment rules.
 
-    Three key classes are recognised by their prefix (or exact value):
-
-    dk_live_*          Production key.  Full processing power.  Rejected with
-                       400 INVALID_ENVIRONMENT_KEY when the runtime environment
-                       is not 'production'.
-
-    dk_test_*          Test/sandbox key.  Always accepted.  Callers that use
-                       this key have their uploaded sheet silently truncated to
-                       at most 20 rows inside the endpoint.
-
-    dk_sandbox_test_99 Universal open-sandbox key.  Rate-limited at 5 req/day
-                       per client IP using a dedicated slowapi Limiter instance.
-                       Truncates to 20 rows like test keys.
-
-    All other keys are validated against the database as before (legacy
-    dk_live_* keys still work for existing integrations).
-
-    Raises 401 for missing/invalid/inactive keys.
-    Raises 400 for a live key used outside a production environment.
+    dk_live_*          Live key.  Requires DODMAN_ENV=production; raises 400
+                       INVALID_ENVIRONMENT_KEY if the runtime env is not live.
+    dk_test_*          Test key.  Truncates upload to 20 rows; accepted everywhere.
+    dk_sandbox_test_99 Universal open-sandbox key.  5 req/day per IP; 20-row cap.
     """
     _UNAUTH = HTTPException(
         status_code=401,
-        detail={
-            "error": {
-                "code":    "INVALID_API_KEY",
-                "message": "Missing or invalid API key. "
-                           "Pass your key as: Authorization: Bearer dk_live_...",
-            }
-        },
+        detail=_error_envelope(
+            "INVALID_API_KEY",
+            "Missing or invalid API key. Pass your key as: Authorization: Bearer dk_test_...",
+            _get_request_id(request),
+        ),
         headers={"WWW-Authenticate": "Bearer"},
     )
 
@@ -516,49 +560,44 @@ async def verify_api_key(
 
     raw = credentials.credentials.strip()
 
-    # ── Universal sandbox key ────────────────────────────────────────────────
-    # Handled entirely without a DB lookup.  IP-level rate limit is applied
-    # here, inside the dependency, so it fires before any file processing.
+    # ── Universal sandbox key ─────────────────────────────────────────────────
     if raw == _SANDBOX_KEY:
-        # Enforce per-IP rate limit via our stable storage helper.
-        # _check_sandbox_ip_limit raises RateLimitExceeded (429) when the
-        # caller has exceeded 5 requests in the current 24-hour window.
         await _check_sandbox_ip_limit(request)
-
         return APIKeyRecord(
-            id=0,
-            label="Sandbox",
-            tier="free",
-            key_prefix=_SANDBOX_KEY,
-            raw_key=raw,
-            is_sandbox=True,
-            is_test=True,
+            id=None, label="Sandbox", tier="free",
+            key_prefix=_SANDBOX_KEY, environment="test",
+            raw_key=raw, is_sandbox=True, is_test=True,
         )
 
-    # ── Production key (dk_live_) ────────────────────────────────────────────
+    # ── Prefix / environment mismatch enforcement ─────────────────────────────
     if raw.startswith(_PREFIX_LIVE):
         if _RUNTIME_ENV != "production":
             raise HTTPException(
                 status_code=400,
-                detail={
-                    "error": {
-                        "code":    "INVALID_ENVIRONMENT_KEY",
-                        "message": "Mismatched environment key layout.",
-                    }
-                },
+                detail=_error_envelope(
+                    "INVALID_ENVIRONMENT_KEY",
+                    "Mismatched environment key layout. "
+                    "A dk_live_ key cannot be used outside a production environment.",
+                    _get_request_id(request),
+                ),
             )
+    elif raw.startswith(_PREFIX_TEST):
+        # Test keys are always accepted regardless of runtime env
+        pass
+    else:
+        # Legacy dk_live_ keys or unknown prefixes go straight to DB validation
+        pass
 
-    # ── Test key (dk_test_) — mark for truncation, skip env-check ────────────
     is_test_key = raw.startswith(_PREFIX_TEST)
 
-    # ── DB validation for dk_live_ / dk_test_ / legacy dk_live_ keys ─────────
+    # ── DB validation ─────────────────────────────────────────────────────────
     hashed = _hash_key(raw)
+    pool   = await get_pool()
 
-    pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, label, tier, key_prefix, is_active
+            SELECT id, user_id, label, tier, key_prefix, environment, is_active
             FROM   api_keys
             WHERE  key_hash = $1
             LIMIT  1
@@ -569,7 +608,32 @@ async def verify_api_key(
     if row is None or not row["is_active"]:
         raise _UNAUTH
 
-    # Fire-and-forget last_used_at update — don't block the response on it
+    # ── Secondary environment guard: key's stored environment vs request key ──
+    # A key stored as environment='test' that physically has a dk_live_ prefix
+    # is a data anomaly — reject it explicitly.
+    stored_env = row["environment"]
+    if raw.startswith(_PREFIX_LIVE) and stored_env != "live":
+        raise HTTPException(
+            status_code=400,
+            detail=_error_envelope(
+                "INVALID_ENVIRONMENT_KEY",
+                "This dk_live_ key is registered as a test-environment key. "
+                "Check your key configuration.",
+                _get_request_id(request),
+            ),
+        )
+    if raw.startswith(_PREFIX_TEST) and stored_env != "test":
+        raise HTTPException(
+            status_code=400,
+            detail=_error_envelope(
+                "INVALID_ENVIRONMENT_KEY",
+                "This dk_test_ key is registered as a live-environment key. "
+                "Check your key configuration.",
+                _get_request_id(request),
+            ),
+        )
+
+    # Fire-and-forget last_used_at update
     async def _touch() -> None:
         try:
             async with (await get_pool()).acquire() as conn:
@@ -578,133 +642,372 @@ async def verify_api_key(
                     row["id"],
                 )
         except Exception:
-            pass  # non-critical
+            pass
 
-    import asyncio
     asyncio.ensure_future(_touch())
 
     return APIKeyRecord(
-        id=row["id"],
+        id=str(row["id"]),
         label=row["label"],
         tier=row["tier"],
         key_prefix=row["key_prefix"],
+        environment=stored_env,
         raw_key=raw,
         is_sandbox=False,
         is_test=is_test_key,
+        user_id=str(row["user_id"]) if row["user_id"] else None,
     )
 
 
-# ---------------------------------------------------------------------------
-# Internal admin guard  (protects key-management endpoints)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Internal admin guard
+# ===========================================================================
 
 def verify_internal_secret(
     x_internal_secret: str | None = Header(default=None, alias="X-Internal-Secret"),
 ) -> None:
-    """
-    Dependency that checks the X-Internal-Secret header matches
-    INTERNAL_SERVICE_SECRET.  Used to protect admin-only endpoints that
-    should never be reachable by external clients.
-    """
     if not INTERNAL_SERVICE_SECRET:
-        raise HTTPException(
-            status_code=503,
-            detail="INTERNAL_SERVICE_SECRET not configured on this server.",
-        )
-    if not secrets.compare_digest(
-        x_internal_secret or "",
-        INTERNAL_SERVICE_SECRET,
-    ):
+        raise HTTPException(status_code=503, detail="INTERNAL_SERVICE_SECRET not configured.")
+    if not secrets.compare_digest(x_internal_secret or "", INTERNAL_SERVICE_SECRET):
         raise HTTPException(
             status_code=403,
             detail={"error": {"code": "FORBIDDEN", "message": "Invalid internal secret."}},
         )
 
 
+# ===========================================================================
+# Versioned API router
+# ===========================================================================
+
+router = APIRouter(prefix="/api/v1", tags=["v1"])
+
+Row   = dict[str, Any]
+Sheet = list[Row]
+
 # ---------------------------------------------------------------------------
-# Key-management endpoint  (internal only)
+# Rate-limit resolver
 # ---------------------------------------------------------------------------
 
+def _resolve_tier_limit(request: StarletteRequest) -> str:
+    tier = getattr(request.state, "api_key_tier", "free")
+    return {
+        "free":    RATE_LIMIT_FREE,
+        "starter": RATE_LIMIT_STARTER,
+        "pro":     "99999/hour",
+    }.get(tier, RATE_LIMIT_DEFAULT)
+
+
+# ===========================================================================
+# Module 4 — Auth routes (signup / login / logout)
+# ===========================================================================
+
+auth_router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+class SignupRequest(BaseModel):
+    email:    EmailStr
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email:    EmailStr
+    password: str
+
+
+@auth_router.post("/signup", status_code=201, summary="Register a new user account")
+async def signup(
+    request: Request,
+    body:    SignupRequest,
+    pool:    asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    # Normalise email
+    email = body.email.lower().strip()
+
+    if len(body.password) < 8:
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                "Password must be at least 8 characters.",
+                _get_request_id(request),
+            ),
+        )
+
+    pw_hash = _hash_password(body.password)
+
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO users (email, password_hash)
+                VALUES ($1, $2)
+                RETURNING id, created_at
+                """,
+                email, pw_hash,
+            )
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(
+            status_code=409,
+            detail=_error_envelope(
+                "CONFLICT",
+                "An account with that email already exists.",
+                _get_request_id(request),
+            ),
+        )
+
+    user_id = str(row["id"])
+    log.info("User registered: id=%s email=%s", user_id, email)
+    return JSONResponse(
+        status_code=201,
+        content={"user_id": user_id, "email": email, "created_at": row["created_at"].isoformat()},
+    )
+
+
+@auth_router.post("/login", summary="Authenticate and receive a session cookie")
+async def login(
+    request:  Request,
+    response: Response,
+    body:     LoginRequest,
+    pool:     asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    email = body.email.lower().strip()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, password_hash FROM users WHERE email = $1",
+            email,
+        )
+
+    _INVALID = HTTPException(
+        status_code=401,
+        detail=_error_envelope(
+            "UNAUTHORIZED",
+            "Invalid email or password.",
+            _get_request_id(request),
+        ),
+    )
+    if row is None:
+        raise _INVALID
+    if not _verify_password(body.password, row["password_hash"]):
+        raise _INVALID
+
+    user_id = str(row["id"])
+    token   = _make_session_token(user_id)
+
+    resp = JSONResponse(content={"status": "ok", "user_id": user_id})
+    resp.set_cookie(
+        key="dodman_session",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=(_RUNTIME_ENV == "production"),
+        max_age=60 * 60 * 24 * 7,   # 7 days
+    )
+    log.info("User logged in: id=%s", user_id)
+    return resp
+
+
+@auth_router.post("/logout", summary="Invalidate the session cookie")
+async def logout() -> Response:
+    resp = JSONResponse(content={"status": "logged_out"})
+    resp.delete_cookie("dodman_session")
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Auth page routes (serve the HTML templates)
+# ---------------------------------------------------------------------------
+
+@auth_router.get("/login-page", include_in_schema=False)
+async def login_page(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+
+
+@auth_router.get("/signup-page", include_in_schema=False)
+async def signup_page(request: Request):
+    return templates.TemplateResponse("signup.html", {"request": request})
+
+
+# Convenience redirect from root
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/auth/login-page")
+
+
+# ---------------------------------------------------------------------------
+# Current-user dependency (reads the session cookie)
+# ---------------------------------------------------------------------------
+
+async def get_current_user(
+    request:         Request,
+    dodman_session:  str | None = Cookie(default=None),
+    pool:            asyncpg.Pool = Depends(get_pool),
+) -> dict:
+    _UNAUTHENTICATED = HTTPException(
+        status_code=401,
+        detail=_error_envelope(
+            "UNAUTHORIZED",
+            "You must be logged in to access this resource.",
+            _get_request_id(request),
+        ),
+    )
+    if not dodman_session:
+        raise _UNAUTHENTICATED
+
+    user_id = _decode_session_token(dodman_session)
+    if not user_id:
+        raise _UNAUTHENTICATED
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, email, created_at FROM users WHERE id = $1",
+            uuid.UUID(user_id),
+        )
+    if row is None:
+        raise _UNAUTHENTICATED
+
+    return {"id": str(row["id"]), "email": row["email"], "created_at": row["created_at"]}
+
+
+# ===========================================================================
+# Key management endpoints (user-facing + internal admin)
+# ===========================================================================
+
 class CreateKeyRequest(BaseModel):
-    label: str
-    tier:  str = "free"
+    label:       str
+    tier:        str = "free"
+    environment: str = "test"
 
 
 @router.post(
     "/keys",
     summary="Issue a new API key",
-    description=(
-        "**Internal endpoint** — requires `X-Internal-Secret` header.\n\n"
-        "Creates a new API key, stores its SHA-256 hash, and returns the "
-        "**plaintext key exactly once**.  Store it immediately — it cannot "
-        "be recovered if lost."
-    ),
-    tags=["admin"],
     status_code=201,
+    tags=["keys"],
 )
 async def create_api_key(
     request: Request,
-    _: None = Depends(verify_internal_secret),
-    pool: asyncpg.Pool = Depends(get_pool),
+    body:    CreateKeyRequest | None = None,
+    _:       None = Depends(verify_internal_secret),
+    pool:    asyncpg.Pool = Depends(get_pool),
 ) -> JSONResponse:
-    """
-    Accepts either JSON body or multipart/form-data — works from Postman,
-    curl, and the sandbox UI without changing the Content-Type.
-    """
+    # Also accept form data
     content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        try:
-            body = await request.json()
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": {"code": "BAD_REQUEST", "message": "Request body is not valid JSON."}},
-            )
-        label = body.get("label", "").strip()
-        tier  = body.get("tier", "free").strip()
-    else:
-        # Fall back to form data (multipart or url-encoded)
+    if body is None or "multipart" in content_type or "form" in content_type:
         form  = await request.form()
         label = str(form.get("label", "")).strip()
         tier  = str(form.get("tier", "free")).strip()
+        env   = str(form.get("environment", "test")).strip()
+    else:
+        label = (body.label or "").strip()
+        tier  = body.tier.strip()
+        env   = body.environment.strip()
 
     if not label:
         raise HTTPException(
             status_code=422,
-            detail={"error": {"code": "VALIDATION_ERROR", "message": "'label' is required. Provide the owner name, e.g. \'Acme Corp\'."}},
+            detail=_error_envelope(
+                "VALIDATION_FAILED", "'label' is required.", _get_request_id(request)
+            ),
         )
     if tier not in TIER_RANK:
         raise HTTPException(
             status_code=422,
-            detail={"error": {"code": "VALIDATION_ERROR", "message": f"Invalid tier '{tier}\'. Must be one of: free, starter, pro."}},
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                f"Invalid tier '{tier}'. Must be one of: free, starter, pro.",
+                _get_request_id(request),
+            ),
+        )
+    if env not in ("test", "live"):
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                "Invalid environment. Must be 'test' or 'live'.",
+                _get_request_id(request),
+            ),
         )
 
-    raw    = _generate_raw_key()
+    raw    = _generate_raw_key(env)
     hashed = _hash_key(raw)
-    prefix = raw[:16]          # "dk_live_XXXXXXX" — safe to store/display
+    prefix = raw[:16]
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO api_keys (label, key_hash, key_prefix, tier)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO api_keys (key_hash, key_prefix, label, environment, tier)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id, created_at
             """,
-            label, hashed, prefix, tier,
+            hashed, prefix, label, env, tier,
         )
 
-    log.info("API key issued: id=%s label=%r tier=%s prefix=%s", row["id"], label, tier, prefix)
+    log.info("API key issued: id=%s label=%r env=%s tier=%s", row["id"], label, env, tier)
+    return JSONResponse(
+        status_code=201,
+        content={
+            "id":          str(row["id"]),
+            "label":       label,
+            "tier":        tier,
+            "environment": env,
+            "key_prefix":  prefix,
+            "api_key":     raw,
+            "created_at":  row["created_at"].isoformat(),
+            "warning":     "Store this key immediately. It will not be shown again.",
+        },
+    )
+
+
+@router.post(
+    "/keys/user",
+    summary="Issue an API key linked to the authenticated user",
+    status_code=201,
+    tags=["keys"],
+)
+async def create_user_api_key(
+    request:      Request,
+    body:         CreateKeyRequest,
+    current_user: dict = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    env  = body.environment.strip()
+    tier = body.tier.strip()
+
+    if env not in ("test", "live"):
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope("VALIDATION_FAILED",
+                                   "environment must be 'test' or 'live'.",
+                                   _get_request_id(request)),
+        )
+
+    raw    = _generate_raw_key(env)
+    hashed = _hash_key(raw)
+    prefix = raw[:16]
+    label  = (body.label or current_user["email"]).strip()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO api_keys (user_id, key_hash, key_prefix, label, environment, tier)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, created_at
+            """,
+            uuid.UUID(current_user["id"]), hashed, prefix, label, env, tier,
+        )
 
     return JSONResponse(
         status_code=201,
         content={
-            "id":         row["id"],
-            "label":      label,
-            "tier":       tier,
-            "key_prefix": prefix,
-            "api_key":    raw,          # plaintext — shown once, never stored
-            "created_at": row["created_at"].isoformat(),
-            "warning":    "Store this key immediately. It will not be shown again.",
+            "id":          str(row["id"]),
+            "label":       label,
+            "environment": env,
+            "tier":        tier,
+            "key_prefix":  prefix,
+            "api_key":     raw,
+            "created_at":  row["created_at"].isoformat(),
+            "warning":     "Store this key immediately. It will not be shown again.",
         },
     )
 
@@ -712,18 +1015,21 @@ async def create_api_key(
 @router.patch(
     "/keys/{key_id}/deactivate",
     summary="Deactivate an API key",
-    description="**Internal endpoint** — requires `X-Internal-Secret` header.",
-    tags=["admin"],
+    tags=["keys"],
 )
 async def deactivate_api_key(
-    key_id: int,
-    _: None = Depends(verify_internal_secret),
-    pool: asyncpg.Pool = Depends(get_pool),
+    key_id: str,
+    _:      None = Depends(verify_internal_secret),
+    pool:   asyncpg.Pool = Depends(get_pool),
 ) -> JSONResponse:
+    try:
+        key_uuid = uuid.UUID(key_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="key_id must be a valid UUID.")
+
     async with pool.acquire() as conn:
         result = await conn.execute(
-            "UPDATE api_keys SET is_active = FALSE WHERE id = $1",
-            key_id,
+            "UPDATE api_keys SET is_active = FALSE WHERE id = $1", key_uuid
         )
     if result == "UPDATE 0":
         raise HTTPException(status_code=404, detail=f"Key id={key_id} not found.")
@@ -731,20 +1037,87 @@ async def deactivate_api_key(
     return JSONResponse(content={"id": key_id, "is_active": False})
 
 
-# ---------------------------------------------------------------------------
-# Parsing helpers  (entirely in-memory – no disk I/O)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Module 4 — Dashboard route
+# ===========================================================================
 
+dash_router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+
+@dash_router.get("/", summary="User dashboard")
+async def dashboard(
+    request:      Request,
+    current_user: dict = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+):
+    async with pool.acquire() as conn:
+        keys = await conn.fetch(
+            """
+            SELECT id, key_prefix, environment, tier, is_active, created_at, last_used_at
+            FROM   api_keys
+            WHERE  user_id = $1
+            ORDER  BY created_at DESC
+            """,
+            uuid.UUID(current_user["id"]),
+        )
+        ledger_rows = await conn.fetch(
+            """
+            SELECT bl.timestamp, bl.rows_in, bl.rows_out, bl.file_type,
+                   bl.duration_ms, bl.key_prefix
+            FROM   billing_ledger bl
+            JOIN   api_keys ak ON ak.id = bl.api_key_id
+            WHERE  ak.user_id = $1
+            ORDER  BY bl.timestamp DESC
+            LIMIT  50
+            """,
+            uuid.UUID(current_user["id"]),
+        )
+
+    def _serialise_key(k: asyncpg.Record) -> dict:
+        return {
+            "id":          str(k["id"]),
+            "key_prefix":  k["key_prefix"],
+            "environment": k["environment"],
+            "tier":        k["tier"],
+            "is_active":   k["is_active"],
+            "created_at":  k["created_at"].isoformat(),
+            "last_used_at": k["last_used_at"].isoformat() if k["last_used_at"] else None,
+        }
+
+    def _serialise_ledger(r: asyncpg.Record) -> dict:
+        return {
+            "timestamp":   r["timestamp"].isoformat(),
+            "rows_in":     r["rows_in"],
+            "rows_out":    r["rows_out"],
+            "file_type":   r["file_type"],
+            "duration_ms": r["duration_ms"],
+            "key_prefix":  r["key_prefix"],
+        }
+
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request":     request,
+            "user":        current_user,
+            "api_keys":    [_serialise_key(k) for k in keys],
+            "ledger":      [_serialise_ledger(r) for r in ledger_rows],
+        },
+    )
+
+
+# ===========================================================================
+# Parsing helpers
+# ===========================================================================
 
 def _parse_csv(data: bytes) -> Sheet:
-    text = data.decode("utf-8-sig")          # handles BOM
+    text   = data.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
     return [dict(row) for row in reader]
 
 
 def _parse_xlsx(data: bytes) -> Sheet:
-    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    ws = wb.active
+    wb   = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    ws   = wb.active
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return []
@@ -752,22 +1125,22 @@ def _parse_xlsx(data: bytes) -> Sheet:
     return [dict(zip(headers, row)) for row in rows[1:]]
 
 
-def parse_file(filename: str, data: bytes) -> Sheet:
+def parse_file(filename: str, data: bytes) -> tuple[Sheet, str]:
+    """Returns (sheet, file_type) where file_type is 'csv' or 'xlsx'."""
     lower = filename.lower()
     if lower.endswith(".csv"):
-        return _parse_csv(data)
+        return _parse_csv(data), "csv"
     if lower.endswith(".xlsx"):
-        return _parse_xlsx(data)
+        return _parse_xlsx(data), "xlsx"
     raise HTTPException(
         status_code=415,
         detail="Unsupported file type. Only .csv and .xlsx are accepted.",
     )
 
 
-# ---------------------------------------------------------------------------
-# Rule engine
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# Rule engine  (unchanged from v1)
+# ===========================================================================
 
 def _to_number(v: Any) -> float | None:
     try:
@@ -776,212 +1149,117 @@ def _to_number(v: Any) -> float | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Typed rule implementations
-# ---------------------------------------------------------------------------
-
-# ── PHONE ────────────────────────────────────────────────────────────────────
-# Accepted Kenyan formats (input) → canonical output: 2547XXXXXXXX / 2541XXXXXXXX
-#
-#   07XXXXXXXX   →  2547XXXXXXXX   (10-digit local mobile)
-#   01XXXXXXXX   →  2541XXXXXXXX   (10-digit local landline/special)
-#   7XXXXXXXX    →  2547XXXXXXXX   (9-digit, missing leading 0)
-#   1XXXXXXXX    →  2541XXXXXXXX   (9-digit, missing leading 0)
-#   2547XXXXXXXX →  unchanged       (already canonical)
-#   2541XXXXXXXX →  unchanged
-#   anything else → None
-
 _KE_PHONE_RE = re.compile(r"^254[71]\d{8}$")
+_EXCEL_EPOCH = datetime.date(1899, 12, 30)
+_DATE_FORMATS = [
+    "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
+    "%d.%m.%Y", "%Y/%m/%d", "%d %b %Y", "%d %B %Y",
+    "%b %d, %Y", "%B %d, %Y",
+]
 
 
 def clean_phone_ke(value: Any) -> str | None:
-    """Normalise a Kenyan phone number to E.164-style 254XXXXXXXXX (12 digits)."""
     if value is None:
         return None
-
-    # Accept integer inputs (e.g. from Excel numeric cells)
-    raw = str(int(value)) if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
-
-    # Strip every non-digit character (spaces, dashes, plus, parentheses, etc.)
+    raw    = str(int(value)) if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
     digits = re.sub(r"\D", "", raw)
-
     if not digits:
         return None
-
-    # Normalise leading country-code variants
     if digits.startswith("0") and len(digits) == 10:
-        # 07XXXXXXXX or 01XXXXXXXX
         digits = "254" + digits[1:]
     elif len(digits) == 9 and digits[0] in ("7", "1"):
-        # 7XXXXXXXX or 1XXXXXXXX — missing leading zero
         digits = "254" + digits
     elif digits.startswith("254") and len(digits) == 12:
-        pass  # already canonical — validate below
+        pass
     else:
-        return None  # unrecognised format
+        return None
+    return digits if _KE_PHONE_RE.match(digits) else None
 
-    # Final validation: must be 2547XXXXXXXX or 2541XXXXXXXX (12 digits total)
-    if _KE_PHONE_RE.match(digits):
-        return digits
-    return None
-
-
-# ── NAME ─────────────────────────────────────────────────────────────────────
 
 def clean_name(value: Any) -> str | None:
-    """Strip surrounding whitespace and apply title-case."""
     if value is None:
         return None
     cleaned = str(value).strip()
     return cleaned.title() if cleaned else None
 
 
-# ── DATE ─────────────────────────────────────────────────────────────────────
-
-# Excel date serial epoch (Windows 1900 date system, accounting for the
-# erroneous 1900 leap-year bug that Excel perpetuates).
-_EXCEL_EPOCH = datetime.date(1899, 12, 30)
-
-# String formats tried in order before falling back to dateutil
-_DATE_FORMATS = [
-    "%Y-%m-%d",    # ISO already
-    "%d/%m/%Y",    # DD/MM/YYYY  (common in Kenya / UK)
-    "%m/%d/%Y",    # MM/DD/YYYY  (US)
-    "%d-%m-%Y",    # DD-MM-YYYY
-    "%d.%m.%Y",    # DD.MM.YYYY
-    "%Y/%m/%d",    # YYYY/MM/DD
-    "%d %b %Y",    # 01 Jan 2024
-    "%d %B %Y",    # 01 January 2024
-    "%b %d, %Y",   # Jan 01, 2024
-    "%B %d, %Y",   # January 01, 2024
-]
-
-
 def clean_date(value: Any) -> str | None:
-    """Parse a date value and return it as an ISO-8601 string (YYYY-MM-DD), or None."""
     if value is None:
         return None
-
-    # ── Already a Python date/datetime (openpyxl returns these for date cells) ─
     if isinstance(value, datetime.datetime):
         return value.date().isoformat()
     if isinstance(value, datetime.date):
         return value.isoformat()
-
-    # ── Excel date serial number (integer or float like 45000.0) ─────────────
     raw_str = str(value).strip()
     if re.match(r"^\d{1,6}(\.\d+)?$", raw_str):
         try:
             serial = int(float(raw_str))
-            # Plausible Excel serial range: 1 (1900-01-01) – 2958465 (9999-12-31)
             if 1 <= serial <= 2958465:
                 parsed = _EXCEL_EPOCH + datetime.timedelta(days=serial)
-                # Sanity-check: reject implausibly old dates (< 1900) returned by
-                # very small serials that are more likely plain integers.
                 if parsed.year >= 1900:
                     return parsed.isoformat()
         except (ValueError, OverflowError):
             pass
-
-    # ── String formats ────────────────────────────────────────────────────────
     for fmt in _DATE_FORMATS:
         try:
             return datetime.datetime.strptime(raw_str, fmt).date().isoformat()
         except ValueError:
             continue
-
-    # Unrecognised — return None rather than corrupt data
     return None
 
-
-# ---------------------------------------------------------------------------
-# Typed-rule dispatcher  +  PASS_THROUGH fallback
-# ---------------------------------------------------------------------------
 
 _TYPED_RULES = {"PHONE", "NAME", "DATE"}
 
 
 def apply_typed_rule(rule: str, value: Any) -> Any:
-    """
-    Dispatch one of the three semantic rules.  Returns the cleaned value, or
-    None when the input cannot be normalised to the expected format.
-    """
-    if rule == "PHONE":
-        return clean_phone_ke(value)
-    if rule == "NAME":
-        return clean_name(value)
-    if rule == "DATE":
-        return clean_date(value)
-    # Fallback: delegate to the legacy per-token engine
+    if rule == "PHONE":  return clean_phone_ke(value)
+    if rule == "NAME":   return clean_name(value)
+    if rule == "DATE":   return clean_date(value)
     return apply_rule(rule, value)
 
 
-def process_row(row: Row, column_rules: dict[str, list[str]]) -> Row:
-    """
-    Apply cleaning rules to every field in *row*.
+def apply_rule(rule: str, value: Any) -> Any:
+    if rule == "strip":        return str(value).strip() if value is not None else value
+    if rule == "lowercase":    return str(value).lower() if value is not None else value
+    if rule == "uppercase":    return str(value).upper() if value is not None else value
+    if rule == "title_case":   return str(value).title() if value is not None else value
+    if rule == "to_int":
+        n = _to_number(value); return int(n) if n is not None else None
+    if rule == "to_float":     return _to_number(value)
+    if rule == "drop_empty":   return value
+    if rule.startswith("fill_value:"):
+        fill = rule.split(":", 1)[1]
+        return fill if (value is None or str(value).strip() == "") else value
+    if rule.startswith("clamp:"):
+        parts = rule.split(":")
+        lo = _to_number(parts[1]) if len(parts) > 1 and parts[1] else None
+        hi = _to_number(parts[2]) if len(parts) > 2 and parts[2] else None
+        n  = _to_number(value)
+        if n is None: return value
+        if lo is not None: n = max(lo, n)
+        if hi is not None: n = min(hi, n)
+        return n
+    if rule.startswith("regex:"):
+        _, pattern, replacement = rule.split(":", 2)
+        return re.sub(pattern, replacement, str(value)) if value is not None else value
+    return value
 
-    • Columns present in *column_rules* are processed through their rule list
-      (typed rules take precedence; legacy rules are applied token-by-token).
-    • Columns NOT in *column_rules* receive PASS_THROUGH treatment:
-      convert to str and strip — value is otherwise left untouched.
-    """
+
+def process_row(row: Row, column_rules: dict[str, list[str]]) -> Row:
     out: Row = {}
     for col, value in row.items():
         rules = column_rules.get(col)
         if rules is None:
-            # PASS_THROUGH: coerce to str, strip whitespace, preserve value
             out[col] = str(value).strip() if value is not None else value
         else:
             current = value
             for rule in rules:
                 if rule in _TYPED_RULES:
                     current = apply_typed_rule(rule, current)
-                    # Typed rules are terminal within their semantic domain;
-                    # subsequent rules still run (e.g. a drop_empty after PHONE).
                 else:
                     current = apply_rule(rule, current)
             out[col] = current
     return out
-
-
-def apply_rule(rule: str, value: Any) -> Any:
-    """Apply a single rule token to a scalar value."""
-    if rule == "strip":
-        return str(value).strip() if value is not None else value
-    if rule == "lowercase":
-        return str(value).lower() if value is not None else value
-    if rule == "uppercase":
-        return str(value).upper() if value is not None else value
-    if rule == "title_case":
-        return str(value).title() if value is not None else value
-    if rule == "to_int":
-        n = _to_number(value)
-        return int(n) if n is not None else None
-    if rule == "to_float":
-        return _to_number(value)
-    if rule == "drop_empty":
-        # Sentinel – handled at sheet level; return value unchanged here
-        return value
-    if rule.startswith("fill_value:"):
-        fill = rule.split(":", 1)[1]
-        return fill if (value is None or str(value).strip() == "") else value
-    if rule.startswith("clamp:"):
-        parts = rule.split(":")
-        lo = _to_number(parts[1]) if len(parts) > 1 and parts[1] != "" else None
-        hi = _to_number(parts[2]) if len(parts) > 2 and parts[2] != "" else None
-        n = _to_number(value)
-        if n is None:
-            return value
-        if lo is not None:
-            n = max(lo, n)
-        if hi is not None:
-            n = min(hi, n)
-        return n
-    if rule.startswith("regex:"):
-        _, pattern, replacement = rule.split(":", 2)
-        return re.sub(pattern, replacement, str(value)) if value is not None else value
-    # Unknown rules are ignored gracefully
-    return value
 
 
 def _column_numerics(sheet: Sheet, col: str) -> list[float]:
@@ -994,14 +1272,8 @@ def _column_numerics(sheet: Sheet, col: str) -> list[float]:
 
 def apply_fill_stat(sheet: Sheet, col: str, stat: str) -> Sheet:
     nums = _column_numerics(sheet, col)
-    if not nums:
-        return sheet
-    if stat == "fill_mean":
-        fill = statistics.mean(nums)
-    elif stat == "fill_median":
-        fill = statistics.median(nums)
-    else:
-        return sheet
+    if not nums: return sheet
+    fill = statistics.mean(nums) if stat == "fill_mean" else statistics.median(nums)
     for row in sheet:
         v = row.get(col)
         if v is None or str(v).strip() == "":
@@ -1010,30 +1282,17 @@ def apply_fill_stat(sheet: Sheet, col: str, stat: str) -> Sheet:
 
 
 def clean_sheet(sheet: Sheet, column_rules: dict[str, list[str]]) -> Sheet:
-    """Apply all rules to every row; return the cleaned sheet."""
-
-    # ── Pass 1: per-cell rules (skip stat-fills, handled in pass 2) ──────────
     stat_rules = {"fill_mean", "fill_median"}
-
-    # Build a view of column_rules that excludes deferred stat-fill tokens so
-    # process_row does not run them prematurely.  PASS_THROUGH columns (those
-    # absent from column_rules) are handled inside process_row automatically.
-    rules_pass1: dict[str, list[str]] = {
+    rules_pass1 = {
         col: [r for r in rules if r not in stat_rules]
         for col, rules in column_rules.items()
     }
     sheet = [process_row(row, rules_pass1) for row in sheet]
-
-    # ── Pass 2: column-level stat fills ──────────────────────────────────────
     for col, rules in column_rules.items():
         for rule in rules:
             if rule in stat_rules:
                 sheet = apply_fill_stat(sheet, col, rule)
-
-    # ── Pass 3: drop rows where a drop_empty column is blank/null ────────────
-    drop_cols = {
-        col for col, rules in column_rules.items() if "drop_empty" in rules
-    }
+    drop_cols = {col for col, rules in column_rules.items() if "drop_empty" in rules}
     if drop_cols:
         sheet = [
             row for row in sheet
@@ -1042,18 +1301,15 @@ def clean_sheet(sheet: Sheet, column_rules: dict[str, list[str]]) -> Sheet:
                 for col in drop_cols
             )
         ]
-
     return sheet
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Serialisers
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
 
 def _to_csv_bytes(sheet: Sheet) -> bytes:
-    if not sheet:
-        return b""
+    if not sheet: return b""
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=list(sheet[0].keys()), lineterminator="\n")
     writer.writeheader()
@@ -1062,117 +1318,59 @@ def _to_csv_bytes(sheet: Sheet) -> bytes:
 
 
 def _sanitise_for_json(sheet: Sheet) -> Sheet:
-    """Replace non-finite floats so json.dumps doesn't choke."""
     clean = []
     for row in sheet:
-        clean.append(
-            {
-                k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
-                for k, v in row.items()
-            }
-        )
+        clean.append({
+            k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
+            for k, v in row.items()
+        })
     return clean
 
 
-# ---------------------------------------------------------------------------
-# Config resolution  (header takes precedence over form field)
-# ---------------------------------------------------------------------------
-
-
-def resolve_config(
-    header_config: str | None,
-    form_config: str | None,
-) -> dict:
+def resolve_config(header_config: str | None, form_config: str | None) -> dict:
     raw = header_config or form_config
     if not raw:
-        return {"columns": {}, "output_format": "csv"}
+        return {"columns": {}, "output_format": "json"}
     try:
         cfg = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid JSON config: {exc}") from exc
     cfg.setdefault("columns", {})
-    cfg.setdefault("output_format", "csv")
+    cfg.setdefault("output_format", "json")
     return cfg
 
 
-# ---------------------------------------------------------------------------
-# Webhook dispatcher  (runs in background after 202 is returned to client)
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# Webhook dispatcher
+# ===========================================================================
 
 async def _dispatch_webhook(url: str, payload: list[Row]) -> None:
-    """
-    POST the cleaned JSON payload to *url* using a dedicated async client.
-
-    Failures are logged but never re-raised — the caller (our API container)
-    must not crash because a client's destination server is unreachable.
-    """
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
+            response = await client.post(url, json=payload,
+                                         headers={"Content-Type": "application/json"})
             response.raise_for_status()
-            log.info(
-                "Webhook delivered: url=%s status=%s rows=%d",
-                url,
-                response.status_code,
-                len(payload),
-            )
+            log.info("Webhook delivered: url=%s status=%s rows=%d",
+                     url, response.status_code, len(payload))
     except httpx.TimeoutException:
         log.error("Webhook timed out: url=%s", url)
     except httpx.HTTPStatusError as exc:
-        log.error(
-            "Webhook rejected by destination: url=%s status=%s body=%.200s",
-            url,
-            exc.response.status_code,
-            exc.response.text,
-        )
-    except httpx.RequestError as exc:
-        # Covers connection refused, DNS failure, SSL errors, etc.
-        log.error("Webhook request error: url=%s error=%r", url, exc)
-    except Exception as exc:  # noqa: BLE001 – intentional catch-all
-        log.exception("Unexpected error dispatching webhook: url=%s error=%r", url, exc)
+        log.error("Webhook rejected: url=%s status=%s", url, exc.response.status_code)
+    except Exception as exc:
+        log.exception("Webhook error: url=%s error=%r", url, exc)
 
 
-# ---------------------------------------------------------------------------
-# Endpoint
-# ---------------------------------------------------------------------------
-
-
-def _resolve_tier_limit(request: StarletteRequest) -> str:
-    """
-    Return the rate limit string for the current request.
-
-    slowapi calls this before the endpoint body runs, so we read the tier
-    directly from the Authorization header and resolve it against the tier
-    map — the same token the auth dependency will validate moments later.
-
-    This means the limit is applied per-API-key (keyed by the token in
-    _rate_limit_identifier), and the string reflects the caller's tier.
-    Unauthenticated requests get the free-tier limit; they will still fail
-    at the auth dependency.
-    """
-    auth  = request.headers.get("Authorization", "")
-    # We don't have the resolved tier yet at this point — read it from state
-    # if auth has already run (e.g. on retry), else default to free.
-    tier  = getattr(request.state, "api_key_tier", "free")
-    return {
-        "free":    RATE_LIMIT_FREE,
-        "starter": RATE_LIMIT_STARTER,
-        "pro":     "99999/hour",    # effectively unlimited — pro pays for throughput
-    }.get(tier, RATE_LIMIT_DEFAULT)
-
+# ===========================================================================
+# Module 2 — /clean endpoint with perf_counter telemetry
+# ===========================================================================
 
 @router.post(
     "/clean",
     summary="Upload and clean a CSV or XLSX file",
     responses={
-        200: {"description": "Cleaned file streamed synchronously (CSV or JSON) — no X-Webhook-URL supplied"},
-        202: {"description": "Processing queued; cleaned payload will be POSTed to X-Webhook-URL"},
-        400: {"description": "Live key used in a non-production environment"},
+        200: {"description": "Cleaned file streamed directly (no webhook)"},
+        202: {"description": "Processing queued; payload POSTed to X-Webhook-URL"},
+        400: {"description": "Environment key mismatch"},
         415: {"description": "Unsupported file type"},
         422: {"description": "Validation / config error"},
         429: {"description": "Rate limit exceeded"},
@@ -1180,132 +1378,102 @@ def _resolve_tier_limit(request: StarletteRequest) -> str:
 )
 @limiter.limit(RATE_LIMIT_DEFAULT, key_func=_rate_limit_identifier)
 async def clean_file(
-    request: Request,
+    request:         Request,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(..., description=".csv or .xlsx file to clean"),
-    config: str | None = Form(
-        default=None,
-        description="JSON cleaning config (overridden by X-Clean-Config header if present)",
-    ),
-    output_format: str | None = Form(
-        default=None,
-        description="'json' or 'csv' — overrides the value in the config body (default: json)",
-    ),
-    x_clean_config: str | None = Header(
-        default=None,
-        alias="X-Clean-Config",
-        description="JSON cleaning config (takes precedence over form field)",
-    ),
-    x_webhook_url: str | None = Header(
-        default=None,
-        alias="X-Webhook-URL",
-        description=(
-            "Optional. When present, the endpoint returns 202 immediately and "
-            "POSTs the cleaned JSON array to this URL asynchronously in the "
-            "background.  When absent, the cleaned file is streamed back "
-            "directly in the HTTP response as a browser download."
-        ),
-    ),
-    x_output_format: str | None = Header(
-        default=None,
-        alias="X-Output-Format",
-        description="'json' or 'csv' — header alternative to the output_format form field",
-    ),
-    api_key: APIKeyRecord = Security(verify_api_key),
-):
-    # ── Store tier on request state so the rate limiter can read it ─────────
+    file:            UploadFile = File(...),
+    config:          str | None = Form(default=None),
+    output_format:   str | None = Form(default=None),
+    x_clean_config:  str | None = Header(default=None, alias="X-Clean-Config"),
+    x_webhook_url:   str | None = Header(default=None, alias="X-Webhook-URL"),
+    x_output_format: str | None = Header(default=None, alias="X-Output-Format"),
+    api_key:         APIKeyRecord = Security(verify_api_key),
+) -> Response:
+
     request.state.api_key_tier = api_key.tier
 
-    # ── Sandbox IP rate limit (dk_sandbox_test_99) ───────────────────────────
-    # Already enforced inside verify_api_key via _check_sandbox_ip_limit.
-    # The dependency runs first and raises 429 before we reach this point,
-    # so no second check is needed here.
+    # ── Start the perf clock ──────────────────────────────────────────────────
+    t_start = time.perf_counter()
 
-    # ── Read file bytes in-memory ─────────────────────────────────────────────
-    raw = await file.read()
+    # ── Read + parse ──────────────────────────────────────────────────────────
+    raw_bytes           = await file.read()
+    sheet, file_type    = parse_file(file.filename or "", raw_bytes)
+    rows_in             = len(sheet)
 
-    # ── Parse ─────────────────────────────────────────────────────────────────
-    sheet = parse_file(file.filename or "", raw)
-
-    # ── Row truncation: dk_test_* and dk_sandbox_test_99 cap at 20 rows ──────
-    # Rows 21+ are silently dropped before any cleaning is applied.
+    # ── Row truncation for test/sandbox keys ──────────────────────────────────
     _SANDBOX_ROW_LIMIT = 20
-    truncated = False
-    original_row_count = len(sheet)
-    if api_key.is_test and len(sheet) > _SANDBOX_ROW_LIMIT:
-        sheet = sheet[:_SANDBOX_ROW_LIMIT]
+    truncated          = False
+    original_row_count = rows_in
+    if api_key.is_test and rows_in > _SANDBOX_ROW_LIMIT:
+        sheet     = sheet[:_SANDBOX_ROW_LIMIT]
         truncated = True
-        log.info(
-            "Row truncation applied: original=%d truncated_to=%d key_prefix=%s",
-            original_row_count, _SANDBOX_ROW_LIMIT, api_key.key_prefix,
-        )
+        log.info("Row truncation: original=%d capped=%d key=%s",
+                 original_row_count, _SANDBOX_ROW_LIMIT, api_key.key_prefix)
 
     # ── Config ────────────────────────────────────────────────────────────────
-    cfg = resolve_config(x_clean_config, config)
-    column_rules: dict[str, list[str]] = cfg["columns"]
-
-    # Resolve output_format: form param > header > config body > default json.
-    # The form `output_format` field and the X-Output-Format header both
-    # override whatever is in the JSON config body.
-    resolved_format: str = (
+    cfg          = resolve_config(x_clean_config, config)
+    column_rules = cfg["columns"]
+    resolved_fmt = (
         (output_format or x_output_format or cfg.get("output_format", "json"))
-        .strip()
-        .lower()
+        .strip().lower()
     )
-    if resolved_format not in {"json", "csv"}:
-        resolved_format = "json"
+    if resolved_fmt not in {"json", "csv"}:
+        resolved_fmt = "json"
 
     # ── Clean ─────────────────────────────────────────────────────────────────
     cleaned   = clean_sheet(sheet, column_rules)
     sanitised = _sanitise_for_json(cleaned)
+    rows_out  = len(sanitised)
 
-    # ── Webhook mode: enqueue background dispatch → return 202 immediately ────
+    # ── Stop the clock ────────────────────────────────────────────────────────
+    duration_ms = int((time.perf_counter() - t_start) * 1000)
+
+    # ── Schedule billing ledger write (non-blocking) ──────────────────────────
+    try:
+        pool = await get_pool()
+        background_tasks.add_task(
+            _write_billing_ledger,
+            pool,
+            api_key.id,           # UUID string or None for sandbox
+            api_key.key_prefix,
+            rows_in,
+            rows_out,
+            file_type,
+            duration_ms,
+        )
+    except HTTPException:
+        pass   # DB unavailable — telemetry is non-critical; don't fail the request
+
+    # ── Webhook mode → 202 ───────────────────────────────────────────────────
     if x_webhook_url:
         background_tasks.add_task(_dispatch_webhook, x_webhook_url, sanitised)
-        log.info(
-            "Job queued: rows=%d webhook=%s key=%s tier=%s truncated=%s",
-            len(sanitised), x_webhook_url, api_key.key_prefix, api_key.tier, truncated,
-        )
+        log.info("Job queued: rows=%d webhook=%s key=%s truncated=%s duration_ms=%d",
+                 rows_out, x_webhook_url, api_key.key_prefix, truncated, duration_ms)
         return JSONResponse(
             status_code=202,
             content={
-                "status":        "queued",
-                "rows_processed": len(sanitised),
+                "status":         "queued",
+                "rows_processed": rows_out,
+                "duration_ms":    duration_ms,
                 **({"rows_dropped": original_row_count - _SANDBOX_ROW_LIMIT} if truncated else {}),
             },
         )
 
-    # ── Direct streaming mode: compile in-memory buffer → StreamingResponse ───
-    # No webhook URL was provided.  Build the output entirely in an io.StringIO
-    # buffer and stream it back with a Content-Disposition header so the browser
-    # treats it as a file download.
-
-    if resolved_format == "csv":
-        buf = io.StringIO()
-        if sanitised:
-            writer = csv.DictWriter(
-                buf,
-                fieldnames=list(sanitised[0].keys()),
-                lineterminator="\n",
-            )
-            writer.writeheader()
-            writer.writerows(sanitised)
-        payload      = buf.getvalue().encode("utf-8")
-        media_type   = "text/csv"
-        disposition  = "attachment; filename=cleaned_file.csv"
+    # ── Direct streaming mode → 200 ───────────────────────────────────────────
+    if resolved_fmt == "csv":
+        payload     = _to_csv_bytes(cleaned)
+        media_type  = "text/csv"
+        disposition = "attachment; filename=cleaned_file.csv"
     else:
-        payload      = json.dumps(sanitised, ensure_ascii=False, indent=2).encode("utf-8")
-        media_type   = "application/json"
-        disposition  = "attachment; filename=cleaned_file.json"
+        payload     = json.dumps(sanitised, ensure_ascii=False, indent=2).encode()
+        media_type  = "application/json"
+        disposition = "attachment; filename=cleaned_file.json"
 
-    log.info(
-        "Streaming response: format=%s rows=%d size_bytes=%d key=%s truncated=%s",
-        resolved_format, len(sanitised), len(payload), api_key.key_prefix, truncated,
-    )
-
-    extra_headers: dict[str, str] = {}
+    extra_headers: dict[str, str] = {"X-Duration-Ms": str(duration_ms)}
     if truncated:
         extra_headers["X-Rows-Truncated"] = str(original_row_count - _SANDBOX_ROW_LIMIT)
+
+    log.info("Streaming: format=%s rows=%d size=%d key=%s duration_ms=%d",
+             resolved_fmt, rows_out, len(payload), api_key.key_prefix, duration_ms)
 
     return StreamingResponse(
         io.BytesIO(payload),
@@ -1315,28 +1483,24 @@ async def clean_file(
     )
 
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# Health checks
+# ===========================================================================
 
 @app.get("/health", include_in_schema=False)
 async def health():
-    """Root-level liveness probe (load balancers, Render health checks)."""
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
-@router.get("/health", include_in_schema=True, summary="API v1 liveness probe")
+@router.get("/health", summary="API v1 liveness probe")
 async def health_v1():
-    """Versioned liveness probe — confirms the v1 router is mounted."""
-    return {"status": "ok", "version": "1.0.0", "docs": "/docs"}
+    return {"status": "ok", "version": "2.0.0", "docs": "/docs"}
 
 
-# ---------------------------------------------------------------------------
-# Mount versioned router
-# ---------------------------------------------------------------------------
-# Add future versions here:
-#   from routers import v2
-#   app.include_router(v2.router, prefix="/api/v2")
+# ===========================================================================
+# Mount routers
+# ===========================================================================
 
+app.include_router(auth_router)
+app.include_router(dash_router)
 app.include_router(router)

@@ -7,3 +7,7 @@ python-multipart
 asyncpg
 python-dotenv
 slowapi
+Jinja2
+passlib
+pydantic[email]
+limits
