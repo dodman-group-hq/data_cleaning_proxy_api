@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dodman · Dashboard</title>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            mono:    ['"IBM Plex Mono"', 'monospace'],
+            display: ['Syne', 'sans-serif'],
+          },
+          colors: {
+            void:    '#07070a',
+            surface: '#0f0f12',
+            panel:   '#16161a',
+            border:  '#232329',
+            muted:   '#3a3a44',
+            dim:     '#6b6b7a',
+            soft:    '#9a9aaa',
+            ghost:   '#d0d0e0',
+            // Test mode — amber
+            amber:   { 300: '#fcd34d', 400: '#fbbf24', 500: '#f59e0b', 600: '#d97706', 900: '#451a03' },
+            // Live mode — emerald
+            emerald: { 300: '#6ee7b7', 400: '#34d399', 500: '#10b981', 600: '#059669', 900: '#022c22' },
+            rose:    { 400: '#fb7185', 500: '#f43f5e' },
+          },
+        },
+      },
+    }
+  </script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body {
+      background: #07070a;
+      color: #d0d0e0;
+      font-family: 'IBM Plex Mono', monospace;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Grid overlay ── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+      background-size: 44px 44px;
+    }
+    .content { position: relative; z-index: 1; }
+
+    /* ── Environment toggle pill ── */
+    .env-pill {
+      display: inline-flex; align-items: center; gap: 0;
+      background: #16161a;
+      border: 1px solid #232329;
+      border-radius: 999px;
+      padding: 3px;
+      cursor: pointer;
+    }
+    .env-pill button {
+      padding: 6px 18px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-family: 'IBM Plex Mono', monospace;
+      font-weight: 600;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      border: none;
+      transition: background 0.22s, color 0.22s, box-shadow 0.22s;
+      background: transparent;
+      color: #6b6b7a;
+    }
+    .env-pill button.active-test {
+      background: #f59e0b;
+      color: #07070a;
+      box-shadow: 0 0 12px #f59e0b44;
+    }
+    .env-pill button.active-live {
+      background: #10b981;
+      color: #07070a;
+      box-shadow: 0 0 12px #10b98144;
+    }
+
+    /* ── Key card glow ── */
+    .key-card-test {
+      border-color: #f59e0b44;
+      box-shadow: 0 0 0 1px #f59e0b22, inset 0 0 40px #f59e0b06;
+    }
+    .key-card-live {
+      border-color: #10b98144;
+      box-shadow: 0 0 0 1px #10b98122, inset 0 0 40px #10b98106;
+    }
+
+    /* ── Blink animation ── */
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
+    .blink { animation: blink 1.4s ease-in-out infinite; }
+
+    /* ── Fade slide in ── */
+    @keyframes fadein {
+      from { opacity:0; transform:translateY(8px); }
+      to   { opacity:1; transform:translateY(0); }
+    }
+    .fadein { animation: fadein .28s ease forwards; }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width:4px; height:4px; }
+    ::-webkit-scrollbar-track { background:transparent; }
+    ::-webkit-scrollbar-thumb { background:#3a3a44; border-radius:2px; }
+
+    /* ── Input focus ── */
+    .field-input:focus {
+      outline: none;
+      border-color: #f59e0b;
+      box-shadow: 0 0 0 1px #f59e0b44;
+    }
+
+    /* ── Mode panels ── */
+    #view-test, #view-live { display: none; }
+    #view-test.active, #view-live.active { display: block; }
+
+    /* ── Live warning bar ── */
+    .live-warning {
+      background: linear-gradient(90deg, #022c22 0%, #064e3b 50%, #022c22 100%);
+      border: 1px solid #059669;
+    }
+
+    /* ── Masked key ── */
+    .key-masked  { letter-spacing: .12em; }
+    .key-reveal  { display: none; }
+    .revealed .key-masked  { display: none; }
+    .revealed .key-reveal  { display: inline; }
+
+    /* ── Table ── */
+    .data-table th {
+      font-size: 10px; text-transform: uppercase; letter-spacing: .12em;
+      color: #6b6b7a; padding: 10px 16px; text-align: left;
+      border-bottom: 1px solid #232329;
+    }
+    .data-table td {
+      font-size: 12px; padding: 10px 16px; border-bottom: 1px solid #16161a;
+      color: #9a9aaa;
+    }
+    .data-table tr:hover td { background: #0f0f12; }
+
+    /* ── Copy flash ── */
+    @keyframes copy-flash {
+      0%   { background: #10b98122; }
+      100% { background: transparent; }
+    }
+    .copy-flash { animation: copy-flash .5s ease; }
+  </style>
+</head>
+
+<body>
+<div class="content max-w-5xl mx-auto px-5 py-10 space-y-6">
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       HEADER
+  ═══════════════════════════════════════════════════════════════════════════ -->
+  <header class="flex items-center justify-between">
+    <div>
+      <div class="flex items-center gap-3 mb-0.5">
+        <span class="font-display text-xs font-700 tracking-[.3em] uppercase text-amber-400 opacity-80">DODMAN</span>
+        <span class="w-px h-3 bg-border"></span>
+        <span class="text-xs text-dim tracking-widest uppercase">Data Clean Proxy</span>
+      </div>
+      <h1 class="font-display text-2xl font-800 text-ghost tracking-tight">
+        API Dashboard
+      </h1>
+    </div>
+    <div class="flex items-center gap-3">
+      <span class="text-xs text-dim font-mono">{{ user.email }}</span>
+      <form action="/auth/logout" method="post">
+        <button type="submit"
+          class="text-xs font-mono text-dim hover:text-rose-400 border border-border hover:border-rose-400 rounded px-3 py-1.5 transition-colors">
+          Sign out
+        </button>
+      </form>
+    </div>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       ENVIRONMENT TOGGLE  (top-of-page, highly visible)
+  ═══════════════════════════════════════════════════════════════════════════ -->
+  <section class="bg-panel border border-border rounded-xl overflow-hidden">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-border bg-surface">
+      <div class="flex items-center gap-3">
+        <span id="env-dot" class="w-2 h-2 rounded-full bg-amber-400 blink"></span>
+        <span id="env-label" class="font-display text-sm font-700 text-amber-400 tracking-wide uppercase">
+          Test Environment
+        </span>
+      </div>
+
+      <!-- Toggle pill -->
+      <div class="env-pill" id="env-toggle">
+        <button id="btn-test" class="active-test" onclick="switchEnv('test')">Test</button>
+        <button id="btn-live"                    onclick="switchEnv('live')">Live</button>
+      </div>
+    </div>
+
+    <!-- ── TEST VIEW ───────────────────────────────────────────────────────── -->
+    <div id="view-test" class="active fadein">
+      <div class="p-6 space-y-4">
+
+        <!-- Sandbox notice -->
+        <div class="flex items-start gap-3 px-4 py-3 rounded-lg bg-amber-500/8 border border-amber-500/25">
+          <svg class="w-4 h-4 text-amber-400 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126z" />
+          </svg>
+          <div>
+            <p class="text-amber-400 text-xs font-mono font-600">Test mode active — 20-row limit enforced</p>
+            <p class="text-amber-400/60 text-xs font-mono mt-0.5">All requests using a <code>dk_test_</code> key are capped at 20 rows. No billing charges apply.</p>
+          </div>
+        </div>
+
+        <!-- Test keys -->
+        {% set test_keys = api_keys | selectattr("environment", "equalto", "test") | list %}
+        {% if test_keys %}
+          {% for key in test_keys %}
+          <div class="key-card-test bg-void border border-border rounded-lg p-4 space-y-3">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="w-1.5 h-1.5 rounded-full {% if key.is_active %}bg-amber-400{% else %}bg-muted{% endif %}"></span>
+                <span class="text-xs text-dim uppercase tracking-widest">{{ key.tier }} · test</span>
+              </div>
+              <span class="text-xs text-muted font-mono">
+                Created {{ key.created_at[:10] }}
+                {% if key.last_used_at %} · Last used {{ key.last_used_at[:10] }}{% endif %}
+              </span>
+            </div>
+
+            <!-- Key display — no masking needed for test keys -->
+            <div class="flex items-center gap-3 bg-surface rounded px-3 py-2.5">
+              <code class="text-amber-400 text-sm font-mono flex-1 truncate" id="test-key-{{ loop.index }}">{{ key.key_prefix }}••••••••••••••••••••</code>
+              <button
+                onclick="copyKey('test-key-{{ loop.index }}', this)"
+                class="shrink-0 text-xs font-mono text-dim hover:text-amber-400 border border-border hover:border-amber-500 rounded px-2.5 py-1 transition-colors">
+                Copy prefix
+              </button>
+            </div>
+            <p class="text-xs text-muted font-mono">
+              Key ID: <span class="text-dim">{{ key.id }}</span>
+            </p>
+          </div>
+          {% endfor %}
+        {% else %}
+          <p class="text-dim text-xs font-mono py-4 text-center">No test keys found. Generate one below.</p>
+        {% endif %}
+
+        <!-- Generate test key form -->
+        <div class="border border-dashed border-muted rounded-lg p-4">
+          <p class="text-xs text-dim mb-3 uppercase tracking-widest">Generate new dk_test_ key</p>
+          <div class="flex gap-2">
+            <input id="test-label" type="text" placeholder="Label (e.g. dev-local)"
+              class="field-input flex-1 bg-void border border-border rounded px-3 py-2 text-sm text-ghost font-mono placeholder-muted transition-all duration-150" />
+            <button onclick="generateKey('test')"
+              class="shrink-0 bg-amber-500 hover:bg-amber-400 text-void font-display font-700 text-xs tracking-wider uppercase px-4 py-2 rounded transition-colors">
+              Generate
+            </button>
+          </div>
+          <div id="test-key-result" class="hidden mt-3 px-3 py-2.5 bg-amber-500/10 border border-amber-500/30 rounded font-mono text-xs text-amber-400 break-all"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── LIVE VIEW ───────────────────────────────────────────────────────── -->
+    <div id="view-live" class="fadein">
+
+      <!-- Corporate warning banner -->
+      <div class="live-warning px-6 py-3 flex items-center gap-3">
+        <svg class="w-4 h-4 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342 1.453-1.096V18.75M3.75 4.5v.75A.75.75 0 013 6h-.75m0 0v-.375c0-.621.504-1.125 1.125-1.125H20.25M2.25 6v9m18-10.5v.75c0 .414.336.75.75.75h.75m-1.5-1.5h.375c.621 0 1.125.504 1.125 1.125v9.75c0 .621-.504 1.125-1.125 1.125h-.375m1.5-1.5H21a.75.75 0 00-.75.75v.75m0 0H3.75m0 0h-.375a1.125 1.125 0 01-1.125-1.125V15m1.5 1.5v-.75A.75.75 0 003 15h-.75M15 10.5a3 3 0 11-6 0 3 3 0 016 0zm3 0h.008v.008H18V10.5zm-12 0h.008v.008H6V10.5z" />
+        </svg>
+        <div>
+          <span class="text-emerald-400 font-mono text-xs font-600">LIVE ENVIRONMENT — BILLING ACTIVE</span>
+          <p class="text-emerald-400/60 text-xs font-mono mt-0.5">
+            Every request in this environment is logged to the billing ledger and may incur charges.
+            <strong class="text-emerald-400">Do not share your dk_live_ key.</strong>
+          </p>
+        </div>
+      </div>
+
+      <div class="p-6 space-y-4">
+        {% set live_keys = api_keys | selectattr("environment", "equalto", "live") | list %}
+        {% if live_keys %}
+          {% for key in live_keys %}
+          <div class="key-card-live bg-void border border-border rounded-lg p-4 space-y-3">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="w-1.5 h-1.5 rounded-full {% if key.is_active %}bg-emerald-400{% else %}bg-muted{% endif %}"></span>
+                <span class="text-xs text-dim uppercase tracking-widest">{{ key.tier }} · live</span>
+              </div>
+              <span class="text-xs text-muted font-mono">
+                Created {{ key.created_at[:10] }}
+                {% if key.last_used_at %} · Last used {{ key.last_used_at[:10] }}{% endif %}
+              </span>
+            </div>
+
+            <!-- Masked live key — requires explicit reveal click -->
+            <div class="flex items-center gap-3 bg-surface rounded px-3 py-2.5">
+              <div id="live-key-wrap-{{ loop.index }}" class="flex-1 min-w-0">
+                <code class="key-masked text-emerald-400 text-sm font-mono truncate block" id="live-key-{{ loop.index }}">
+                  {{ key.key_prefix }}<span class="opacity-50">••••••••••••••••••••••••••••</span>
+                </code>
+                <code class="key-reveal text-emerald-400 text-sm font-mono break-all hidden" id="live-key-plain-{{ loop.index }}"
+                  data-prefix="{{ key.key_prefix }}">
+                  {{ key.key_prefix }}[stored securely — re-issue to obtain plaintext]
+                </code>
+              </div>
+              <div class="flex items-center gap-1.5 shrink-0">
+                <button
+                  onclick="revealKey('live-key-wrap-{{ loop.index }}', this)"
+                  class="text-xs font-mono text-dim hover:text-emerald-400 border border-border hover:border-emerald-500 rounded px-2.5 py-1 transition-colors">
+                  Reveal
+                </button>
+                <button
+                  onclick="copyKeyPrefix('{{ key.key_prefix }}', this)"
+                  class="text-xs font-mono text-dim hover:text-emerald-400 border border-border hover:border-emerald-500 rounded px-2.5 py-1 transition-colors">
+                  Copy prefix
+                </button>
+              </div>
+            </div>
+            <p class="text-xs text-muted font-mono">
+              Key ID: <span class="text-dim">{{ key.id }}</span>
+            </p>
+          </div>
+          {% endfor %}
+        {% else %}
+          <p class="text-dim text-xs font-mono py-4 text-center">No live keys found. Generate one below.</p>
+        {% endif %}
+
+        <!-- Generate live key form -->
+        <div class="border border-dashed border-muted rounded-lg p-4">
+          <p class="text-xs text-dim mb-3 uppercase tracking-widest">Generate new dk_live_ key</p>
+          <div class="flex gap-2">
+            <input id="live-label" type="text" placeholder="Label (e.g. production-v1)"
+              class="field-input flex-1 bg-void border border-border rounded px-3 py-2 text-sm text-ghost font-mono placeholder-muted transition-all duration-150" />
+            <button onclick="generateKey('live')"
+              class="shrink-0 bg-emerald-500 hover:bg-emerald-400 text-void font-display font-700 text-xs tracking-wider uppercase px-4 py-2 rounded transition-colors">
+              Generate
+            </button>
+          </div>
+          <div id="live-key-result" class="hidden mt-3 px-3 py-2.5 bg-emerald-500/10 border border-emerald-500/30 rounded font-mono text-xs text-emerald-400 break-all"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       BILLING LEDGER
+  ═══════════════════════════════════════════════════════════════════════════ -->
+  <section class="bg-panel border border-border rounded-xl overflow-hidden">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-border bg-surface">
+      <div class="flex items-center gap-3">
+        <span class="w-1.5 h-1.5 rounded-full bg-dim"></span>
+        <span class="text-xs font-mono text-dim tracking-widest uppercase">Request Ledger</span>
+      </div>
+      <span class="text-xs text-muted font-mono">Last 50 requests</span>
+    </div>
+
+    {% if ledger %}
+    <div class="overflow-x-auto">
+      <table class="data-table w-full">
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Key Prefix</th>
+            <th>File</th>
+            <th>Rows In</th>
+            <th>Rows Out</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in ledger %}
+          <tr>
+            <td class="font-mono text-ghost">{{ row.timestamp[:19].replace("T", " ") }}</td>
+            <td>
+              <code class="text-xs px-1.5 py-0.5 rounded
+                {% if 'live' in row.key_prefix %}bg-emerald-500/10 text-emerald-400{% else %}bg-amber-500/10 text-amber-400{% endif %}">
+                {{ row.key_prefix }}
+              </code>
+            </td>
+            <td class="uppercase text-xs">{{ row.file_type }}</td>
+            <td class="text-right">{{ row.rows_in }}</td>
+            <td class="text-right">{{ row.rows_out }}</td>
+            <td class="text-right">
+              <span class="{% if row.duration_ms > 2000 %}text-rose-400{% elif row.duration_ms > 500 %}text-amber-400{% else %}text-emerald-400{% endif %}">
+                {{ row.duration_ms }}ms
+              </span>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="py-12 text-center">
+      <p class="text-dim text-xs font-mono">No requests logged yet. Upload a file using the sandbox to generate telemetry.</p>
+    </div>
+    {% endif %}
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       FOOTER
+  ═══════════════════════════════════════════════════════════════════════════ -->
+  <footer class="text-center text-xs text-muted font-mono py-4 space-y-1 border-t border-border">
+    <p>Dodman Group · Internal Infrastructure Tooling · v2.0</p>
+    <p class="text-border">POST /api/v1/clean · asyncpg · Neon PostgreSQL</p>
+  </footer>
+
+</div><!-- /content -->
+
+<!-- Toast notification -->
+<div id="toast"
+  class="fixed bottom-6 right-6 z-50 hidden px-4 py-3 bg-panel border border-border rounded-lg shadow-xl font-mono text-xs text-ghost max-w-xs transition-all">
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// Environment Toggle
+// ═══════════════════════════════════════════════════════════════════════════
+
+let currentEnv = 'test';
+
+function switchEnv(env) {
+  currentEnv = env;
+
+  // Toggle views
+  document.getElementById('view-test').classList.toggle('active', env === 'test');
+  document.getElementById('view-live').classList.toggle('active', env === 'live');
+
+  // Pill buttons
+  document.getElementById('btn-test').className =
+    env === 'test' ? 'active-test' : '';
+  document.getElementById('btn-live').className =
+    env === 'live' ? 'active-live' : '';
+
+  // Dot + label
+  const dot   = document.getElementById('env-dot');
+  const label = document.getElementById('env-label');
+  if (env === 'live') {
+    dot.className   = 'w-2 h-2 rounded-full bg-emerald-400 blink';
+    label.className = 'font-display text-sm font-700 text-emerald-400 tracking-wide uppercase';
+    label.textContent = 'Live Environment';
+  } else {
+    dot.className   = 'w-2 h-2 rounded-full bg-amber-400 blink';
+    label.className = 'font-display text-sm font-700 text-amber-400 tracking-wide uppercase';
+    label.textContent = 'Test Environment';
+  }
+
+  // Re-run fade animation on the newly visible view
+  const activeView = document.getElementById(`view-${env}`);
+  activeView.classList.remove('fadein');
+  void activeView.offsetWidth;   // force reflow
+  activeView.classList.add('fadein');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Key reveal (live keys only)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function revealKey(wrapId, btn) {
+  const wrap = document.getElementById(wrapId);
+  if (wrap.classList.contains('revealed')) {
+    wrap.classList.remove('revealed');
+    btn.textContent = 'Reveal';
+    // Re-hide the plain text element
+    wrap.querySelector('.key-reveal').classList.add('hidden');
+    wrap.querySelector('.key-masked').classList.remove('hidden');
+  } else {
+    wrap.classList.add('revealed');
+    btn.textContent = 'Hide';
+    wrap.querySelector('.key-reveal').classList.remove('hidden');
+    wrap.querySelector('.key-masked').classList.add('hidden');
+    // Auto-hide after 15 seconds to prevent screen-sharing leaks
+    setTimeout(() => {
+      if (wrap.classList.contains('revealed')) {
+        wrap.classList.remove('revealed');
+        btn.textContent = 'Reveal';
+        wrap.querySelector('.key-reveal').classList.add('hidden');
+        wrap.querySelector('.key-masked').classList.remove('hidden');
+        showToast('Key automatically hidden after 15 seconds.');
+      }
+    }, 15_000);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Clipboard helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+function copyKey(elId, btn) {
+  const el   = document.getElementById(elId);
+  const text = el.textContent.trim();
+  navigator.clipboard.writeText(text).then(() => {
+    const prev = btn.textContent;
+    btn.textContent = '✓ Copied';
+    el.closest('.bg-surface, .bg-void')?.classList.add('copy-flash');
+    setTimeout(() => {
+      btn.textContent = prev;
+      el.closest('.bg-surface, .bg-void')?.classList.remove('copy-flash');
+    }, 1500);
+  });
+}
+
+function copyKeyPrefix(prefix, btn) {
+  navigator.clipboard.writeText(prefix).then(() => {
+    const prev = btn.textContent;
+    btn.textContent = '✓ Copied';
+    setTimeout(() => btn.textContent = prev, 1500);
+    showToast(`Copied prefix: ${prefix}`);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Key generation  (calls POST /api/v1/keys/user via fetch)
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function generateKey(env) {
+  const labelInput = document.getElementById(`${env}-label`);
+  const resultEl   = document.getElementById(`${env}-key-result`);
+  const label      = labelInput.value.trim();
+
+  if (!label) {
+    labelInput.style.borderColor = '#fb7185';
+    setTimeout(() => labelInput.style.borderColor = '', 1500);
+    showToast('Please enter a label for this key.');
+    return;
+  }
+
+  resultEl.textContent = 'Generating…';
+  resultEl.classList.remove('hidden');
+
+  try {
+    const res = await fetch('/api/v1/keys/user', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label, environment: env, tier: 'free' }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      const msg = data?.error?.message ?? `Error ${res.status}`;
+      resultEl.textContent = `⚠ ${msg}`;
+      return;
+    }
+
+    const key = data.api_key;
+    resultEl.innerHTML =
+      `<span class="block mb-1 opacity-60">Store this key now — it will not be shown again.</span>` +
+      `<span class="break-all select-all">${escHtml(key)}</span>` +
+      `<button onclick="navigator.clipboard.writeText('${escHtml(key)}').then(()=>showToast('Copied!'))"
+         class="mt-2 inline-block text-xs border border-current rounded px-2 py-0.5 hover:opacity-70 transition-opacity">
+         Copy
+       </button>`;
+
+    showToast(`${env === 'live' ? 'dk_live_' : 'dk_test_'} key generated. Save it immediately.`);
+    labelInput.value = '';
+
+    // Refresh the page after 8 s so the new key shows in the list
+    // (without the plaintext — it's already been shown in the result box)
+    setTimeout(() => location.reload(), 8000);
+
+  } catch (err) {
+    resultEl.textContent = `Network error: ${err.message}`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Toast
+// ═══════════════════════════════════════════════════════════════════════════
+
+let _toastTimer = null;
+function showToast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.add('hidden'), 3500);
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+</script>
+</body>
+</html>

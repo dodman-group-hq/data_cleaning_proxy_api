@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dodman · Sign In</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            mono:    ['"IBM Plex Mono"', 'monospace'],
+            display: ['Syne', 'sans-serif'],
+          },
+        },
+      },
+    }
+  </script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body {
+      background: #07070a;
+      color: #d0d0e0;
+      font-family: 'IBM Plex Mono', monospace;
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      -webkit-font-smoothing: antialiased;
+    }
+    body::before {
+      content: '';
+      position: fixed; inset: 0; pointer-events: none;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+      background-size: 44px 44px;
+    }
+    .card {
+      background: #0f0f12;
+      border: 1px solid #232329;
+      border-radius: 16px;
+      width: 100%;
+      max-width: 420px;
+      padding: 40px;
+      position: relative;
+      z-index: 1;
+      box-shadow: 0 0 60px rgba(245,158,11,0.04), 0 0 0 1px #ffffff05;
+    }
+    .field-input {
+      width: 100%;
+      background: #07070a;
+      border: 1px solid #232329;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 13px;
+      color: #d0d0e0;
+      outline: none;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    .field-input:focus {
+      border-color: #f59e0b;
+      box-shadow: 0 0 0 1px #f59e0b44;
+    }
+    .field-input::placeholder { color: #3a3a44; }
+    .btn-primary {
+      width: 100%;
+      background: #f59e0b;
+      color: #07070a;
+      font-family: 'Syne', sans-serif;
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      border: none;
+      border-radius: 6px;
+      padding: 11px;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .btn-primary:hover { background: #fbbf24; }
+    .btn-primary:disabled { opacity: .45; cursor: not-allowed; }
+    label { display: block; font-size: 11px; color: #6b6b7a; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 6px; }
+    .error-box {
+      background: rgba(244,63,94,.08);
+      border: 1px solid rgba(244,63,94,.3);
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 12px;
+      color: #fb7185;
+    }
+    a { color: #f59e0b; text-decoration: none; }
+    a:hover { color: #fcd34d; }
+    @keyframes fadein { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+    .card { animation: fadein .3s ease; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <!-- Logo -->
+  <div class="mb-8 text-center space-y-1">
+    <p class="font-display text-xs font-700 tracking-[.35em] uppercase text-amber-400">DODMAN GROUP</p>
+    <h1 class="font-display text-2xl font-800 text-white tracking-tight">Sign in</h1>
+    <p class="text-xs text-gray-500 font-mono mt-1">Data Cleaning Proxy · Admin Dashboard</p>
+  </div>
+
+  <!-- Flash error -->
+  {% if error %}
+  <div class="error-box mb-5">{{ error }}</div>
+  {% endif %}
+
+  <form id="login-form" class="space-y-4" onsubmit="handleLogin(event)">
+    <div>
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" required autocomplete="email"
+        placeholder="you@company.com" class="field-input" />
+    </div>
+    <div>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" required autocomplete="current-password"
+        placeholder="••••••••" class="field-input" />
+    </div>
+
+    <div id="form-error" class="error-box hidden"></div>
+
+    <button id="submit-btn" type="submit" class="btn-primary mt-2">Sign in</button>
+  </form>
+
+  <p class="text-center text-xs font-mono text-gray-600 mt-6">
+    No account? <a href="/auth/signup-page">Create one</a>
+  </p>
+</div>
+
+<script>
+async function handleLogin(e) {
+  e.preventDefault();
+  const btn      = document.getElementById('submit-btn');
+  const errBox   = document.getElementById('form-error');
+  const email    = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+
+  btn.disabled    = true;
+  btn.textContent = 'Signing in…';
+  errBox.classList.add('hidden');
+
+  try {
+    const res  = await fetch('/auth/login', {
+      method:      'POST',
+      headers:     { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body:        JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+
+    if (res.ok) {
+      window.location.href = '/dashboard/';
+    } else {
+      const msg = data?.error?.message ?? `Error ${res.status}`;
+      errBox.textContent = msg;
+      errBox.classList.remove('hidden');
+    }
+  } catch (err) {
+    errBox.textContent = `Network error: ${err.message}`;
+    errBox.classList.remove('hidden');
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = 'Sign in';
+  }
+}
+</script>
+</body>
+</html>
