@@ -820,12 +820,12 @@ async def logout() -> Response:
 
 @auth_router.get("/login-page", include_in_schema=False)
 async def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+    return templates.TemplateResponse(request=request, name="login.html", context={"error": None})
 
 
 @auth_router.get("/signup-page", include_in_schema=False)
 async def signup_page(request: Request):
-    return templates.TemplateResponse("signup.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="signup.html", context={})
 
 
 # Convenience redirect from root
@@ -1095,12 +1095,12 @@ async def dashboard(
         }
 
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request":     request,
-            "user":        current_user,
-            "api_keys":    [_serialise_key(k) for k in keys],
-            "ledger":      [_serialise_ledger(r) for r in ledger_rows],
+        request=request,
+        name="dashboard.html",
+        context={
+            "user":     current_user,
+            "api_keys": [_serialise_key(k) for k in keys],
+            "ledger":   [_serialise_ledger(r) for r in ledger_rows],
         },
     )
 
