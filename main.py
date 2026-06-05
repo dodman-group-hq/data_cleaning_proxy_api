@@ -63,13 +63,30 @@ load_dotenv()
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Sentinel — raised when a browser-facing route needs a login redirect.
+# Caught by _login_redirect_handler below and converted to a 303 response.
+# Cannot use a plain RedirectResponse here because `raise` only accepts
+# BaseException subclasses, not Starlette Response objects.
+# ---------------------------------------------------------------------------
+
+class _NeedsLoginRedirect(Exception):
+    """Raised by get_current_user when the caller is a browser (HTML request)."""
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 TENANT_DATABASE_URL     = os.getenv("TENANT_DATABASE_URL", "")
 INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
 SESSION_SECRET_KEY      = os.getenv("SESSION_SECRET_KEY", secrets.token_hex(32))
-_RUNTIME_ENV            = os.getenv("DODMAN_ENV", "development").lower()
+# _RUNTIME_ENV is intentionally a function, not a module-level constant.
+# os.getenv() (and load_dotenv) only run once at import time, so a frozen
+# string would never pick up .env changes between requests.  Reading
+# os.environ directly on every call means the value is always current.
+def _RUNTIME_ENV() -> str:
+    return os.environ.get("DODMAN_ENV", "development").strip().lower()
 
 RATE_LIMIT_FREE     = os.getenv("RATE_LIMIT_FREE",    "60/hour")
 RATE_LIMIT_STARTER  = os.getenv("RATE_LIMIT_STARTER", "500/hour")
@@ -321,6 +338,16 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
             _get_request_id(request),
         ),
     )
+
+
+@app.exception_handler(_NeedsLoginRedirect)
+async def _login_redirect_handler(request: Request, exc: _NeedsLoginRedirect) -> Response:
+    """Convert the sentinel into an actual 303 redirect to the login page."""
+    resp = RedirectResponse(url="/auth/login-page", status_code=303)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"]        = "no-cache"
+    resp.headers["Expires"]       = "0"
+    return resp
 
 
 # ===========================================================================
@@ -578,7 +605,7 @@ async def verify_api_key(
 
     # ── Prefix / environment mismatch enforcement ─────────────────────────────
     if raw.startswith(_PREFIX_LIVE):
-        if _RUNTIME_ENV != "production":
+        if _RUNTIME_ENV() != "production":
             raise HTTPException(
                 status_code=400,
                 detail=_error_envelope(
@@ -807,7 +834,7 @@ async def login(
         value=token,
         httponly=True,
         samesite="lax",
-        secure=(_RUNTIME_ENV == "production"),
+        secure=(_RUNTIME_ENV() == "production"),
         max_age=60 * 60 * 24 * 7,   # 7 days
     )
     log.info("User logged in: id=%s", user_id)
@@ -866,12 +893,13 @@ async def get_current_user(
     dodman_session:  str | None = Cookie(default=None),
     pool:            asyncpg.Pool = Depends(get_pool),
 ) -> dict:
-    # For browser-facing routes (Accept: text/html) redirect to login on
-    # auth failure instead of returning a JSON 401 envelope.
-    def _unauth():
+    # For browser-facing routes (Accept: text/html) raise _NeedsLoginRedirect
+    # which is caught by _login_redirect_handler and turned into a 303.
+    # For API clients raise a standard 401 HTTPException with a JSON envelope.
+    def _unauth() -> Exception:
         accept = request.headers.get("accept", "")
         if "text/html" in accept:
-            return RedirectResponse(url="/auth/login-page", status_code=303)
+            return _NeedsLoginRedirect()
         return HTTPException(
             status_code=401,
             detail=_error_envelope(

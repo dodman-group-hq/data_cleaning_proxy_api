@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dodman · API Integration Docs</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: #07070a; color: #d0d0e0;
+      font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+      line-height: 1.7; min-height: 100vh; -webkit-font-smoothing: antialiased;
+    }
+    body::before {
+      content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.016) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.016) 1px, transparent 1px);
+      background-size: 44px 44px;
+    }
+
+    /* ── Layout ── */
+    .layout { display: flex; min-height: 100vh; position: relative; z-index: 1; }
+    .sidebar {
+      width: 220px; flex-shrink: 0; position: sticky; top: 0; height: 100vh;
+      overflow-y: auto; border-right: 1px solid #16161a;
+      background: #07070a; padding: 28px 0;
+    }
+    .main { flex: 1; max-width: 760px; padding: 40px 48px 80px; min-width: 0; }
+
+    /* ── Sidebar nav ── */
+    .sidebar-brand { padding: 0 20px 20px; border-bottom: 1px solid #16161a; margin-bottom: 16px; }
+    .sidebar-brand-name {
+      font-family: Syne, sans-serif; font-weight: 800; font-size: 13px;
+      color: #ffffff; letter-spacing: -.01em;
+    }
+    .sidebar-brand-sub { font-size: 9px; color: #6b6b7a; letter-spacing: .12em; text-transform: uppercase; margin-top: 2px; }
+    .nav-section { padding: 0 20px; margin-bottom: 18px; }
+    .nav-section-title { font-size: 9px; color: #3a3a44; letter-spacing: .18em; text-transform: uppercase; margin-bottom: 8px; }
+    .nav-item { display: block; font-size: 11px; color: #6b6b7a; text-decoration: none; padding: 4px 0; transition: color .12s; }
+    .nav-item:hover { color: #d0d0e0; }
+    .nav-item.active { color: #f59e0b; }
+
+    /* ── Content typography ── */
+    h1 { font-family: Syne, sans-serif; font-weight: 800; font-size: 28px; color: #fff; letter-spacing: -.02em; line-height: 1.15; margin-bottom: 10px; }
+    h2 { font-family: Syne, sans-serif; font-weight: 700; font-size: 18px; color: #d0d0e0; letter-spacing: -.01em; margin: 44px 0 14px; padding-top: 44px; border-top: 1px solid #16161a; }
+    h3 { font-size: 13px; font-weight: 600; color: #9a9aaa; letter-spacing: .04em; text-transform: uppercase; margin: 28px 0 10px; }
+    p  { color: #9a9aaa; margin-bottom: 14px; }
+    a  { color: #f59e0b; text-decoration: none; }
+    a:hover { color: #fcd34d; }
+    code {
+      font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+      background: #16161a; border: 1px solid #232329;
+      padding: 2px 6px; border-radius: 4px; color: #d0d0e0;
+    }
+    strong { color: #d0d0e0; font-weight: 600; }
+    ul { padding-left: 18px; color: #9a9aaa; margin-bottom: 14px; }
+    ul li { margin-bottom: 4px; }
+
+    /* ── Code blocks ── */
+    .code-block {
+      background: #0f0f12; border: 1px solid #232329; border-radius: 10px;
+      margin: 16px 0; overflow: hidden;
+    }
+    .code-block-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 14px; background: #16161a; border-bottom: 1px solid #232329;
+    }
+    .code-lang { font-size: 10px; color: #6b6b7a; letter-spacing: .1em; text-transform: uppercase; }
+    .copy-btn {
+      font-size: 10px; font-family: 'IBM Plex Mono', monospace; color: #6b6b7a;
+      background: none; border: 1px solid #232329; border-radius: 4px;
+      padding: 3px 10px; cursor: pointer; transition: color .12s, border-color .12s;
+    }
+    .copy-btn:hover { color: #f59e0b; border-color: #f59e0b44; }
+    pre {
+      padding: 16px; overflow-x: auto; font-size: 12px; line-height: 1.6;
+      color: #9a9aaa; white-space: pre;
+    }
+    pre .kw  { color: #c084fc; }
+    pre .str { color: #86efac; }
+    pre .cm  { color: #4b5563; }
+    pre .key { color: #93c5fd; }
+    pre .val { color: #fbbf24; }
+    pre .url { color: #67e8f9; }
+    pre .err { color: #fb7185; }
+
+    /* ── Method badge ── */
+    .method {
+      display: inline-block; font-size: 10px; font-weight: 600; font-family: 'IBM Plex Mono', monospace;
+      letter-spacing: .06em; padding: 3px 8px; border-radius: 4px; margin-right: 8px; vertical-align: middle;
+    }
+    .method-post { background: rgba(245,158,11,.12); color: #f59e0b; border: 1px solid rgba(245,158,11,.3); }
+    .method-get  { background: rgba(16,185,129,.12); color: #10b981; border: 1px solid rgba(16,185,129,.3); }
+
+    /* ── Endpoint line ── */
+    .endpoint-line { font-size: 14px; color: #67e8f9; margin-bottom: 6px; }
+
+    /* ── Alert boxes ── */
+    .alert {
+      display: flex; gap: 10px; padding: 12px 14px; border-radius: 8px; margin: 16px 0;
+    }
+    .alert-amber { background: rgba(245,158,11,.07); border: 1px solid rgba(245,158,11,.22); }
+    .alert-emerald { background: rgba(16,185,129,.07); border: 1px solid rgba(16,185,129,.22); }
+    .alert-rose   { background: rgba(244,63,94,.07); border: 1px solid rgba(244,63,94,.22); }
+    .alert-icon { flex-shrink: 0; font-size: 15px; margin-top: 1px; }
+    .alert p { margin: 0; font-size: 12px; }
+    .alert-amber   p { color: #f59e0b; }
+    .alert-emerald p { color: #10b981; }
+    .alert-rose    p { color: #fb7185; }
+
+    /* ── Param table ── */
+    .param-table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; font-size: 12px; }
+    .param-table th { text-align: left; font-size: 9px; letter-spacing: .14em; text-transform: uppercase; color: #6b6b7a; padding: 8px 12px; border-bottom: 1px solid #232329; }
+    .param-table td { padding: 8px 12px; border-bottom: 1px solid #16161a; vertical-align: top; }
+    .param-table td:first-child { color: #93c5fd; font-weight: 500; white-space: nowrap; }
+    .param-table td:nth-child(2) { color: #6b6b7a; font-size: 10px; }
+    .param-table td:last-child { color: #9a9aaa; }
+    .required { color: #fb7185; font-size: 9px; vertical-align: super; }
+
+    /* ── Response envelope ── */
+    .resp-tab-bar { display: flex; gap: 0; border-bottom: 1px solid #232329; }
+    .resp-tab {
+      font-size: 10px; font-family: 'IBM Plex Mono', monospace; letter-spacing: .08em;
+      text-transform: uppercase; padding: 7px 14px; cursor: pointer;
+      background: none; border: none; color: #6b6b7a;
+      border-bottom: 2px solid transparent; transition: color .12s;
+    }
+    .resp-tab.active { color: #f59e0b; border-bottom-color: #f59e0b; }
+    .resp-panel { display: none; }
+    .resp-panel.active { display: block; }
+
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-thumb { background: #232329; border-radius: 2px; }
+  </style>
+</head>
+<body>
+<div class="layout">
+
+  <!-- ── Sidebar nav ── -->
+  <nav class="sidebar">
+    <div class="sidebar-brand">
+      <div class="sidebar-brand-name">Dodman API</div>
+      <div class="sidebar-brand-sub">v1 · Integration Docs</div>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-title">Getting Started</div>
+      <a href="#overview"       class="nav-item active">Overview</a>
+      <a href="#authentication" class="nav-item">Authentication</a>
+      <a href="#environments"   class="nav-item">Environments</a>
+      <a href="#rate-limits"    class="nav-item">Rate Limits</a>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-title">Endpoints</div>
+      <a href="#endpoint-clean"  class="nav-item">POST /clean</a>
+      <a href="#endpoint-health" class="nav-item">GET /health</a>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-title">Configuration</div>
+      <a href="#config-schema"  class="nav-item">Config Schema</a>
+      <a href="#column-rules"   class="nav-item">Column Rules</a>
+      <a href="#output-formats" class="nav-item">Output Formats</a>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-title">Responses</div>
+      <a href="#error-envelope" class="nav-item">Error Envelope</a>
+      <a href="#error-codes"    class="nav-item">Error Codes</a>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-section-title">Examples</div>
+      <a href="#example-python"  class="nav-item">Python</a>
+      <a href="#example-node"    class="nav-item">Node.js</a>
+      <a href="#example-curl"    class="nav-item">cURL</a>
+      <a href="#example-webhook" class="nav-item">Webhook</a>
+    </div>
+
+    <div class="nav-section" style="margin-top: auto; padding-top: 20px; border-top: 1px solid #16161a;">
+      <a href="/dashboard/" class="nav-item">← Dashboard</a>
+      <a href="/docs"       class="nav-item" target="_blank">OpenAPI /docs</a>
+    </div>
+  </nav>
+
+  <!-- ── Main content ── -->
+  <main class="main">
+
+    <!-- OVERVIEW -->
+    <section id="overview">
+      <p style="font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:#6b6b7a;margin-bottom:10px;">Dodman Group · Data Cleaning Proxy</p>
+      <h1>API Integration Guide</h1>
+      <p>A stateless, in-memory CSV and XLSX cleaning service. Send a file, receive cleaned rows as JSON or CSV — either streamed directly back in the response or POSTed to your webhook endpoint asynchronously.</p>
+
+      <div class="alert alert-amber">
+        <span class="alert-icon">⚑</span>
+        <p>All requests require an API key sent as a <strong>Bearer token</strong> in the <code>Authorization</code> header. Obtain your key from the <a href="/dashboard/">dashboard</a>.</p>
+      </div>
+
+      <h3>Base URL</h3>
+      <div class="code-block">
+        <div class="code-block-header">
+          <span class="code-lang">endpoint</span>
+          <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+        </div>
+        <pre>https://your-deployment-url.com/api/v1</pre>
+      </div>
+    </section>
+
+    <!-- AUTHENTICATION -->
+    <section id="authentication">
+      <h2>Authentication</h2>
+      <p>Pass your API key as a Bearer token on every request.</p>
+
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">http header</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>Authorization: Bearer dk_test_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</pre>
+      </div>
+
+      <div class="alert alert-rose">
+        <span class="alert-icon">✕</span>
+        <p>Never send your API key in a URL query string, request body, or client-side JavaScript. Treat it like a password.</p>
+      </div>
+    </section>
+
+    <!-- ENVIRONMENTS -->
+    <section id="environments">
+      <h2>Environments</h2>
+      <p>Every key is scoped to exactly one environment. The environment is encoded in the key prefix and enforced server-side on every request.</p>
+
+      <table class="param-table">
+        <thead><tr><th>Prefix</th><th>Environment</th><th>Behaviour</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>dk_test_</code></td>
+            <td>Test</td>
+            <td>Files are silently truncated to the first 20 rows. No billing. Safe for development and CI pipelines.</td>
+          </tr>
+          <tr>
+            <td><code>dk_live_</code></td>
+            <td>Live</td>
+            <td>Full file processing, no row cap. Every request is logged to the billing ledger. Rejected unless the server is running in <code>DODMAN_ENV=production</code>.</td>
+          </tr>
+          <tr>
+            <td><code>sk_sandbox_test_99</code></td>
+            <td>Open Sandbox</td>
+            <td>Public key for the interactive sandbox UI. Limited to 5 requests per day per IP. 20-row cap.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="alert alert-amber">
+        <span class="alert-icon">⚠</span>
+        <p>Using a <code>dk_live_</code> key against a development server returns a <code>400 INVALID_ENVIRONMENT_KEY</code> error. This is intentional — it prevents accidental production data from being sent to non-production infrastructure.</p>
+      </div>
+    </section>
+
+    <!-- RATE LIMITS -->
+    <section id="rate-limits">
+      <h2>Rate Limits</h2>
+      <table class="param-table">
+        <thead><tr><th>Tier</th><th>Limit</th><th>Scope</th></tr></thead>
+        <tbody>
+          <tr><td>free</td><td>60 requests / hour</td><td>Per API key</td></tr>
+          <tr><td>starter</td><td>500 requests / hour</td><td>Per API key</td></tr>
+          <tr><td>pro</td><td>Unlimited</td><td>Per API key</td></tr>
+          <tr><td>sandbox</td><td>5 requests / day</td><td>Per client IP</td></tr>
+        </tbody>
+      </table>
+      <p>Rate-limited requests return <code>429 Too Many Requests</code> with a <code>Retry-After: 60</code> header.</p>
+    </section>
+
+    <!-- ENDPOINT: /clean -->
+    <section id="endpoint-clean">
+      <h2>POST /clean</h2>
+      <p class="endpoint-line"><span class="method method-post">POST</span><code>/api/v1/clean</code></p>
+      <p>Upload a CSV or XLSX file for in-memory cleaning. Returns the cleaned data directly (stream download) or, if <code>X-Webhook-URL</code> is provided, queues delivery and returns immediately with <code>202 Accepted</code>.</p>
+
+      <h3>Request — multipart/form-data</h3>
+      <table class="param-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>file <span class="required">*</span></td>
+            <td>File</td>
+            <td>The <code>.csv</code> or <code>.xlsx</code> file to clean.</td>
+          </tr>
+          <tr>
+            <td>config</td>
+            <td>JSON string</td>
+            <td>Cleaning configuration object (see <a href="#config-schema">Config Schema</a>). Optional — omit to strip whitespace from all columns.</td>
+          </tr>
+          <tr>
+            <td>output_format</td>
+            <td><code>"json"</code> | <code>"csv"</code></td>
+            <td>Response format when no webhook URL is supplied. Defaults to <code>"json"</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Request Headers</h3>
+      <table class="param-table">
+        <thead><tr><th>Header</th><th>Required</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>Authorization</td><td>Yes</td><td><code>Bearer dk_test_…</code> or <code>Bearer dk_live_…</code></td></tr>
+          <tr><td>X-Webhook-URL</td><td>No</td><td>When present, cleaned JSON is POSTed to this URL asynchronously and the endpoint returns 202.</td></tr>
+          <tr><td>X-Clean-Config</td><td>No</td><td>Cleaning config as a JSON string (overrides the <code>config</code> form field).</td></tr>
+          <tr><td>X-Output-Format</td><td>No</td><td>Header alternative to the <code>output_format</code> form field.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Responses</h3>
+      <div class="code-block" style="border-radius:10px 10px 0 0;margin-bottom:0;">
+        <div class="resp-tab-bar">
+          <button class="resp-tab active" onclick="showTab('r1','resp-200')">200 Download</button>
+          <button class="resp-tab"        onclick="showTab('r1','resp-202')">202 Queued</button>
+          <button class="resp-tab"        onclick="showTab('r1','resp-4xx')">4xx Error</button>
+        </div>
+        <div id="r1-resp-200" class="resp-panel active"><pre><span class="cm">// Content-Type: application/json  (or text/csv)
+// Content-Disposition: attachment; filename=cleaned_file.json
+// X-Duration-Ms: 142</span>
+
+[
+  { <span class="key">"name"</span>: <span class="str">"Alice Kamau"</span>, <span class="key">"phone"</span>: <span class="str">"254712345678"</span>, <span class="key">"date"</span>: <span class="str">"2024-01-15"</span> },
+  { <span class="key">"name"</span>: <span class="str">"Brian Ochieng"</span>, <span class="key">"phone"</span>: <span class="str">"254798765432"</span>, <span class="key">"date"</span>: <span class="str">"2024-02-03"</span> }
+]</pre></div>
+        <div id="r1-resp-202" class="resp-panel"><pre><span class="cm">// HTTP 202 Accepted
+// Webhook delivery is enqueued as a background task.</span>
+
+{
+  <span class="key">"status"</span>:          <span class="str">"queued"</span>,
+  <span class="key">"rows_processed"</span>:  <span class="val">847</span>,
+  <span class="key">"duration_ms"</span>:     <span class="val">312</span>
+}</pre></div>
+        <div id="r1-resp-4xx" class="resp-panel"><pre><span class="cm">// Every error follows the standard envelope (see Error Envelope)</span>
+
+{
+  <span class="key">"error"</span>: {
+    <span class="key">"code"</span>:       <span class="str">"INVALID_ENVIRONMENT_KEY"</span>,
+    <span class="key">"message"</span>:    <span class="str">"A dk_live_ key cannot be used outside a production environment."</span>,
+    <span class="key">"request_id"</span>: <span class="str">"b3d2f1a0-4c1e-4a2b-9f3d-e5a7c8b9d0e1"</span>
+  }
+}</pre></div>
+      </div>
+    </section>
+
+    <!-- CONFIG SCHEMA -->
+    <section id="config-schema">
+      <h2>Config Schema</h2>
+      <p>Pass a JSON-encoded config object in the <code>config</code> form field or <code>X-Clean-Config</code> header.</p>
+
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">json schema</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>{
+  <span class="key">"columns"</span>: {
+    <span class="str">"ColumnName"</span>: [<span class="str">"rule1"</span>, <span class="str">"rule2"</span>],
+    <span class="str">"Phone"</span>:      [<span class="str">"PHONE"</span>],
+    <span class="str">"Full Name"</span>:  [<span class="str">"NAME"</span>],
+    <span class="str">"DOB"</span>:        [<span class="str">"DATE"</span>],
+    <span class="str">"Amount"</span>:     [<span class="str">"strip"</span>, <span class="str">"to_float"</span>, <span class="str">"clamp:0:1000000"</span>]
+  },
+  <span class="key">"output_format"</span>: <span class="str">"json"</span>
+}</pre>
+      </div>
+
+      <p>Columns not listed in <code>columns</code> are included in the output with whitespace stripped. Columns listed with an empty rule array <code>[]</code> pass through unchanged.</p>
+    </section>
+
+    <!-- COLUMN RULES -->
+    <section id="column-rules">
+      <h2>Column Rules</h2>
+      <p>Rules are applied left to right. Multiple rules can be chained on one column.</p>
+
+      <table class="param-table">
+        <thead><tr><th>Rule</th><th>Input Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>PHONE</code></td><td>any</td><td>Normalise to Kenyan E.164 format (<code>2547xxxxxxxx</code>). Returns <code>null</code> if invalid.</td></tr>
+          <tr><td><code>NAME</code></td><td>string</td><td>Strip and title-case the value.</td></tr>
+          <tr><td><code>DATE</code></td><td>string / number</td><td>Parse 10+ common date formats and Excel serial numbers → ISO 8601 (<code>YYYY-MM-DD</code>).</td></tr>
+          <tr><td><code>strip</code></td><td>string</td><td>Remove leading/trailing whitespace.</td></tr>
+          <tr><td><code>lowercase</code></td><td>string</td><td>Convert to lowercase.</td></tr>
+          <tr><td><code>uppercase</code></td><td>string</td><td>Convert to uppercase.</td></tr>
+          <tr><td><code>title_case</code></td><td>string</td><td>Title-case each word.</td></tr>
+          <tr><td><code>to_int</code></td><td>any</td><td>Cast to integer. Returns <code>null</code> if not numeric.</td></tr>
+          <tr><td><code>to_float</code></td><td>any</td><td>Cast to float. Returns <code>null</code> if not numeric.</td></tr>
+          <tr><td><code>drop_empty</code></td><td>any</td><td>Drop the entire row if this column is null or blank.</td></tr>
+          <tr><td><code>fill_mean</code></td><td>number</td><td>Fill null/blank cells with the column mean.</td></tr>
+          <tr><td><code>fill_median</code></td><td>number</td><td>Fill null/blank cells with the column median.</td></tr>
+          <tr><td><code>fill_value:X</code></td><td>any</td><td>Fill null/blank cells with the literal string <code>X</code>.</td></tr>
+          <tr><td><code>clamp:lo:hi</code></td><td>number</td><td>Clamp value to [lo, hi]. Either bound can be empty (<code>clamp::1000</code>).</td></tr>
+          <tr><td><code>regex:pattern:replace</code></td><td>string</td><td>Apply <code>re.sub(pattern, replace, value)</code>.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- OUTPUT FORMATS -->
+    <section id="output-formats">
+      <h2>Output Formats</h2>
+      <p>Set <code>output_format</code> to <code>"json"</code> (default) or <code>"csv"</code>. The response <code>Content-Disposition</code> header triggers a file download automatically.</p>
+
+      <table class="param-table">
+        <thead><tr><th>Format</th><th>Content-Type</th><th>Filename</th></tr></thead>
+        <tbody>
+          <tr><td><code>json</code></td><td><code>application/json</code></td><td><code>cleaned_file.json</code></td></tr>
+          <tr><td><code>csv</code></td><td><code>text/csv</code></td><td><code>cleaned_file.csv</code></td></tr>
+        </tbody>
+      </table>
+
+      <p>When a webhook URL is supplied, the payload is always sent as a JSON array regardless of <code>output_format</code>.</p>
+    </section>
+
+    <!-- ERROR ENVELOPE -->
+    <section id="error-envelope">
+      <h2>Error Envelope</h2>
+      <p>Every error response across the API uses this exact structure. Parse <code>error.code</code> for programmatic handling and <code>error.message</code> for display to end-users.</p>
+
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">json</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>{
+  <span class="key">"error"</span>: {
+    <span class="key">"code"</span>:       <span class="str">"ERROR_CODE_CONSTANT"</span>,
+    <span class="key">"message"</span>:    <span class="str">"Human-readable description."</span>,
+    <span class="key">"request_id"</span>: <span class="str">"uuid-v4-per-request"</span>
+  }
+}</pre>
+      </div>
+
+      <p>The <code>request_id</code> is also sent as the <code>X-Request-ID</code> response header on every request (including successful ones) for log correlation.</p>
+    </section>
+
+    <!-- ERROR CODES -->
+    <section id="error-codes">
+      <h2>Error Codes</h2>
+      <table class="param-table">
+        <thead><tr><th>HTTP</th><th>code</th><th>Cause</th></tr></thead>
+        <tbody>
+          <tr><td>400</td><td><code>INVALID_ENVIRONMENT_KEY</code></td><td><code>dk_live_</code> key used outside a production environment, or key/environment mismatch in the database.</td></tr>
+          <tr><td>401</td><td><code>INVALID_API_KEY</code></td><td>Missing, malformed, or inactive API key.</td></tr>
+          <tr><td>401</td><td><code>UNAUTHORIZED</code></td><td>Session expired or cookie missing on a dashboard route.</td></tr>
+          <tr><td>409</td><td><code>CONFLICT</code></td><td>Email already registered (signup).</td></tr>
+          <tr><td>415</td><td><code>UNSUPPORTED_MEDIA_TYPE</code></td><td>File is not <code>.csv</code> or <code>.xlsx</code>.</td></tr>
+          <tr><td>422</td><td><code>VALIDATION_FAILED</code></td><td>Missing required field or invalid value.</td></tr>
+          <tr><td>429</td><td><code>RATE_LIMIT_EXCEEDED</code></td><td>Request quota exhausted for this key or IP.</td></tr>
+          <tr><td>500</td><td><code>INTERNAL_SERVER_ERROR</code></td><td>Unexpected server error. Logged with the <code>request_id</code> for diagnosis.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- PYTHON EXAMPLE -->
+    <section id="example-python">
+      <h2>Python Example</h2>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">python · requests</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre><span class="kw">import</span> requests, json
+
+API_KEY  = <span class="str">"dk_test_your_key_here"</span>
+ENDPOINT = <span class="url">"https://your-deployment-url.com/api/v1/clean"</span>
+
+config = {
+    <span class="str">"columns"</span>: {
+        <span class="str">"Phone"</span>:    [<span class="str">"PHONE"</span>],
+        <span class="str">"Name"</span>:     [<span class="str">"NAME"</span>],
+        <span class="str">"JoinDate"</span>: [<span class="str">"DATE"</span>],
+        <span class="str">"Amount"</span>:   [<span class="str">"strip"</span>, <span class="str">"to_float"</span>],
+    },
+    <span class="str">"output_format"</span>: <span class="str">"json"</span>,
+}
+
+<span class="kw">with</span> open(<span class="str">"members.csv"</span>, <span class="str">"rb"</span>) <span class="kw">as</span> f:
+    resp = requests.post(
+        ENDPOINT,
+        headers={<span class="str">"Authorization"</span>: <span class="str">f"Bearer {API_KEY}"</span>},
+        files={<span class="str">"file"</span>: (<span class="str">"members.csv"</span>, f, <span class="str">"text/csv"</span>)},
+        data={<span class="str">"config"</span>: json.dumps(config)},
+    )
+
+resp.raise_for_status()
+cleaned_rows = resp.json()
+print(<span class="str">f"Cleaned {len(cleaned_rows)} rows"</span>)</pre>
+      </div>
+    </section>
+
+    <!-- NODE EXAMPLE -->
+    <section id="example-node">
+      <h2>Node.js Example</h2>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">javascript · fetch + form-data</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre><span class="kw">import</span> fs   from <span class="str">'fs'</span>;
+<span class="kw">import</span> FormData from <span class="str">'form-data'</span>;
+<span class="kw">import</span> fetch   from <span class="str">'node-fetch'</span>;
+
+<span class="kw">const</span> API_KEY  = <span class="str">'dk_test_your_key_here'</span>;
+<span class="kw">const</span> ENDPOINT = <span class="url">'https://your-deployment-url.com/api/v1/clean'</span>;
+
+<span class="kw">const</span> config = {
+  columns: {
+    Phone:    [<span class="str">'PHONE'</span>],
+    Name:     [<span class="str">'NAME'</span>],
+    JoinDate: [<span class="str">'DATE'</span>],
+    Amount:   [<span class="str">'strip'</span>, <span class="str">'to_float'</span>],
+  },
+  output_format: <span class="str">'json'</span>,
+};
+
+<span class="kw">const</span> form = <span class="kw">new</span> FormData();
+form.append(<span class="str">'file'</span>, fs.createReadStream(<span class="str">'members.csv'</span>), <span class="str">'members.csv'</span>);
+form.append(<span class="str">'config'</span>, JSON.stringify(config));
+
+<span class="kw">const</span> res = <span class="kw">await</span> fetch(ENDPOINT, {
+  method:  <span class="str">'POST'</span>,
+  headers: { Authorization: <span class="str">`Bearer ${API_KEY}`</span>, ...form.getHeaders() },
+  body:    form,
+});
+
+<span class="kw">if</span> (!res.ok) {
+  <span class="kw">const</span> err = <span class="kw">await</span> res.json();
+  <span class="kw">throw new</span> Error(err.error.message);
+}
+
+<span class="kw">const</span> rows = <span class="kw">await</span> res.json();
+console.log(<span class="str">`Cleaned ${rows.length} rows`</span>);</pre>
+      </div>
+    </section>
+
+    <!-- CURL EXAMPLE -->
+    <section id="example-curl">
+      <h2>cURL Example</h2>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">shell</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>curl -X POST https://your-deployment-url.com/api/v1/clean \
+  -H <span class="str">"Authorization: Bearer dk_test_your_key_here"</span> \
+  -F <span class="str">"file=@members.csv"</span> \
+  -F <span class="str">'config={"columns":{"Phone":["PHONE"],"Name":["NAME"]}}'</span> \
+  -F <span class="str">"output_format=csv"</span> \
+  --output cleaned_file.csv</pre>
+      </div>
+    </section>
+
+    <!-- WEBHOOK EXAMPLE -->
+    <section id="example-webhook">
+      <h2>Webhook Delivery</h2>
+      <p>Add the <code>X-Webhook-URL</code> header to any request. The endpoint immediately returns <code>202 Accepted</code> and delivers the cleaned JSON array to your URL as a background task.</p>
+
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">python · webhook mode</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>resp = requests.post(
+    ENDPOINT,
+    headers={
+        <span class="str">"Authorization"</span>:  <span class="str">f"Bearer {API_KEY}"</span>,
+        <span class="str">"X-Webhook-URL"</span>:  <span class="str">"https://your-server.com/hook/cleaned"</span>,
+    },
+    files={<span class="str">"file"</span>: (<span class="str">"data.xlsx"</span>, f, <span class="str">"application/vnd.openxmlformats..."</span>)},
+    data={<span class="str">"config"</span>: json.dumps(config)},
+)
+assert resp.status_code == 202
+<span class="cm"># Your webhook receives POST with Content-Type: application/json
+# Body: [ { "col": "value", ... }, ... ]</span></pre>
+      </div>
+
+      <div class="alert alert-emerald">
+        <span class="alert-icon">✓</span>
+        <p>Webhook delivery is retried once on timeout. Your endpoint should respond with a <code>2xx</code> status within 30 seconds to confirm receipt.</p>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+// Tab switching for response examples
+function showTab(groupId, tabName) {
+  const container = document.getElementById(`${groupId}-${tabName}`).closest('.code-block').parentElement;
+  container.querySelectorAll('.resp-panel').forEach(p => p.classList.remove('active'));
+  container.querySelectorAll('.resp-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(`${groupId}-${tabName}`).classList.add('active');
+  event.target.classList.add('active');
+}
+
+// Code block copy
+function copyCode(btn) {
+  const pre = btn.closest('.code-block').querySelector('pre');
+  navigator.clipboard.writeText(pre.innerText).then(() => {
+    btn.textContent = '✓ Copied';
+    setTimeout(() => btn.textContent = 'Copy', 1800);
+  });
+}
+
+// Active sidebar link on scroll
+const sections = document.querySelectorAll('section[id]');
+const navItems = document.querySelectorAll('.nav-item');
+const observer = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      navItems.forEach(a => a.classList.remove('active'));
+      const active = document.querySelector(`.nav-item[href="#${e.target.id}"]`);
+      if (active) active.classList.add('active');
+    }
+  });
+}, { rootMargin: '-30% 0px -65% 0px' });
+sections.forEach(s => observer.observe(s));
+</script>
+</body>
+</html>

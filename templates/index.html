@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dodman · Data Clean Proxy</title>
+
+  <!-- Tailwind CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- PapaParse (CSV) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+  <!-- SheetJS (XLSX) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+  <!-- Google Fonts: JetBrains Mono + Syne -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            mono: ['"JetBrains Mono"', 'monospace'],
+            display: ['Syne', 'sans-serif'],
+          },
+          colors: {
+            void:    '#09090b',
+            surface: '#111113',
+            panel:   '#18181b',
+            border:  '#27272a',
+            muted:   '#3f3f46',
+            dim:     '#71717a',
+            soft:    '#a1a1aa',
+            ghost:   '#d4d4d8',
+            amber:   { 400: '#fbbf24', 500: '#f59e0b', 600: '#d97706' },
+            emerald: { 400: '#34d399', 500: '#10b981' },
+            rose:    { 400: '#fb7185', 500: '#f43f5e' },
+          },
+          boxShadow: {
+            'glow-amber': '0 0 0 1px #fbbf2440, 0 0 24px #fbbf2418',
+            'glow-emerald': '0 0 0 1px #34d39940, 0 0 24px #34d39918',
+            'glow-rose':  '0 0 0 1px #fb718540, 0 0 20px #fb718518',
+          },
+        },
+      },
+    }
+  </script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html, body {
+      background: #09090b;
+      color: #d4d4d8;
+      font-family: 'JetBrains Mono', monospace;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Subtle grid background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(251,191,36,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(251,191,36,0.03) 1px, transparent 1px);
+      background-size: 48px 48px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .content { position: relative; z-index: 1; }
+
+    /* Scan-line shimmer on logo */
+    @keyframes scan {
+      0%   { background-position: 0 -100%; }
+      100% { background-position: 0 200%; }
+    }
+    .logo-scan {
+      background: linear-gradient(180deg, transparent 40%, rgba(251,191,36,0.18) 50%, transparent 60%);
+      background-size: 100% 200%;
+      animation: scan 3s linear infinite;
+      -webkit-background-clip: text;
+      background-clip: text;
+    }
+
+    /* Drop zone pulse */
+    @keyframes zone-pulse {
+      0%, 100% { border-color: #3f3f46; }
+      50%       { border-color: #fbbf24; box-shadow: 0 0 20px #fbbf2412; }
+    }
+    .drop-zone.drag-over {
+      border-color: #fbbf24 !important;
+      box-shadow: 0 0 0 1px #fbbf2440, 0 0 32px #fbbf2420;
+      background: #fbbf2406;
+    }
+
+    /* Custom select arrow */
+    select {
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2371717a'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      padding-right: 28px !important;
+    }
+    select:focus { outline: none; }
+
+    /* JSON output highlight */
+    .json-key    { color: #34d399; }
+    .json-str    { color: #fbbf24; }
+    .json-num    { color: #60a5fa; }
+    .json-bool   { color: #c084fc; }
+    .json-null   { color: #71717a; }
+
+    /* Input focus ring */
+    .field-input:focus {
+      outline: none;
+      border-color: #fbbf24;
+      box-shadow: 0 0 0 1px #fbbf2440;
+    }
+
+    /* Status badge blink */
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    .blink { animation: blink 1.2s ease-in-out infinite; }
+
+    /* Row slide-in */
+    @keyframes row-in {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .row-in { animation: row-in 0.25s ease forwards; }
+
+    /* Button ripple */
+    .btn-primary { position: relative; overflow: hidden; }
+    .btn-primary::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, transparent 40%, rgba(255,255,255,0.06) 60%, transparent 80%);
+      transform: translateX(-100%);
+      transition: transform 0.5s;
+    }
+    .btn-primary:hover::after { transform: translateX(100%); }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 2px; }
+  </style>
+</head>
+
+<body>
+<div class="content max-w-3xl mx-auto px-4 py-12 space-y-6">
+
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <header class="flex items-start justify-between">
+    <div>
+      <div class="flex items-center gap-3 mb-1">
+        <!-- Wordmark -->
+        <span class="font-display text-xs font-700 tracking-[0.25em] uppercase text-amber-400 opacity-80">DODMAN</span>
+        <span class="w-px h-4 bg-border"></span>
+        <span class="font-mono text-xs text-dim tracking-widest uppercase">Data Clean Proxy</span>
+      </div>
+      <h1 class="font-display text-2xl font-800 text-ghost tracking-tight leading-tight">
+        File Validation<br/><span class="text-amber-400">Sandbox</span>
+      </h1>
+    </div>
+    <!-- Status indicator -->
+    <div class="flex items-center gap-2 mt-1 px-3 py-1.5 bg-panel border border-border rounded text-xs text-dim font-mono">
+      <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 blink"></span>
+      <span id="status-label">IDLE</span>
+    </div>
+  </header>
+
+  <!-- ── Config Card ────────────────────────────────────────────────────── -->
+  <section class="bg-panel border border-border rounded-lg overflow-hidden">
+    <!-- Section label -->
+    <div class="flex items-center gap-3 px-5 py-3 border-b border-border bg-surface">
+      <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+      <span class="text-xs font-mono text-dim tracking-widest uppercase">01 · Request Config</span>
+    </div>
+    <div class="p-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <!-- Webhook URL -->
+      <div class="sm:col-span-2">
+        <label class="block text-xs text-dim mb-1.5 tracking-wider uppercase">
+          X-Webhook-URL
+          <span class="text-muted normal-case tracking-normal ml-1">(optional — leave blank for direct download)</span>
+        </label>
+        <input
+          id="webhook-url"
+          type="url"
+          placeholder="https://your-server.com/webhook  ·  leave blank to stream file download"
+          class="field-input w-full bg-void border border-border rounded px-3 py-2.5 text-sm text-ghost font-mono placeholder-muted transition-all duration-150"
+        />
+      </div>
+      <!-- API Key -->
+      <div>
+        <label class="block text-xs text-dim mb-1.5 tracking-wider uppercase">API Key <span class="text-amber-400">*</span></label>
+        <input
+          id="api-key"
+          type="password"
+          placeholder="dk_live_••••••••••••••••"
+          class="field-input w-full bg-void border border-border rounded px-3 py-2.5 text-sm text-ghost font-mono placeholder-muted transition-all duration-150"
+        />
+      </div>
+      <!-- Output format -->
+      <div>
+        <label class="block text-xs text-dim mb-1.5 tracking-wider uppercase">Output Format</label>
+        <select
+          id="output-format"
+          class="field-input w-full bg-void border border-border rounded px-3 py-2.5 text-sm text-ghost font-mono transition-all duration-150 cursor-pointer"
+        >
+          <option value="json">JSON</option>
+          <option value="csv">CSV</option>
+        </select>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Drop Zone Card ─────────────────────────────────────────────────── -->
+  <section class="bg-panel border border-border rounded-lg overflow-hidden">
+    <div class="flex items-center gap-3 px-5 py-3 border-b border-border bg-surface">
+      <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+      <span class="text-xs font-mono text-dim tracking-widest uppercase">02 · File Upload</span>
+    </div>
+    <div class="p-5">
+      <div
+        id="drop-zone"
+        class="drop-zone relative border-2 border-dashed border-muted rounded-lg p-10 text-center cursor-pointer transition-all duration-200 select-none"
+        onclick="document.getElementById('file-input').click()"
+      >
+        <input id="file-input" type="file" accept=".csv,.xlsx" class="hidden" />
+
+        <!-- Default state -->
+        <div id="drop-default">
+          <div class="flex justify-center mb-4">
+            <svg class="w-10 h-10 text-muted" fill="none" viewBox="0 0 48 48" stroke="currentColor" stroke-width="1.5">
+              <rect x="8" y="4" width="28" height="36" rx="3" stroke-dasharray="4 2"/>
+              <path d="M28 4v10h10M18 28l6-6 6 6M24 22v14" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <p class="text-ghost font-mono text-sm mb-1">Drop <span class="text-amber-400">.csv</span> or <span class="text-amber-400">.xlsx</span> here</p>
+          <p class="text-dim text-xs">or click to browse</p>
+        </div>
+
+        <!-- File loaded state (hidden by default) -->
+        <div id="drop-loaded" class="hidden">
+          <div class="flex items-center justify-center gap-3">
+            <svg class="w-5 h-5 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <div class="text-left">
+              <p id="file-name" class="text-sm text-ghost font-mono"></p>
+              <p id="file-meta" class="text-xs text-dim mt-0.5"></p>
+            </div>
+            <button
+              id="clear-file"
+              onclick="event.stopPropagation(); clearFile()"
+              class="ml-4 text-muted hover:text-rose-400 transition-colors text-xs border border-muted hover:border-rose-400 rounded px-2 py-1"
+            >✕ clear</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Parse error -->
+      <div id="parse-error" class="hidden mt-3 px-4 py-2.5 bg-rose-500/10 border border-rose-500/30 rounded text-rose-400 text-xs font-mono"></div>
+    </div>
+  </section>
+
+  <!-- ── Column Mapping ─────────────────────────────────────────────────── -->
+  <section id="mapping-section" class="hidden bg-panel border border-border rounded-lg overflow-hidden">
+    <div class="flex items-center justify-between px-5 py-3 border-b border-border bg-surface">
+      <div class="flex items-center gap-3">
+        <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+        <span class="text-xs font-mono text-dim tracking-widest uppercase">03 · Header Mapping Matrix</span>
+      </div>
+      <span id="col-count" class="text-xs text-dim font-mono"></span>
+    </div>
+
+    <!-- Column header labels -->
+    <div class="grid grid-cols-2 gap-px bg-border text-xs text-dim font-mono tracking-widest uppercase px-5 py-2.5 border-b border-border bg-surface">
+      <span>Column Header</span>
+      <span>Cleaning Rule</span>
+    </div>
+
+    <!-- Rows injected by JS -->
+    <div id="mapping-rows" class="divide-y divide-border"></div>
+  </section>
+
+  <!-- ── Live Config Preview ────────────────────────────────────────────── -->
+  <section id="preview-section" class="hidden bg-panel border border-border rounded-lg overflow-hidden">
+    <div class="flex items-center justify-between px-5 py-3 border-b border-border bg-surface">
+      <div class="flex items-center gap-3">
+        <span class="w-1.5 h-1.5 rounded-full bg-dim"></span>
+        <span class="text-xs font-mono text-dim tracking-widest uppercase">Config Preview</span>
+      </div>
+      <span class="text-xs text-dim font-mono">X-Clean-Config payload</span>
+    </div>
+    <pre id="config-preview" class="p-5 text-xs leading-relaxed overflow-x-auto font-mono"></pre>
+  </section>
+
+  <!-- ── Submit ─────────────────────────────────────────────────────────── -->
+  <div id="submit-section" class="hidden">
+    <button
+      id="process-btn"
+      onclick="submitJob()"
+      class="btn-primary w-full flex items-center justify-center gap-3 bg-amber-500 hover:bg-amber-400 active:bg-amber-600 text-void font-display font-700 text-sm tracking-wider uppercase py-4 rounded-lg transition-all duration-150 shadow-glow-amber"
+    >
+      <svg id="btn-icon" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M12 5l7 7-7 7" />
+      </svg>
+      <span id="btn-label">Process &amp; Download File</span>
+    </button>
+  </div>
+
+  <!-- ── Response Block ─────────────────────────────────────────────────── -->
+  <section id="response-section" class="hidden bg-panel border border-border rounded-lg overflow-hidden">
+    <div class="flex items-center justify-between px-5 py-3 border-b border-border bg-surface">
+      <div class="flex items-center gap-3">
+        <span id="resp-dot" class="w-1.5 h-1.5 rounded-full bg-dim"></span>
+        <span class="text-xs font-mono text-dim tracking-widest uppercase">API Response</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <span id="resp-status-badge" class="text-xs font-mono px-2 py-0.5 rounded border"></span>
+        <span id="resp-time" class="text-xs text-dim font-mono"></span>
+      </div>
+    </div>
+
+    <!-- Success alert -->
+    <div id="success-alert" class="hidden mx-5 mt-5 flex items-start gap-3 px-4 py-3 bg-emerald-500/10 border border-emerald-500/30 rounded">
+      <svg class="w-4 h-4 text-emerald-400 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+      <div>
+        <p class="text-emerald-400 text-xs font-mono font-500">Job queued successfully</p>
+        <p id="success-detail" class="text-emerald-400/70 text-xs font-mono mt-0.5"></p>
+      </div>
+    </div>
+
+    <!-- Error alert -->
+    <div id="error-alert" class="hidden mx-5 mt-5 flex items-start gap-3 px-4 py-3 bg-rose-500/10 border border-rose-500/30 rounded">
+      <svg class="w-4 h-4 text-rose-400 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+      <div>
+        <p class="text-rose-400 text-xs font-mono font-500">Request failed</p>
+        <p id="error-detail" class="text-rose-400/70 text-xs font-mono mt-0.5"></p>
+      </div>
+    </div>
+
+    <!-- JSON output -->
+    <pre id="response-json" class="p-5 text-xs leading-relaxed overflow-x-auto font-mono mt-0"></pre>
+  </section>
+
+  <!-- ── Footer ─────────────────────────────────────────────────────────── -->
+  <footer class="text-center text-xs text-muted font-mono py-4 space-y-1">
+    <p>Dodman Group · Internal Infrastructure Tooling</p>
+    <p class="text-border">dodman.group · POST /api/v1/clean · BackgroundTasks · httpx</p>
+  </footer>
+
+</div><!-- /content -->
+
+<script>
+// ─── State ──────────────────────────────────────────────────────────────────
+let currentFile  = null;
+let parsedHeaders = [];
+
+const RULE_OPTIONS = [
+  { value: 'PASS_THROUGH', label: 'Pass-Through (Default)' },
+  { value: 'PHONE',        label: 'Clean Phone (KE)' },
+  { value: 'NAME',         label: 'Clean Name' },
+  { value: 'DATE',         label: 'Clean Date → ISO' },
+];
+
+// FastAPI backend
+const ENDPOINT = 'http://127.0.0.1:8000/api/v1/clean';
+
+// ─── Element refs ────────────────────────────────────────────────────────────
+const dropZone       = document.getElementById('drop-zone');
+const fileInput      = document.getElementById('file-input');
+const dropDefault    = document.getElementById('drop-default');
+const dropLoaded     = document.getElementById('drop-loaded');
+const fileNameEl     = document.getElementById('file-name');
+const fileMetaEl     = document.getElementById('file-meta');
+const parseError     = document.getElementById('parse-error');
+const mappingSection = document.getElementById('mapping-section');
+const mappingRows    = document.getElementById('mapping-rows');
+const previewSection = document.getElementById('preview-section');
+const configPreview  = document.getElementById('config-preview');
+const submitSection  = document.getElementById('submit-section');
+const responseSection= document.getElementById('response-section');
+const statusLabel    = document.getElementById('status-label');
+const colCount       = document.getElementById('col-count');
+
+// ─── Drag & Drop ─────────────────────────────────────────────────────────────
+dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', e => { if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('drag-over'); });
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const f = e.dataTransfer.files[0];
+  if (f) handleFile(f);
+});
+fileInput.addEventListener('change', e => {
+  if (e.target.files[0]) handleFile(e.target.files[0]);
+});
+
+// ─── File Handling ────────────────────────────────────────────────────────────
+function handleFile(file) {
+  const ext = file.name.split('.').pop().toLowerCase();
+  if (!['csv', 'xlsx'].includes(ext)) {
+    showParseError('Unsupported file type. Please upload a .csv or .xlsx file.');
+    return;
+  }
+  hideParseError();
+  currentFile = file;
+
+  // Show file pill
+  fileNameEl.textContent = file.name;
+  fileMetaEl.textContent = `${(file.size / 1024).toFixed(1)} KB · .${ext}`;
+  dropDefault.classList.add('hidden');
+  dropLoaded.classList.remove('hidden');
+  setStatus('PARSING');
+
+  if (ext === 'csv') parseCSV(file);
+  else               parseXLSX(file);
+}
+
+function parseCSV(file) {
+  Papa.parse(file, {
+    preview: 1,
+    skipEmptyLines: true,
+    complete(results) {
+      if (!results.data || !results.data[0] || results.data[0].length === 0) {
+        showParseError('Could not extract headers. Is the file empty?');
+        setStatus('ERROR');
+        return;
+      }
+      renderMapping(results.data[0]);
+    },
+    error(err) {
+      showParseError('CSV parse error: ' + err.message);
+      setStatus('ERROR');
+    },
+  });
+}
+
+function parseXLSX(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const wb      = XLSX.read(e.target.result, { type: 'array', sheetRows: 1 });
+      const wsName  = wb.SheetNames[0];
+      const ws      = wb.Sheets[wsName];
+      const data    = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+      if (!data || !data[0] || data[0].length === 0) {
+        showParseError('Could not extract headers from sheet. Is the first row empty?');
+        setStatus('ERROR');
+        return;
+      }
+      renderMapping(data[0].map(h => String(h)));
+    } catch(err) {
+      showParseError('XLSX parse error: ' + err.message);
+      setStatus('ERROR');
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// ─── Mapping Matrix ───────────────────────────────────────────────────────────
+function renderMapping(headers) {
+  parsedHeaders = headers.filter(h => h.trim() !== '');
+  mappingRows.innerHTML = '';
+
+  parsedHeaders.forEach((header, i) => {
+    const row = document.createElement('div');
+    row.className = 'row-in grid grid-cols-2 items-center gap-4 px-5 py-3 hover:bg-void/40 transition-colors';
+    row.style.animationDelay = `${i * 35}ms`;
+    row.style.opacity = '0';
+
+    const options = RULE_OPTIONS.map(o =>
+      `<option value="${o.value}">${o.label}</option>`
+    ).join('');
+
+    row.innerHTML = `
+      <div class="flex items-center gap-2 min-w-0">
+        <span class="shrink-0 text-xs text-muted font-mono w-5 text-right">${String(i+1).padStart(2,'0')}</span>
+        <span class="text-xs text-ghost font-mono truncate" title="${escHtml(header)}">${escHtml(header)}</span>
+      </div>
+      <select
+        data-header="${escHtml(header)}"
+        onchange="updatePreview()"
+        class="field-input bg-void border border-border rounded px-2.5 py-2 text-xs text-ghost font-mono w-full cursor-pointer transition-all duration-150"
+      >${options}</select>
+    `;
+    mappingRows.appendChild(row);
+  });
+
+  colCount.textContent = `${parsedHeaders.length} col${parsedHeaders.length !== 1 ? 's' : ''} detected`;
+  mappingSection.classList.remove('hidden');
+  previewSection.classList.remove('hidden');
+  submitSection.classList.remove('hidden');
+  updatePreview();
+  setStatus('READY');
+}
+
+// ─── Config Preview ───────────────────────────────────────────────────────────
+function buildConfig() {
+  const selects = mappingRows.querySelectorAll('select');
+  const columns = {};
+  selects.forEach(sel => {
+    const header = sel.dataset.header;
+    const rule   = sel.value;
+    if (rule !== 'PASS_THROUGH') {
+      columns[header] = [rule];
+    }
+  });
+  return {
+    columns,
+    output_format: document.getElementById('output-format').value,
+  };
+}
+
+function updatePreview() {
+  const cfg = buildConfig();
+  configPreview.innerHTML = syntaxHighlight(JSON.stringify(cfg, null, 2));
+}
+
+document.getElementById('output-format').addEventListener('change', updatePreview);
+
+// ─── Submit ───────────────────────────────────────────────────────────────────
+async function submitJob() {
+  const webhookUrl  = document.getElementById('webhook-url').value.trim();
+  const apiKey      = document.getElementById('api-key').value.trim();
+  const outputFmt   = document.getElementById('output-format').value; // 'json' | 'csv'
+
+  if (!currentFile) { flashError('No file selected.'); return; }
+
+  // Build form data — output_format is always sent as a form field so the
+  // backend resolves it with highest priority over the config body value.
+  const cfg      = buildConfig();
+  const formData = new FormData();
+  formData.append('file', currentFile);
+  formData.append('config', JSON.stringify(cfg));
+  formData.append('output_format', outputFmt);
+
+  // Build headers — webhook URL is now optional
+  const headers = {};
+  if (webhookUrl) headers['X-Webhook-URL'] = webhookUrl;
+  if (apiKey)     headers['Authorization'] = `Bearer ${apiKey}`;
+
+  // UI: loading state
+  setBtnLoading(true);
+  setStatus('POSTING');
+  hideAlerts();
+  responseSection.classList.remove('hidden');
+  document.getElementById('response-json').innerHTML =
+    '<span class="text-dim animate-pulse">Awaiting response…</span>';
+
+  const t0 = performance.now();
+  try {
+    const res = await fetch(ENDPOINT, { method: 'POST', headers, body: formData });
+    const ms  = Math.round(performance.now() - t0);
+
+    // ── Status badge ────────────────────────────────────────────────────────────────────
+    const badge = document.getElementById('resp-status-badge');
+    badge.textContent = res.status;
+    if (res.ok) {
+      badge.className = 'text-xs font-mono px-2 py-0.5 rounded border text-emerald-400 border-emerald-500/40 bg-emerald-500/10';
+      document.getElementById('resp-dot').className = 'w-1.5 h-1.5 rounded-full bg-emerald-400';
+    } else {
+      badge.className = 'text-xs font-mono px-2 py-0.5 rounded border text-rose-400 border-rose-500/40 bg-rose-500/10';
+      document.getElementById('resp-dot').className = 'w-1.5 h-1.5 rounded-full bg-rose-400';
+    }
+    document.getElementById('resp-time').textContent = `${ms}ms`;
+
+    // ── 202 Webhook-queued path ───────────────────────────────────────────────────────────
+    if (res.status === 202) {
+      const body = await res.json().catch(() => ({}));
+      document.getElementById('response-json').innerHTML =
+        syntaxHighlight(JSON.stringify(body, null, 2));
+      document.getElementById('success-alert').classList.remove('hidden');
+      const dropped = body.rows_dropped != null
+        ? ` · ${body.rows_dropped} rows dropped by sandbox limit`
+        : '';
+      document.getElementById('success-detail').textContent =
+        `${body.rows_processed ?? '?'} rows queued → routed to webhook destination${dropped}`;
+      setStatus('QUEUED');
+
+    // ── 200 Direct-download streaming path ──────────────────────────────────────────────────
+    // The server streams CSV or JSON bytes with Content-Disposition: attachment.
+    // We read the response body as a raw Blob, build an in-memory object URL,
+    // attach it to a temporary <a> element, and click it to trigger the OS
+    // "Save File" dialog — all without a page navigation.
+    } else if (res.status === 200) {
+      const blob     = await res.blob();
+      const ext      = outputFmt === 'csv' ? 'csv' : 'json';
+      const filename = `cleaned_file.${ext}`;
+      const mimeType = outputFmt === 'csv' ? 'text/csv' : 'application/json';
+
+      const objectUrl = URL.createObjectURL(new Blob([blob], { type: mimeType }));
+      const anchor    = document.createElement('a');
+      anchor.href     = objectUrl;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      // Release the temporary object URL after 10 s — enough time for any browser
+      // to start the download without leaking memory.
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+
+      // Truncation notice (surfaced via X-Rows-Truncated response header)
+      const truncatedCount = res.headers.get('X-Rows-Truncated');
+
+      // Build an in-panel preview from the already-consumed blob text.
+      const text = await blob.text();
+      let previewHtml;
+      if (outputFmt === 'json') {
+        try {
+          previewHtml = syntaxHighlight(
+            JSON.stringify(JSON.parse(text), null, 2).slice(0, 8000)
+          );
+        } catch {
+          previewHtml = escHtml(text.slice(0, 8000));
+        }
+      } else {
+        previewHtml = `<span class="text-dim">// CSV preview (first 4000 chars)\n\n</span>${escHtml(text.slice(0, 4000))}`;
+      }
+      document.getElementById('response-json').innerHTML = previewHtml;
+
+      document.getElementById('success-alert').classList.remove('hidden');
+      let detail = `Download started → ${filename}`;
+      if (truncatedCount) detail += ` · ${truncatedCount} rows dropped (sandbox limit)`;
+      document.getElementById('success-detail').textContent = detail;
+      setStatus('DONE');
+
+    // ── Error path ────────────────────────────────────────────────────────────────────────────────
+    } else {
+      const body = await res.json().catch(() => ({}));
+      document.getElementById('response-json').innerHTML =
+        syntaxHighlight(JSON.stringify(body, null, 2));
+      document.getElementById('error-alert').classList.remove('hidden');
+      document.getElementById('error-detail').textContent = (() => {
+        const d = body.detail;
+        if (!d) return `HTTP ${res.status} · ${body.message ?? 'Unexpected response'}`;
+        if (typeof d === 'string') return `HTTP ${res.status} · ${d}`;
+        if (Array.isArray(d))
+          return `HTTP ${res.status} · ` + d.map(e => `${e.loc?.slice(-1)[0] ?? 'field'}: ${e.msg}`).join('; ');
+        if (d.error?.message) return `HTTP ${res.status} · [${d.error.code}] ${d.error.message}`;
+        return `HTTP ${res.status} · ${JSON.stringify(d)}`;
+      })();
+      setStatus('ERROR');
+    }
+
+  } catch (err) {
+    const ms = Math.round(performance.now() - t0);
+    document.getElementById('resp-time').textContent = `${ms}ms`;
+    document.getElementById('response-json').innerHTML =
+      `<span class="text-rose-400">// Network error\n// ${escHtml(err.message)}\n//\n// Is the FastAPI server running at ${escHtml(ENDPOINT)} ?</span>`;
+
+    const badge = document.getElementById('resp-status-badge');
+    badge.textContent = 'ERR';
+    badge.className = 'text-xs font-mono px-2 py-0.5 rounded border text-rose-400 border-rose-500/40 bg-rose-500/10';
+    document.getElementById('resp-dot').className = 'w-1.5 h-1.5 rounded-full bg-rose-400';
+
+    document.getElementById('error-alert').classList.remove('hidden');
+    document.getElementById('error-detail').textContent = err.message;
+    setStatus('ERROR');
+  } finally {
+    setBtnLoading(false);
+  }
+
+  // Scroll response into view
+  responseSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function clearFile() {
+  currentFile = null;
+  parsedHeaders = [];
+  fileInput.value = '';
+  dropDefault.classList.remove('hidden');
+  dropLoaded.classList.add('hidden');
+  mappingSection.classList.add('hidden');
+  previewSection.classList.add('hidden');
+  submitSection.classList.add('hidden');
+  responseSection.classList.add('hidden');
+  hideParseError();
+  setStatus('IDLE');
+}
+
+function showParseError(msg) {
+  parseError.textContent = msg;
+  parseError.classList.remove('hidden');
+}
+function hideParseError() {
+  parseError.classList.add('hidden');
+}
+
+function hideAlerts() {
+  document.getElementById('success-alert').classList.add('hidden');
+  document.getElementById('error-alert').classList.add('hidden');
+}
+
+function setStatus(s) {
+  statusLabel.textContent = s;
+  const dot = statusLabel.previousElementSibling;
+  const colors = {
+    IDLE:    'bg-dim',
+    PARSING: 'bg-amber-400 blink',
+    READY:   'bg-emerald-400',
+    POSTING: 'bg-amber-400 blink',
+    QUEUED:  'bg-emerald-400',
+    DONE:    'bg-emerald-400',
+    ERROR:   'bg-rose-400',
+  };
+  dot.className = `w-1.5 h-1.5 rounded-full ${colors[s] || 'bg-dim'}`;
+}
+
+function setBtnLoading(loading) {
+  const btn = document.getElementById('process-btn');
+  const lbl = document.getElementById('btn-label');
+  const ico = document.getElementById('btn-icon');
+  if (loading) {
+    btn.disabled = true;
+    btn.classList.add('opacity-70', 'cursor-not-allowed');
+    lbl.textContent = 'Dispatching…';
+    ico.innerHTML = `<circle cx="12" cy="12" r="10" stroke-width="2" stroke-dasharray="32" stroke-dashoffset="32" class="origin-center animate-spin" style="animation-duration:0.8s"/>`;
+  } else {
+    btn.disabled = false;
+    btn.classList.remove('opacity-70', 'cursor-not-allowed');
+    lbl.textContent = 'Process & Download File';
+    ico.innerHTML = `<path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M12 5l7 7-7 7" />`;
+  }
+}
+
+function flashError(msg) {
+  // Brief console note — no modal needed, field errors handle UX
+  console.warn('[sandbox]', msg);
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+// Syntax highlighter for JSON
+function syntaxHighlight(json) {
+  return json.replace(
+    /("(\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"(?:\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    match => {
+      if (/^"/.test(match)) {
+        if (/:$/.test(match)) return `<span class="json-key">${escHtml(match)}</span>`;
+        return `<span class="json-str">${escHtml(match)}</span>`;
+      }
+      if (/true|false/.test(match)) return `<span class="json-bool">${match}</span>`;
+      if (/null/.test(match))        return `<span class="json-null">${match}</span>`;
+      return `<span class="json-num">${match}</span>`;
+    }
+  );
+}
+</script>
+</body>
+</html>
