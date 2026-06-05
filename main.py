@@ -499,6 +499,86 @@ async def _write_billing_ledger(
 
 
 # ===========================================================================
+# Audit log writer
+# ===========================================================================
+# Writes to the shared audit_logs table used across all Dodman services.
+# Every row carries  details->>'service' = 'data_cleaning_proxy'  so you can
+# filter this service out of the shared table with a single WHERE clause:
+#
+#   SELECT * FROM audit_logs
+#   WHERE  details->>'service' = 'data_cleaning_proxy'
+#   ORDER  BY timestamp DESC;
+#
+# All writes are fire-and-forget via BackgroundTasks — failures are logged
+# server-side but never propagate to the caller.
+# ===========================================================================
+
+_AUDIT_SERVICE = "data_cleaning_proxy"
+
+
+async def _write_audit_log(
+    pool:        asyncpg.Pool,
+    action:      str,
+    success:     bool,
+    *,
+    user_type:   str        = "anonymous",
+    target_type: str        = "",
+    target_id:   str        = "",
+    ip_address:  str        = "",
+    details:     dict | None = None,
+) -> None:
+    """
+    Insert one row into audit_logs.  Called via BackgroundTasks.
+
+    Mandatory filtering fields baked into every row:
+      details->>'service'  = 'data_cleaning_proxy'
+      details->>'env'      = current DODMAN_ENV value
+
+    Args:
+        action      – dot-namespaced event string, e.g. 'user.login'
+        success     – True if the operation completed without error
+        user_type   – 'anonymous' | 'user' | 'admin' | 'api_key'
+        target_type – entity being acted on: 'user' | 'api_key' | 'file' | 'request' | 'session'
+        target_id   – string identifier of that entity (UUID, key prefix, filename, …)
+        ip_address  – client IP extracted from the request
+        details     – arbitrary extra fields merged into the JSONB column
+    """
+    payload = {
+        "service": _AUDIT_SERVICE,
+        "env":     _RUNTIME_ENV(),
+        **(details or {}),
+    }
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO audit_logs
+                    (timestamp, user_type, action, target_type, target_id,
+                     details, ip_address, success)
+                VALUES
+                    (NOW(), $1, $2, $3, $4, $5::jsonb, $6, $7)
+                """,
+                user_type,
+                action,
+                target_type,
+                target_id,
+                json.dumps(payload),
+                ip_address,
+                success,
+            )
+    except Exception:
+        log.exception("audit_log write failed (non-fatal): action=%s target=%s", action, target_id)
+
+
+def _client_ip(request: Request) -> str:
+    """Extract client IP, respecting X-Forwarded-For for proxied deployments."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+# ===========================================================================
 # API key helpers
 # ===========================================================================
 
@@ -517,6 +597,33 @@ def _hash_key(raw: str) -> str:
 
 _bearer = HTTPBearer(auto_error=False)
 TIER_RANK = {"free": 0, "starter": 1, "pro": 2}
+
+
+async def _log_auth_failure(
+    request:    Request,
+    action:     str,
+    reason:     str,
+    target_id:  str = "",
+) -> None:
+    """
+    Convenience wrapper for logging auth-layer failures.
+    Safe to call even when the DB pool is unavailable — failures are silently
+    swallowed so they never affect the error response being returned.
+    """
+    try:
+        pool = await get_pool()
+        await _write_audit_log(
+            pool,
+            action=action,
+            success=False,
+            user_type="anonymous",
+            target_type="request",
+            target_id=target_id,
+            ip_address=_client_ip(request),
+            details={"reason": reason, "request_id": _get_request_id(request)},
+        )
+    except Exception:
+        pass  # pool unavailable or write failed — never block the auth error response
 
 
 class APIKeyRecord:
@@ -606,6 +713,11 @@ async def verify_api_key(
     # ── Prefix / environment mismatch enforcement ─────────────────────────────
     if raw.startswith(_PREFIX_LIVE):
         if _RUNTIME_ENV() != "production":
+            asyncio.ensure_future(_log_auth_failure(
+                request, "auth.env_mismatch",
+                f"dk_live_ key used in {_RUNTIME_ENV()} environment",
+                raw[:16],
+            ))
             raise HTTPException(
                 status_code=400,
                 detail=_error_envelope(
@@ -640,6 +752,11 @@ async def verify_api_key(
         )
 
     if row is None or not row["is_active"]:
+        asyncio.ensure_future(_log_auth_failure(
+            request, "auth.invalid_key",
+            "Key not found or inactive",
+            raw[:16] if len(raw) >= 8 else "redacted",
+        ))
         raise _UNAUTH
 
     # ── Secondary environment guard: key's stored environment vs request key ──
@@ -647,6 +764,11 @@ async def verify_api_key(
     # is a data anomaly — reject it explicitly.
     stored_env = row["environment"]
     if raw.startswith(_PREFIX_LIVE) and stored_env != "live":
+        asyncio.ensure_future(_log_auth_failure(
+            request, "auth.env_mismatch",
+            "dk_live_ prefix but key stored as test environment",
+            raw[:16],
+        ))
         raise HTTPException(
             status_code=400,
             detail=_error_envelope(
@@ -657,6 +779,11 @@ async def verify_api_key(
             ),
         )
     if raw.startswith(_PREFIX_TEST) and stored_env != "test":
+        asyncio.ensure_future(_log_auth_failure(
+            request, "auth.env_mismatch",
+            "dk_test_ prefix but key stored as live environment",
+            raw[:16],
+        ))
         raise HTTPException(
             status_code=400,
             detail=_error_envelope(
@@ -780,6 +907,17 @@ async def signup(
                 email, pw_hash,
             )
     except asyncpg.UniqueViolationError:
+        # Log failed signup attempt — duplicate email
+        asyncio.ensure_future(_write_audit_log(
+            pool,
+            action="user.signup",
+            success=False,
+            user_type="anonymous",
+            target_type="user",
+            target_id=email,
+            ip_address=_client_ip(request),
+            details={"reason": "duplicate_email", "request_id": _get_request_id(request)},
+        ))
         raise HTTPException(
             status_code=409,
             detail=_error_envelope(
@@ -791,6 +929,19 @@ async def signup(
 
     user_id = str(row["id"])
     log.info("User registered: id=%s email=%s", user_id, email)
+
+    # Log successful signup
+    asyncio.ensure_future(_write_audit_log(
+        pool,
+        action="user.signup",
+        success=True,
+        user_type="anonymous",
+        target_type="user",
+        target_id=user_id,
+        ip_address=_client_ip(request),
+        details={"email": email, "request_id": _get_request_id(request)},
+    ))
+
     return JSONResponse(
         status_code=201,
         content={"user_id": user_id, "email": email, "created_at": row["created_at"].isoformat()},
@@ -821,12 +972,44 @@ async def login(
         ),
     )
     if row is None:
+        asyncio.ensure_future(_write_audit_log(
+            pool,
+            action="user.login",
+            success=False,
+            user_type="anonymous",
+            target_type="user",
+            target_id=email,
+            ip_address=_client_ip(request),
+            details={"reason": "user_not_found", "request_id": _get_request_id(request)},
+        ))
         raise _INVALID
     if not _verify_password(body.password, row["password_hash"]):
+        asyncio.ensure_future(_write_audit_log(
+            pool,
+            action="user.login",
+            success=False,
+            user_type="anonymous",
+            target_type="user",
+            target_id=str(row["id"]),
+            ip_address=_client_ip(request),
+            details={"reason": "wrong_password", "request_id": _get_request_id(request)},
+        ))
         raise _INVALID
 
     user_id = str(row["id"])
     token   = _make_session_token(user_id)
+
+    # Log successful login
+    asyncio.ensure_future(_write_audit_log(
+        pool,
+        action="user.login",
+        success=True,
+        user_type="anonymous",
+        target_type="user",
+        target_id=user_id,
+        ip_address=_client_ip(request),
+        details={"email": email, "request_id": _get_request_id(request)},
+    ))
 
     resp = JSONResponse(content={"status": "ok", "user_id": user_id})
     resp.set_cookie(
@@ -842,19 +1025,35 @@ async def login(
 
 
 @auth_router.post("/logout", summary="Invalidate the session cookie")
-async def logout() -> Response:
+async def logout(
+    request:        Request,
+    dodman_session: str | None = Cookie(default=None),
+) -> Response:
+    # Identify the user from the session token (best-effort — no DB hit)
+    user_id = _decode_session_token(dodman_session) if dodman_session else "unknown"
+
     resp = RedirectResponse(url="/auth/login-page", status_code=303)
-    # Delete the session cookie
-    resp.delete_cookie(
-        key="dodman_session",
-        httponly=True,
-        samesite="lax",
-    )
-    # Instruct every cache layer (browser, CDN, proxy) never to store this
-    # page so the back-button cannot replay a stale authenticated view.
+    resp.delete_cookie(key="dodman_session", httponly=True, samesite="lax")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"]        = "no-cache"
     resp.headers["Expires"]       = "0"
+
+    # Log the logout — fire-and-forget, pool may be None if DB is unreachable
+    try:
+        pool = await get_pool()
+        asyncio.ensure_future(_write_audit_log(
+            pool,
+            action="user.logout",
+            success=True,
+            user_type="user",
+            target_type="session",
+            target_id=user_id or "unknown",
+            ip_address=_client_ip(request),
+            details={"request_id": _get_request_id(request)},
+        ))
+    except Exception:
+        pass
+
     return resp
 
 
@@ -1037,6 +1236,20 @@ async def create_api_key(
         )
 
     log.info("API key issued: id=%s label=%r env=%s tier=%s", row["id"], label, env, tier)
+    asyncio.ensure_future(_write_audit_log(
+        pool,
+        action="api_key.issue",
+        success=True,
+        user_type="admin",
+        target_type="api_key",
+        target_id=str(row["id"]),
+        ip_address=_client_ip(request),
+        details={
+            "key_prefix": prefix, "label": label,
+            "environment": env, "tier": tier,
+            "request_id": _get_request_id(request),
+        },
+    ))
     return JSONResponse(
         status_code=201,
         content={
@@ -1107,6 +1320,23 @@ async def create_user_api_key(
         "Key re-issued: user=%s env=%s deactivated_previous=%d new_prefix=%s",
         current_user["id"], env, deactivated_count, prefix,
     )
+    asyncio.ensure_future(_write_audit_log(
+        pool,
+        action="api_key.reissue",
+        success=True,
+        user_type="user",
+        target_type="api_key",
+        target_id=str(row["id"]),
+        ip_address=_client_ip(request),
+        details={
+            "user_id": current_user["id"],
+            "key_prefix": prefix,
+            "environment": env,
+            "tier": tier,
+            "previous_deactivated": deactivated_count,
+            "request_id": _get_request_id(request),
+        },
+    ))
     return JSONResponse(
         status_code=201,
         content={
@@ -1129,9 +1359,10 @@ async def create_user_api_key(
     tags=["keys"],
 )
 async def deactivate_api_key(
-    key_id: str,
-    _:      None = Depends(verify_internal_secret),
-    pool:   asyncpg.Pool = Depends(get_pool),
+    key_id:  str,
+    request: Request,
+    _:       None = Depends(verify_internal_secret),
+    pool:    asyncpg.Pool = Depends(get_pool),
 ) -> JSONResponse:
     try:
         key_uuid = uuid.UUID(key_id)
@@ -1145,6 +1376,16 @@ async def deactivate_api_key(
     if result == "UPDATE 0":
         raise HTTPException(status_code=404, detail=f"Key id={key_id} not found.")
     log.info("API key deactivated: id=%s", key_id)
+    asyncio.ensure_future(_write_audit_log(
+        pool,
+        action="api_key.deactivate",
+        success=True,
+        user_type="admin",
+        target_type="api_key",
+        target_id=key_id,
+        ip_address=_client_ip(request),
+        details={"request_id": _get_request_id(request)},
+    ))
     return JSONResponse(content={"id": key_id, "is_active": False})
 
 
@@ -1587,7 +1828,7 @@ async def clean_file(
     # ── Stop the clock ────────────────────────────────────────────────────────
     duration_ms = int((time.perf_counter() - t_start) * 1000)
 
-    # ── Schedule billing ledger write (non-blocking) ──────────────────────────
+    # ── Schedule billing ledger + audit log writes (non-blocking) ───────────
     try:
         pool = await get_pool()
         background_tasks.add_task(
@@ -1599,6 +1840,30 @@ async def clean_file(
             rows_out,
             file_type,
             duration_ms,
+        )
+        background_tasks.add_task(
+            _write_audit_log,
+            pool,
+            "file.clean",         # action
+            True,                 # success
+            # keyword args
+            user_type="api_key",
+            target_type="file",
+            target_id=file.filename or "unknown",
+            ip_address=_client_ip(request),
+            details={
+                "key_prefix":  api_key.key_prefix,
+                "environment": api_key.environment,
+                "tier":        api_key.tier,
+                "file_type":   file_type,
+                "rows_in":     rows_in,
+                "rows_out":    rows_out,
+                "duration_ms": duration_ms,
+                "truncated":   truncated,
+                "webhook":     bool(x_webhook_url),
+                "output_format": resolved_fmt,
+                "request_id":  _get_request_id(request),
+            },
         )
     except HTTPException:
         pass   # DB unavailable — telemetry is non-critical; don't fail the request
