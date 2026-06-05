@@ -816,38 +816,19 @@ async def login(
 
 @auth_router.post("/logout", summary="Invalidate the session cookie")
 async def logout() -> Response:
-    resp = JSONResponse(content={"status": "logged_out"})
-    resp.delete_cookie("dodman_session")
+    resp = RedirectResponse(url="/auth/login-page", status_code=303)
+    # Delete the session cookie
+    resp.delete_cookie(
+        key="dodman_session",
+        httponly=True,
+        samesite="lax",
+    )
+    # Instruct every cache layer (browser, CDN, proxy) never to store this
+    # page so the back-button cannot replay a stale authenticated view.
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"]        = "no-cache"
+    resp.headers["Expires"]       = "0"
     return resp
-
-
-# ---------------------------------------------------------------------------
-# PATCH /auth/me/env — persist the user's last-viewed environment toggle
-# ---------------------------------------------------------------------------
-
-@auth_router.patch("/me/env", summary="Save the user\'s preferred environment view")
-async def update_last_env(
-    request:      Request,
-    current_user: dict = Depends(get_current_user),
-    pool:         asyncpg.Pool = Depends(get_pool),
-) -> JSONResponse:
-    body = await request.json()
-    env  = str(body.get("env", "")).strip().lower()
-    if env not in ("test", "live"):
-        raise HTTPException(
-            status_code=422,
-            detail=_error_envelope(
-                "VALIDATION_FAILED",
-                "env must be \'test\' or \'live\'.",
-                _get_request_id(request),
-            ),
-        )
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET last_env = $1 WHERE id = $2",
-            env, uuid.UUID(current_user["id"]),
-        )
-    return JSONResponse(content={"last_env": env})
 
 
 # ---------------------------------------------------------------------------
@@ -856,7 +837,13 @@ async def update_last_env(
 
 @auth_router.get("/login-page", include_in_schema=False)
 async def login_page(request: Request):
-    return templates.TemplateResponse(request=request, name="login.html", context={"error": None})
+    resp = templates.TemplateResponse(request=request, name="login.html", context={"error": None})
+    # Prevent caching so the browser always fetches a fresh copy.
+    # Critical: ensures back-button after logout shows this page, not the dashboard.
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"]        = "no-cache"
+    resp.headers["Expires"]       = "0"
+    return resp
 
 
 @auth_router.get("/signup-page", include_in_schema=False)
@@ -879,20 +866,27 @@ async def get_current_user(
     dodman_session:  str | None = Cookie(default=None),
     pool:            asyncpg.Pool = Depends(get_pool),
 ) -> dict:
-    _UNAUTHENTICATED = HTTPException(
-        status_code=401,
-        detail=_error_envelope(
-            "UNAUTHORIZED",
-            "You must be logged in to access this resource.",
-            _get_request_id(request),
-        ),
-    )
+    # For browser-facing routes (Accept: text/html) redirect to login on
+    # auth failure instead of returning a JSON 401 envelope.
+    def _unauth():
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept:
+            return RedirectResponse(url="/auth/login-page", status_code=303)
+        return HTTPException(
+            status_code=401,
+            detail=_error_envelope(
+                "UNAUTHORIZED",
+                "You must be logged in to access this resource.",
+                _get_request_id(request),
+            ),
+        )
+
     if not dodman_session:
-        raise _UNAUTHENTICATED
+        raise _unauth()
 
     user_id = _decode_session_token(dodman_session)
     if not user_id:
-        raise _UNAUTHENTICATED
+        raise _unauth()
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -900,7 +894,7 @@ async def get_current_user(
             uuid.UUID(user_id),
         )
     if row is None:
-        raise _UNAUTHENTICATED
+        raise _unauth()
 
     return {
         "id":         str(row["id"]),
@@ -908,6 +902,36 @@ async def get_current_user(
         "last_env":   row["last_env"],
         "created_at": row["created_at"],
     }
+
+
+# ---------------------------------------------------------------------------
+# PATCH /auth/me/env  — persist the user's preferred environment toggle
+# Placed here because it depends on get_current_user defined above.
+# ---------------------------------------------------------------------------
+
+@auth_router.patch("/me/env", summary="Save preferred environment view")
+async def update_last_env(
+    request:      Request,
+    current_user: dict          = Depends(get_current_user),
+    pool:         asyncpg.Pool  = Depends(get_pool),
+) -> JSONResponse:
+    body = await request.json()
+    env  = str(body.get("env", "")).strip().lower()
+    if env not in ("test", "live"):
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                "env must be 'test' or 'live'.",
+                _get_request_id(request),
+            ),
+        )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET last_env = $1 WHERE id = $2",
+            env, uuid.UUID(current_user["id"]),
+        )
+    return JSONResponse(content={"last_env": env})
 
 
 # ===========================================================================
@@ -1170,7 +1194,7 @@ async def dashboard(
             "key_prefix":  r["key_prefix"],
         }
 
-    return templates.TemplateResponse(
+    resp = templates.TemplateResponse(
         request=request,
         name="dashboard.html",
         context={
@@ -1181,6 +1205,12 @@ async def dashboard(
             "ledger_live":  [_serialise_ledger(r) for r in ledger_live_rows],
         },
     )
+    # Authenticated page — never cache so back-button after logout always
+    # hits the server and gets redirected to login via get_current_user.
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"]        = "no-cache"
+    resp.headers["Expires"]       = "0"
+    return resp
 
 
 @dash_router.get("/api-docs", summary="Client integration documentation", include_in_schema=False)
@@ -1191,6 +1221,18 @@ async def api_docs_page(
     return templates.TemplateResponse(
         request=request,
         name="api_docs.html",
+        context={"user": current_user},
+    )
+
+
+@dash_router.get("/data-cleaner", summary="Data cleaning tool", include_in_schema=False)
+async def data_cleaner_page(
+    request:      Request,
+    current_user: dict = Depends(get_current_user),
+):
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
         context={"user": current_user},
     )
 
