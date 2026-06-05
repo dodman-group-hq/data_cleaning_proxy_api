@@ -350,9 +350,16 @@ CREATE TABLE IF NOT EXISTS users (
     id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     email         VARCHAR(320) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
+    last_env      VARCHAR(8)   NOT NULL DEFAULT 'test'
+                               CHECK (last_env IN ('test', 'live')),
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+-- Idempotent column add for existing deployments
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_env VARCHAR(8) NOT NULL DEFAULT 'test'
+        CHECK (last_env IN ('test', 'live'));
+EXCEPTION WHEN others THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS api_keys (
     id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -815,6 +822,35 @@ async def logout() -> Response:
 
 
 # ---------------------------------------------------------------------------
+# PATCH /auth/me/env — persist the user's last-viewed environment toggle
+# ---------------------------------------------------------------------------
+
+@auth_router.patch("/me/env", summary="Save the user\'s preferred environment view")
+async def update_last_env(
+    request:      Request,
+    current_user: dict = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    body = await request.json()
+    env  = str(body.get("env", "")).strip().lower()
+    if env not in ("test", "live"):
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                "env must be \'test\' or \'live\'.",
+                _get_request_id(request),
+            ),
+        )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET last_env = $1 WHERE id = $2",
+            env, uuid.UUID(current_user["id"]),
+        )
+    return JSONResponse(content={"last_env": env})
+
+
+# ---------------------------------------------------------------------------
 # Auth page routes (serve the HTML templates)
 # ---------------------------------------------------------------------------
 
@@ -860,13 +896,18 @@ async def get_current_user(
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, created_at FROM users WHERE id = $1",
+            "SELECT id, email, last_env, created_at FROM users WHERE id = $1",
             uuid.UUID(user_id),
         )
     if row is None:
         raise _UNAUTHENTICATED
 
-    return {"id": str(row["id"]), "email": row["email"], "created_at": row["created_at"]}
+    return {
+        "id":         str(row["id"]),
+        "email":      row["email"],
+        "last_env":   row["last_env"],
+        "created_at": row["created_at"],
+    }
 
 
 # ===========================================================================
@@ -988,6 +1029,18 @@ async def create_user_api_key(
     label  = (body.label or current_user["email"]).strip()
 
     async with pool.acquire() as conn:
+        # Deactivate ALL existing keys for this user+environment before issuing
+        # a new one — only one active key per environment is allowed.
+        deactivated = await conn.execute(
+            """
+            UPDATE api_keys
+            SET    is_active = FALSE
+            WHERE  user_id = $1
+            AND    environment = $2
+            AND    is_active = TRUE
+            """,
+            uuid.UUID(current_user["id"]), env,
+        )
         row = await conn.fetchrow(
             """
             INSERT INTO api_keys (user_id, key_hash, key_prefix, label, environment, tier)
@@ -997,17 +1050,23 @@ async def create_user_api_key(
             uuid.UUID(current_user["id"]), hashed, prefix, label, env, tier,
         )
 
+    deactivated_count = int(deactivated.split()[-1]) if deactivated else 0
+    log.info(
+        "Key re-issued: user=%s env=%s deactivated_previous=%d new_prefix=%s",
+        current_user["id"], env, deactivated_count, prefix,
+    )
     return JSONResponse(
         status_code=201,
         content={
-            "id":          str(row["id"]),
-            "label":       label,
-            "environment": env,
-            "tier":        tier,
-            "key_prefix":  prefix,
-            "api_key":     raw,
-            "created_at":  row["created_at"].isoformat(),
-            "warning":     "Store this key immediately. It will not be shown again.",
+            "id":                  str(row["id"]),
+            "label":               label,
+            "environment":         env,
+            "tier":                tier,
+            "key_prefix":          prefix,
+            "api_key":             raw,
+            "created_at":          row["created_at"].isoformat(),
+            "previous_deactivated": deactivated_count,
+            "warning":             "Store this key immediately. It will not be shown again.",
         },
     )
 
@@ -1050,6 +1109,8 @@ async def dashboard(
     current_user: dict = Depends(get_current_user),
     pool:         asyncpg.Pool = Depends(get_pool),
 ):
+    uid = uuid.UUID(current_user["id"])
+
     async with pool.acquire() as conn:
         keys = await conn.fetch(
             """
@@ -1058,29 +1119,44 @@ async def dashboard(
             WHERE  user_id = $1
             ORDER  BY created_at DESC
             """,
-            uuid.UUID(current_user["id"]),
+            uid,
         )
-        ledger_rows = await conn.fetch(
+        # Fetch test and live ledger rows separately for split-tab display
+        ledger_test_rows = await conn.fetch(
             """
             SELECT bl.timestamp, bl.rows_in, bl.rows_out, bl.file_type,
                    bl.duration_ms, bl.key_prefix
             FROM   billing_ledger bl
             JOIN   api_keys ak ON ak.id = bl.api_key_id
             WHERE  ak.user_id = $1
+            AND    bl.key_prefix LIKE 'dk!_test!_%' ESCAPE '!'
             ORDER  BY bl.timestamp DESC
             LIMIT  50
             """,
-            uuid.UUID(current_user["id"]),
+            uid,
+        )
+        ledger_live_rows = await conn.fetch(
+            """
+            SELECT bl.timestamp, bl.rows_in, bl.rows_out, bl.file_type,
+                   bl.duration_ms, bl.key_prefix
+            FROM   billing_ledger bl
+            JOIN   api_keys ak ON ak.id = bl.api_key_id
+            WHERE  ak.user_id = $1
+            AND    bl.key_prefix LIKE 'dk!_live!_%' ESCAPE '!'
+            ORDER  BY bl.timestamp DESC
+            LIMIT  50
+            """,
+            uid,
         )
 
     def _serialise_key(k: asyncpg.Record) -> dict:
         return {
-            "id":          str(k["id"]),
-            "key_prefix":  k["key_prefix"],
-            "environment": k["environment"],
-            "tier":        k["tier"],
-            "is_active":   k["is_active"],
-            "created_at":  k["created_at"].isoformat(),
+            "id":           str(k["id"]),
+            "key_prefix":   k["key_prefix"],
+            "environment":  k["environment"],
+            "tier":         k["tier"],
+            "is_active":    k["is_active"],
+            "created_at":   k["created_at"].isoformat(),
             "last_used_at": k["last_used_at"].isoformat() if k["last_used_at"] else None,
         }
 
@@ -1098,10 +1174,24 @@ async def dashboard(
         request=request,
         name="dashboard.html",
         context={
-            "user":     current_user,
-            "api_keys": [_serialise_key(k) for k in keys],
-            "ledger":   [_serialise_ledger(r) for r in ledger_rows],
+            "user":         current_user,
+            "default_env":  current_user.get("last_env", "test"),
+            "api_keys":     [_serialise_key(k) for k in keys],
+            "ledger_test":  [_serialise_ledger(r) for r in ledger_test_rows],
+            "ledger_live":  [_serialise_ledger(r) for r in ledger_live_rows],
         },
+    )
+
+
+@dash_router.get("/api-docs", summary="Client integration documentation", include_in_schema=False)
+async def api_docs_page(
+    request:      Request,
+    current_user: dict = Depends(get_current_user),
+):
+    return templates.TemplateResponse(
+        request=request,
+        name="api_docs.html",
+        context={"user": current_user},
     )
 
 
