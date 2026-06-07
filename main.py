@@ -93,6 +93,19 @@ RATE_LIMIT_STARTER  = os.getenv("RATE_LIMIT_STARTER", "500/hour")
 RATE_LIMIT_DEFAULT  = os.getenv("RATE_LIMIT_DEFAULT", "60/hour")
 
 # ---------------------------------------------------------------------------
+# Paystack
+# ---------------------------------------------------------------------------
+PAYSTACK_SECRET_KEY       = os.getenv("PAYSTACK_SECRET_KEY", "")
+PAYSTACK_PUBLIC_KEY       = os.getenv("PAYSTACK_PUBLIC_KEY", "")
+# Plan codes from your Paystack dashboard → Subscriptions → Plans
+PAYSTACK_PLAN_STARTER     = os.getenv("PAYSTACK_PLAN_STARTER", "")   # e.g. PLN_xxxx
+PAYSTACK_PLAN_PRO         = os.getenv("PAYSTACK_PLAN_PRO", "")       # e.g. PLN_yyyy
+# Your public deployment URL — used to build callback URLs sent to Paystack
+APP_BASE_URL              = os.getenv("APP_BASE_URL", "http://localhost:8000")
+# Paystack signs webhook payloads with this secret; verify before trusting
+PAYSTACK_WEBHOOK_SECRET   = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
+
+# ---------------------------------------------------------------------------
 # Key-prefix constants
 # ---------------------------------------------------------------------------
 
@@ -420,6 +433,38 @@ CREATE TABLE IF NOT EXISTS billing_ledger (
 CREATE INDEX IF NOT EXISTS idx_ledger_api_key   ON billing_ledger (api_key_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_timestamp ON billing_ledger (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_prefix    ON billing_ledger (key_prefix);
+
+-- ---------------------------------------------------------------------------
+-- subscriptions  (one active row per user; updated by Paystack webhooks)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+    -- Paystack identifiers
+    paystack_customer_id    VARCHAR(64)  NOT NULL DEFAULT '',
+    paystack_subscription_id VARCHAR(64) NOT NULL DEFAULT '',
+    paystack_plan_code      VARCHAR(64)  NOT NULL DEFAULT '',
+
+    -- Mirrored from Paystack: active | cancelled | non-renewing | attention | pending
+    status              VARCHAR(20)  NOT NULL DEFAULT 'pending',
+
+    -- Maps to your tier names: starter | pro
+    plan                VARCHAR(16)  NOT NULL DEFAULT 'starter',
+
+    -- Billing cycle dates from Paystack
+    current_period_start TIMESTAMPTZ,
+    current_period_end   TIMESTAMPTZ,
+
+    -- Full Paystack event payload for debugging/auditing
+    last_event_data     JSONB,
+
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_user       ON subscriptions (user_id);
+CREATE INDEX        IF NOT EXISTS idx_sub_status     ON subscriptions (status);
+CREATE INDEX        IF NOT EXISTS idx_sub_paystack_id ON subscriptions (paystack_subscription_id);
 """
 
 
@@ -1117,17 +1162,28 @@ async def get_current_user(
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, last_env, created_at FROM users WHERE id = $1",
+            """
+            SELECT u.id, u.email, u.last_env, u.created_at,
+                   s.status   AS sub_status,
+                   s.plan     AS sub_plan,
+                   s.current_period_end AS sub_period_end
+            FROM   users u
+            LEFT JOIN subscriptions s ON s.user_id = u.id
+            WHERE  u.id = $1
+            """,
             uuid.UUID(user_id),
         )
     if row is None:
         raise _unauth()
 
     return {
-        "id":         str(row["id"]),
-        "email":      row["email"],
-        "last_env":   row["last_env"],
-        "created_at": row["created_at"],
+        "id":             str(row["id"]),
+        "email":          row["email"],
+        "last_env":       row["last_env"],
+        "created_at":     row["created_at"],
+        "sub_status":     row["sub_status"] or "none",
+        "sub_plan":       row["sub_plan"]   or "free",
+        "sub_period_end": row["sub_period_end"].isoformat() if row["sub_period_end"] else None,
     }
 
 
@@ -1288,6 +1344,27 @@ async def create_user_api_key(
                                    _get_request_id(request)),
         )
 
+    # ── Paywall: live keys require an active subscription ─────────────────────
+    if env == "live":
+        sub_status = current_user.get("sub_status", "none")
+        if sub_status != "active":
+            asyncio.ensure_future(_write_audit_log(
+                pool, "billing.paywall_blocked", False,
+                user_type="user", target_type="api_key",
+                target_id=current_user["id"],
+                ip_address=_client_ip(request),
+                details={"sub_status": sub_status, "request_id": _get_request_id(request)},
+            ))
+            raise HTTPException(
+                status_code=402,
+                detail=_error_envelope(
+                    "SUBSCRIPTION_REQUIRED",
+                    "A live API key requires an active subscription. "
+                    "Visit /dashboard/billing to subscribe.",
+                    _get_request_id(request),
+                ),
+            )
+
     raw    = _generate_raw_key(env)
     hashed = _hash_key(raw)
     prefix = raw[:16]
@@ -1390,6 +1467,1024 @@ async def deactivate_api_key(
 
 
 # ===========================================================================
+# Billing / Paystack router
+# ===========================================================================
+# Paystack flow:
+#   1. GET  /dashboard/billing       — pricing page (served from dashboard)
+#   2. POST /billing/subscribe       — initialise Paystack transaction → redirect
+#   3. GET  /billing/callback        — Paystack redirects here after payment
+#   4. POST /billing/webhook         — Paystack posts events (charge, cancel, etc.)
+# ===========================================================================
+
+billing_router = APIRouter(prefix="/billing", tags=["billing"])
+
+_PAYSTACK_API = "https://api.paystack.co"
+
+_PLAN_MAP = {
+    "starter": lambda: PAYSTACK_PLAN_STARTER,
+    "pro":     lambda: PAYSTACK_PLAN_PRO,
+}
+
+_TIER_FROM_PLAN: dict[str, str] = {}   # populated lazily from plan codes
+
+
+async def _paystack_post(endpoint: str, payload: dict) -> dict:
+    """POST to Paystack API, return parsed JSON. Raises on HTTP error."""
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            f"{_PAYSTACK_API}{endpoint}",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+                "Content-Type":  "application/json",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _paystack_get(endpoint: str) -> dict:
+    """GET from Paystack API."""
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(
+            f"{_PAYSTACK_API}{endpoint}",
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _upsert_subscription(
+    pool:       asyncpg.Pool,
+    user_id:    str,
+    *,
+    customer_id:     str,
+    subscription_id: str,
+    plan_code:       str,
+    status:          str,
+    period_start:    datetime.datetime | None,
+    period_end:      datetime.datetime | None,
+    plan_name:       str,
+    raw_event:       dict,
+) -> None:
+    """Insert or update the subscriptions row for a user."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO subscriptions
+                (user_id, paystack_customer_id, paystack_subscription_id,
+                 paystack_plan_code, status, plan,
+                 current_period_start, current_period_end,
+                 last_event_data, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                paystack_customer_id     = EXCLUDED.paystack_customer_id,
+                paystack_subscription_id = EXCLUDED.paystack_subscription_id,
+                paystack_plan_code       = EXCLUDED.paystack_plan_code,
+                status                   = EXCLUDED.status,
+                plan                     = EXCLUDED.plan,
+                current_period_start     = EXCLUDED.current_period_start,
+                current_period_end       = EXCLUDED.current_period_end,
+                last_event_data          = EXCLUDED.last_event_data,
+                updated_at               = NOW()
+            """,
+            uuid.UUID(user_id),
+            customer_id,
+            subscription_id,
+            plan_code,
+            status,
+            plan_name,
+            period_start,
+            period_end,
+            json.dumps(raw_event),
+        )
+
+
+def _plan_name_from_code(plan_code: str) -> str:
+    """Resolve a Paystack plan code to our internal tier name."""
+    if plan_code == PAYSTACK_PLAN_PRO:
+        return "pro"
+    return "starter"
+
+
+# ---------------------------------------------------------------------------
+# POST /billing/subscribe — start a Paystack subscription checkout
+# ---------------------------------------------------------------------------
+
+@billing_router.post("/subscribe", summary="Initialise a Paystack subscription checkout")
+async def billing_subscribe(
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    body     = await request.json()
+    plan_key = str(body.get("plan", "starter")).strip().lower()
+
+    if plan_key not in _PLAN_MAP:
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                f"Invalid plan '{plan_key}'. Must be 'starter' or 'pro'.",
+                _get_request_id(request),
+            ),
+        )
+
+    plan_code = _PLAN_MAP[plan_key]()
+    if not plan_code:
+        raise HTTPException(
+            status_code=503,
+            detail=_error_envelope(
+                "CONFIGURATION_ERROR",
+                f"PAYSTACK_PLAN_{plan_key.upper()} is not configured on this server.",
+                _get_request_id(request),
+            ),
+        )
+
+    callback_url = f"{APP_BASE_URL}/billing/callback"
+
+    try:
+        data = await _paystack_post("/transaction/initialize", {
+            "email":        current_user["email"],
+            "plan":         plan_code,
+            "callback_url": callback_url,
+            "metadata": {
+                "user_id":    current_user["id"],
+                "plan":       plan_key,
+                "service":    "data_cleaning_proxy",
+            },
+        })
+    except httpx.HTTPStatusError as exc:
+        log.error("Paystack initialise failed: %s", exc.response.text)
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Could not initialise payment. Please try again.",
+                _get_request_id(request),
+            ),
+        )
+
+    asyncio.ensure_future(_write_audit_log(
+        pool, "billing.subscribe_initiated", True,
+        user_type="user", target_type="subscription",
+        target_id=current_user["id"],
+        ip_address=_client_ip(request),
+        details={"plan": plan_key, "request_id": _get_request_id(request)},
+    ))
+
+    return JSONResponse(content={
+        "authorization_url": data["data"]["authorization_url"],
+        "access_code":       data["data"]["access_code"],
+        "reference":         data["data"]["reference"],
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /billing/callback — Paystack redirects here after the hosted page
+# ---------------------------------------------------------------------------
+
+@billing_router.get("/callback", include_in_schema=False)
+async def billing_callback(
+    request:      Request,
+    trxref:       str | None = None,
+    reference:    str | None = None,
+    current_user: dict       = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> Response:
+    ref = trxref or reference
+    if not ref:
+        return RedirectResponse(url="/dashboard/billing?status=error&reason=missing_ref")
+
+    try:
+        data = await _paystack_get(f"/transaction/verify/{ref}")
+    except Exception:
+        log.exception("Paystack verify failed for ref=%s", ref)
+        return RedirectResponse(url="/dashboard/billing?status=error&reason=verify_failed")
+
+    tx   = data.get("data", {})
+    stat = tx.get("status")
+
+    if stat != "success":
+        return RedirectResponse(
+            url=f"/dashboard/billing?status=failed&reason={stat}"
+        )
+
+    # Pull subscription details from the verified transaction
+    sub      = tx.get("subscription", {}) or {}
+    customer = tx.get("customer",     {}) or {}
+    plan     = tx.get("plan",         {}) or {}
+
+    plan_code = plan.get("plan_code", "")
+    plan_name = _plan_name_from_code(plan_code)
+
+    # Period may come as ISO strings or missing — handle both
+    def _parse_dt(val: str | None) -> datetime.datetime | None:
+        if not val:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    await _upsert_subscription(
+        pool,
+        current_user["id"],
+        customer_id=str(customer.get("id", "")),
+        subscription_id=str(sub.get("id", "")),
+        plan_code=plan_code,
+        status="active",
+        period_start=_parse_dt(sub.get("createdAt")),
+        period_end=_parse_dt(sub.get("next_payment_date")),
+        plan_name=plan_name,
+        raw_event=tx,
+    )
+
+    # Upgrade the api_keys tier for all active live keys belonging to this user
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE api_keys SET tier = $1
+            WHERE  user_id = $2 AND environment = 'live' AND is_active = TRUE
+            """,
+            plan_name, uuid.UUID(current_user["id"]),
+        )
+
+    asyncio.ensure_future(_write_audit_log(
+        pool, "billing.subscribed", True,
+        user_type="user", target_type="subscription",
+        target_id=current_user["id"],
+        ip_address=_client_ip(request),
+        details={"plan": plan_name, "plan_code": plan_code, "ref": ref},
+    ))
+
+    log.info("Subscription activated: user=%s plan=%s", current_user["id"], plan_name)
+    return RedirectResponse(url="/dashboard/?billing=success", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# POST /billing/webhook — Paystack event stream (unsigned verification)
+# ---------------------------------------------------------------------------
+
+@billing_router.post("/webhook", include_in_schema=False)
+async def billing_webhook(
+    request: Request,
+    pool:    asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    """
+    Receive and verify Paystack webhook events.
+
+    Paystack signs the payload with HMAC-SHA512 using your secret key.
+    We verify the signature before trusting any payload content.
+    Responds 200 immediately (Paystack retries on non-200).
+    """
+    import hmac as _hmac
+
+    body_bytes = await request.body()
+    sig_header = request.headers.get("x-paystack-signature", "")
+
+    if PAYSTACK_WEBHOOK_SECRET:
+        expected = _hmac.new(
+            PAYSTACK_WEBHOOK_SECRET.encode(),
+            body_bytes,
+            "sha512",
+        ).hexdigest()
+        if not _hmac.compare_digest(expected, sig_header):
+            log.warning("Paystack webhook: signature mismatch — rejected")
+            # Return 200 so Paystack doesn't keep retrying a spoofed payload
+            return JSONResponse(content={"status": "ignored"})
+
+    try:
+        event = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        return JSONResponse(content={"status": "bad_json"})
+
+    event_type = event.get("event", "")
+    data       = event.get("data", {})
+    log.info("Paystack webhook received: event=%s", event_type)
+
+    # ── Resolve user_id from customer email ───────────────────────────────────
+    async def _user_id_from_email(email: str) -> str | None:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id FROM users WHERE email = $1", email.lower().strip()
+            )
+        return str(row["id"]) if row else None
+
+    customer    = data.get("customer", {}) or {}
+    cust_email  = customer.get("email", "")
+    cust_id     = str(customer.get("id", ""))
+    plan        = data.get("plan", {}) or {}
+    plan_code   = plan.get("plan_code", "")
+    plan_name   = _plan_name_from_code(plan_code)
+
+    def _parse_dt(val: str | None) -> datetime.datetime | None:
+        if not val:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    # ── charge.success ────────────────────────────────────────────────────────
+    if event_type == "charge.success":
+        user_id = await _user_id_from_email(cust_email)
+        if user_id:
+            sub_code = data.get("subscription", {}) or {}
+            await _upsert_subscription(
+                pool, user_id,
+                customer_id=cust_id,
+                subscription_id=str(sub_code.get("id", "")),
+                plan_code=plan_code,
+                status="active",
+                period_start=_parse_dt(data.get("paidAt")),
+                period_end=_parse_dt(sub_code.get("next_payment_date")),
+                plan_name=plan_name,
+                raw_event=data,
+            )
+            asyncio.ensure_future(_write_audit_log(
+                pool, "billing.charge_success", True,
+                user_type="user", target_type="subscription",
+                target_id=user_id,
+                ip_address="paystack-webhook",
+                details={"plan": plan_name, "amount": data.get("amount"), "event": event_type},
+            ))
+
+    # ── subscription.create ───────────────────────────────────────────────────
+    elif event_type == "subscription.create":
+        user_id = await _user_id_from_email(cust_email)
+        if user_id:
+            await _upsert_subscription(
+                pool, user_id,
+                customer_id=cust_id,
+                subscription_id=str(data.get("subscription_code", "")),
+                plan_code=plan_code,
+                status="active",
+                period_start=_parse_dt(data.get("createdAt")),
+                period_end=_parse_dt(data.get("next_payment_date")),
+                plan_name=plan_name,
+                raw_event=data,
+            )
+            asyncio.ensure_future(_write_audit_log(
+                pool, "billing.subscription_created", True,
+                user_type="user", target_type="subscription",
+                target_id=user_id,
+                ip_address="paystack-webhook",
+                details={"plan": plan_name, "event": event_type},
+            ))
+
+    # ── subscription.disable / subscription.not_renew ─────────────────────────
+    elif event_type in ("subscription.disable", "subscription.not_renew"):
+        user_id = await _user_id_from_email(cust_email)
+        if user_id:
+            new_status = "cancelled" if event_type == "subscription.disable" else "non-renewing"
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE subscriptions
+                    SET    status = $1, last_event_data = $2::jsonb, updated_at = NOW()
+                    WHERE  user_id = $3
+                    """,
+                    new_status, json.dumps(data), uuid.UUID(user_id),
+                )
+            asyncio.ensure_future(_write_audit_log(
+                pool, "billing.subscription_cancelled", True,
+                user_type="user", target_type="subscription",
+                target_id=user_id,
+                ip_address="paystack-webhook",
+                details={"new_status": new_status, "event": event_type},
+            ))
+
+    # ── invoice.payment_failed ────────────────────────────────────────────────
+    elif event_type == "invoice.payment_failed":
+        user_id = await _user_id_from_email(cust_email)
+        if user_id:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE subscriptions
+                    SET    status = 'attention', last_event_data = $1::jsonb, updated_at = NOW()
+                    WHERE  user_id = $2
+                    """,
+                    json.dumps(data), uuid.UUID(user_id),
+                )
+            asyncio.ensure_future(_write_audit_log(
+                pool, "billing.payment_failed", False,
+                user_type="user", target_type="subscription",
+                target_id=user_id,
+                ip_address="paystack-webhook",
+                details={"event": event_type, "amount": data.get("amount")},
+            ))
+
+    return JSONResponse(content={"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# GET /billing/portal  — current user's subscription status (JSON)
+# ---------------------------------------------------------------------------
+
+@billing_router.get("/portal", summary="Get current subscription status")
+async def billing_portal(
+    current_user: dict = Depends(get_current_user),
+) -> JSONResponse:
+    return JSONResponse(content={
+        "sub_status":     current_user.get("sub_status", "none"),
+        "sub_plan":       current_user.get("sub_plan", "free"),
+        "sub_period_end": current_user.get("sub_period_end"),
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /billing/verify/{reference}
+# Manually verify a specific Paystack transaction reference.
+# Useful when a user completes payment but the callback was missed (network
+# hiccup, browser closed, etc.).  Idempotent — safe to call multiple times.
+# ---------------------------------------------------------------------------
+
+@billing_router.get(
+    "/verify/{reference}",
+    summary="Verify a Paystack transaction by reference and sync subscription state",
+)
+async def billing_verify(
+    reference:    str,
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    """
+    Calls Paystack GET /transaction/verify/:reference and, if the transaction
+    status is 'success', upserts the subscription row exactly as the callback
+    does.  Returns the full verification payload so the caller can inspect it.
+
+    Use this when:
+      - A user paid but the dashboard still shows 'no subscription'
+      - You want to confirm a specific charge reference from your records
+    """
+    try:
+        data = await _paystack_get(f"/transaction/verify/{reference}")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=_error_envelope(
+                    "NOT_FOUND",
+                    f"Transaction reference '{reference}' not found on Paystack.",
+                    _get_request_id(request),
+                ),
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Paystack verification request failed. Try again shortly.",
+                _get_request_id(request),
+            ),
+        )
+
+    tx        = data.get("data", {})
+    tx_status = tx.get("status", "")
+    amount    = tx.get("amount", 0)          # in kobo / smallest currency unit
+    currency  = tx.get("currency", "")
+    paid_at   = tx.get("paid_at") or tx.get("paidAt")
+
+    sub      = tx.get("subscription", {}) or {}
+    customer = tx.get("customer",     {}) or {}
+    plan     = tx.get("plan",         {}) or {}
+
+    plan_code = plan.get("plan_code", "")
+    plan_name = _plan_name_from_code(plan_code)
+
+    def _parse_dt(val: str | None) -> datetime.datetime | None:
+        if not val:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    synced = False
+    if tx_status == "success":
+        # Only sync if this transaction belongs to the requesting user
+        tx_email = (customer.get("email") or "").lower().strip()
+        if tx_email and tx_email != current_user["email"].lower():
+            raise HTTPException(
+                status_code=403,
+                detail=_error_envelope(
+                    "FORBIDDEN",
+                    "This transaction does not belong to your account.",
+                    _get_request_id(request),
+                ),
+            )
+        await _upsert_subscription(
+            pool,
+            current_user["id"],
+            customer_id=str(customer.get("id", "")),
+            subscription_id=str(sub.get("id", "")),
+            plan_code=plan_code,
+            status="active",
+            period_start=_parse_dt(paid_at),
+            period_end=_parse_dt(sub.get("next_payment_date")),
+            plan_name=plan_name,
+            raw_event=tx,
+        )
+        # Also upgrade the live key tier
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE api_keys SET tier = $1
+                WHERE  user_id = $2 AND environment = 'live' AND is_active = TRUE
+                """,
+                plan_name, uuid.UUID(current_user["id"]),
+            )
+        synced = True
+        asyncio.ensure_future(_write_audit_log(
+            pool, "billing.verify_synced", True,
+            user_type="user", target_type="subscription",
+            target_id=current_user["id"],
+            ip_address=_client_ip(request),
+            details={"reference": reference, "plan": plan_name, "amount": amount},
+        ))
+
+    return JSONResponse(content={
+        "reference":         reference,
+        "transaction_status": tx_status,
+        "amount":            amount,
+        "currency":          currency,
+        "paid_at":           paid_at,
+        "plan":              plan_name,
+        "synced_to_account": synced,
+        "message": (
+            "Subscription activated and account updated."
+            if synced
+            else f"Transaction status is '{tx_status}' — no changes made."
+        ),
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /billing/transactions
+# List raw Paystack transaction history for the authenticated user's email.
+# Shows all charges ever made — successful, failed, abandoned.
+# ---------------------------------------------------------------------------
+
+@billing_router.get(
+    "/transactions",
+    summary="List Paystack transaction history for this account",
+)
+async def billing_transactions(
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    page:         int          = 1,
+    per_page:     int          = 20,
+) -> JSONResponse:
+    """
+    Proxies Paystack GET /transaction?email=...&page=...&perPage=... and
+    returns a normalised list.  Useful for confirming individual charge
+    deposits and checking their exact timestamps and amounts.
+
+    Each item in the response carries:
+      - reference        → use with GET /billing/verify/{reference}
+      - status           → 'success' | 'failed' | 'abandoned'
+      - amount_display   → human-readable e.g. "KES 2,000.00"
+      - paid_at          → ISO timestamp of the successful charge
+    """
+    if per_page > 100:
+        per_page = 100  # Paystack hard cap
+
+    try:
+        data = await _paystack_get(
+            f"/transaction?email={current_user['email']}"
+            f"&page={page}&perPage={per_page}&status=success"
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Could not fetch transaction list from Paystack.",
+                _get_request_id(request),
+            ),
+        )
+
+    raw_list = data.get("data", []) or []
+    meta     = data.get("meta", {})
+
+    def _fmt_amount(amount_minor: int, currency: str) -> str:
+        """Convert smallest-unit integer to display string."""
+        major = amount_minor / 100
+        return f"{currency} {major:,.2f}"
+
+    normalised = [
+        {
+            "reference":      tx.get("reference", ""),
+            "status":         tx.get("status", ""),
+            "amount_minor":   tx.get("amount", 0),
+            "amount_display": _fmt_amount(tx.get("amount", 0), tx.get("currency", "")),
+            "currency":       tx.get("currency", ""),
+            "paid_at":        tx.get("paid_at") or tx.get("paidAt"),
+            "channel":        tx.get("channel", ""),
+            "plan_code":      (tx.get("plan", {}) or {}).get("plan_code", ""),
+        }
+        for tx in raw_list
+    ]
+
+    return JSONResponse(content={
+        "transactions": normalised,
+        "total":        meta.get("total", len(normalised)),
+        "page":         page,
+        "per_page":     per_page,
+        "pages":        meta.get("pageCount", 1),
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /billing/subscription
+# Pull the live subscription record directly from Paystack (not our DB cache)
+# and return the authoritative state.  Also re-syncs our DB row.
+# ---------------------------------------------------------------------------
+
+@billing_router.get(
+    "/subscription",
+    summary="Fetch live subscription state from Paystack and re-sync local record",
+)
+async def billing_subscription_status(
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    """
+    Fetches the subscription directly from Paystack using the subscription_id
+    stored in our local subscriptions row.  Re-syncs status, next payment date,
+    and amount.  Use this to confirm what Paystack actually holds as truth,
+    bypassing our cached DB state entirely.
+    """
+    # Fetch our local record first to get the Paystack subscription_id
+    async with pool.acquire() as conn:
+        local = await conn.fetchrow(
+            """
+            SELECT paystack_subscription_id, paystack_customer_id,
+                   paystack_plan_code, status, plan,
+                   current_period_start, current_period_end, updated_at
+            FROM   subscriptions
+            WHERE  user_id = $1
+            """,
+            uuid.UUID(current_user["id"]),
+        )
+
+    if not local:
+        return JSONResponse(content={
+            "local_status":  "none",
+            "paystack_data": None,
+            "message":       "No subscription record found. Subscribe at /billing/subscribe.",
+        })
+
+    sub_id = local["paystack_subscription_id"]
+
+    # If we have a subscription_id, fetch live data from Paystack
+    paystack_data = None
+    if sub_id:
+        try:
+            resp       = await _paystack_get(f"/subscription/{sub_id}")
+            paystack_data = resp.get("data", {})
+
+            # Re-sync our local row with authoritative Paystack state
+            ps_status = paystack_data.get("status", local["status"])
+
+            def _parse_dt(val: str | None) -> datetime.datetime | None:
+                if not val:
+                    return None
+                try:
+                    return datetime.datetime.fromisoformat(val.replace("Z", "+00:00"))
+                except Exception:
+                    return None
+
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE subscriptions
+                    SET    status               = $1,
+                           current_period_end   = $2,
+                           last_event_data      = $3::jsonb,
+                           updated_at           = NOW()
+                    WHERE  user_id = $4
+                    """,
+                    ps_status,
+                    _parse_dt(paystack_data.get("next_payment_date")),
+                    json.dumps(paystack_data),
+                    uuid.UUID(current_user["id"]),
+                )
+            asyncio.ensure_future(_write_audit_log(
+                pool, "billing.status_synced", True,
+                user_type="user", target_type="subscription",
+                target_id=current_user["id"],
+                ip_address=_client_ip(request),
+                details={"paystack_status": ps_status},
+            ))
+        except httpx.HTTPStatusError:
+            # Paystack returned 404 — subscription no longer exists there
+            paystack_data = None
+
+    def _maybe_iso(val: Any) -> str | None:
+        if val is None:
+            return None
+        if hasattr(val, "isoformat"):
+            return val.isoformat()
+        return str(val)
+
+    return JSONResponse(content={
+        "local_status":         local["status"],
+        "local_plan":           local["plan"],
+        "local_period_end":     _maybe_iso(local["current_period_end"]),
+        "local_last_synced":    _maybe_iso(local["updated_at"]),
+        "paystack_sub_id":      sub_id,
+        "paystack_live_data":   paystack_data,
+        "days_until_renewal":   (
+            max(0, (local["current_period_end"] - datetime.datetime.now(datetime.timezone.utc)).days)
+            if local["current_period_end"] else None
+        ),
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /billing/due
+# Internal/admin endpoint: list all subscriptions whose next payment is within
+# N days (default 3).  Useful for sending renewal reminder emails or flagging
+# accounts that may churn.  Requires X-Internal-Secret header.
+# ---------------------------------------------------------------------------
+
+@billing_router.get(
+    "/due",
+    summary="List subscriptions due for renewal within N days (admin)",
+    dependencies=[Depends(verify_internal_secret)],
+)
+async def billing_due(
+    request:  Request,
+    days:     int          = 3,
+    pool:     asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    """
+    Returns all active subscriptions whose current_period_end falls within
+    the next `days` days.  Protected by X-Internal-Secret.
+
+    Useful for:
+      - Cron job that sends renewal reminder emails
+      - Monitoring dashboard showing upcoming renewals
+      - Identifying at-risk accounts before auto-charge
+    """
+    if days < 0 or days > 90:
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                "'days' must be between 0 and 90.",
+                _get_request_id(request),
+            ),
+        )
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                s.id,
+                s.user_id,
+                u.email,
+                s.plan,
+                s.status,
+                s.paystack_subscription_id,
+                s.current_period_end,
+                s.current_period_start,
+                EXTRACT(EPOCH FROM (s.current_period_end - NOW())) / 86400 AS days_remaining
+            FROM subscriptions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.status IN ('active', 'non-renewing', 'attention')
+            AND   s.current_period_end IS NOT NULL
+            AND   s.current_period_end <= NOW() + ($1 || ' days')::interval
+            ORDER BY s.current_period_end ASC
+            """,
+            str(days),
+        )
+
+    def _maybe_iso(val: Any) -> str | None:
+        return val.isoformat() if val else None
+
+    result = [
+        {
+            "subscription_id":       str(r["id"]),
+            "user_id":               str(r["user_id"]),
+            "email":                 r["email"],
+            "plan":                  r["plan"],
+            "status":                r["status"],
+            "paystack_sub_id":       r["paystack_subscription_id"],
+            "current_period_end":    _maybe_iso(r["current_period_end"]),
+            "current_period_start":  _maybe_iso(r["current_period_start"]),
+            "days_remaining":        round(float(r["days_remaining"] or 0), 1),
+        }
+        for r in rows
+    ]
+
+    return JSONResponse(content={
+        "window_days": days,
+        "count":       len(result),
+        "due":         result,
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /billing/cancel
+# User-initiated cancellation: calls Paystack to disable auto-renewal, then
+# marks the local subscription as 'non-renewing'.  The subscription stays
+# active until current_period_end — access is not cut off immediately.
+# ---------------------------------------------------------------------------
+
+@billing_router.post(
+    "/cancel",
+    summary="Cancel the current subscription (disables auto-renewal at period end)",
+)
+async def billing_cancel(
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    """
+    Calls Paystack POST /subscription/disable to stop auto-renewal, then sets
+    local status to 'non-renewing'.
+
+    The user retains full access until current_period_end.  Their dk_live_ key
+    continues to work.  On period end, the next webhook (subscription.disable)
+    will set status to 'cancelled' and the live key becomes inaccessible.
+    """
+    # Fetch local subscription to get the Paystack identifiers
+    async with pool.acquire() as conn:
+        local = await conn.fetchrow(
+            """
+            SELECT paystack_subscription_id, paystack_customer_id,
+                   status, current_period_end
+            FROM   subscriptions
+            WHERE  user_id = $1
+            """,
+            uuid.UUID(current_user["id"]),
+        )
+
+    if not local:
+        raise HTTPException(
+            status_code=404,
+            detail=_error_envelope(
+                "NOT_FOUND",
+                "No active subscription found for this account.",
+                _get_request_id(request),
+            ),
+        )
+
+    if local["status"] in ("cancelled", "non-renewing"):
+        return JSONResponse(content={
+            "status":  local["status"],
+            "message": "Subscription is already cancelled or set to not renew.",
+            "access_until": local["current_period_end"].isoformat() if local["current_period_end"] else None,
+        })
+
+    sub_id  = local["paystack_subscription_id"]
+    cust_id = local["paystack_customer_id"]
+
+    # Call Paystack to disable auto-renewal
+    try:
+        await _paystack_post("/subscription/disable", {
+            "code":  sub_id,
+            "token": cust_id,
+        })
+    except httpx.HTTPStatusError as exc:
+        log.error("Paystack cancel failed: %s", exc.response.text)
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Paystack could not process the cancellation. Please try again.",
+                _get_request_id(request),
+            ),
+        )
+
+    # Mark locally as non-renewing — access continues until period end
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE subscriptions
+            SET    status = 'non-renewing', updated_at = NOW()
+            WHERE  user_id = $1
+            """,
+            uuid.UUID(current_user["id"]),
+        )
+
+    asyncio.ensure_future(_write_audit_log(
+        pool, "billing.cancelled", True,
+        user_type="user", target_type="subscription",
+        target_id=current_user["id"],
+        ip_address=_client_ip(request),
+        details={
+            "paystack_sub_id": sub_id,
+            "access_until": local["current_period_end"].isoformat() if local["current_period_end"] else None,
+            "request_id": _get_request_id(request),
+        },
+    ))
+
+    log.info("Subscription cancelled: user=%s sub_id=%s", current_user["id"], sub_id)
+    return JSONResponse(content={
+        "status":        "non-renewing",
+        "access_until":  local["current_period_end"].isoformat() if local["current_period_end"] else None,
+        "message": (
+            "Auto-renewal disabled. Your subscription remains active until the end "
+            "of the current billing period."
+        ),
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /billing/reactivate  (admin)
+# Re-enable an auto-renewal that was previously cancelled via Paystack.
+# Requires X-Internal-Secret — only support staff can reactivate on behalf
+# of a user, as Paystack's enable endpoint needs the subscription_code + token.
+# ---------------------------------------------------------------------------
+
+@billing_router.post(
+    "/reactivate",
+    summary="Re-enable auto-renewal for a cancelled subscription (admin)",
+    dependencies=[Depends(verify_internal_secret)],
+)
+async def billing_reactivate(
+    request: Request,
+    pool:    asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    body    = await request.json()
+    user_id = str(body.get("user_id", "")).strip()
+    if not user_id:
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED", "'user_id' is required.", _get_request_id(request)
+            ),
+        )
+
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED", "'user_id' must be a valid UUID.", _get_request_id(request)
+            ),
+        )
+
+    async with pool.acquire() as conn:
+        local = await conn.fetchrow(
+            "SELECT paystack_subscription_id, paystack_customer_id, status FROM subscriptions WHERE user_id = $1",
+            uid,
+        )
+
+    if not local:
+        raise HTTPException(
+            status_code=404,
+            detail=_error_envelope("NOT_FOUND", "No subscription found for this user.", _get_request_id(request)),
+        )
+
+    sub_id  = local["paystack_subscription_id"]
+    cust_id = local["paystack_customer_id"]
+
+    try:
+        await _paystack_post("/subscription/enable", {
+            "code":  sub_id,
+            "token": cust_id,
+        })
+    except httpx.HTTPStatusError as exc:
+        log.error("Paystack reactivate failed: %s", exc.response.text)
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Paystack could not re-enable the subscription.",
+                _get_request_id(request),
+            ),
+        )
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE subscriptions SET status = 'active', updated_at = NOW() WHERE user_id = $1",
+            uid,
+        )
+
+    asyncio.ensure_future(_write_audit_log(
+        pool, "billing.reactivated", True,
+        user_type="admin", target_type="subscription",
+        target_id=user_id,
+        ip_address=_client_ip(request),
+        details={"paystack_sub_id": sub_id, "request_id": _get_request_id(request)},
+    ))
+
+    return JSONResponse(content={
+        "user_id": user_id,
+        "status":  "active",
+        "message": "Subscription re-enabled. Auto-renewal is active.",
+    })
+
+
+# ===========================================================================
 # Module 4 — Dashboard route
 # ===========================================================================
 
@@ -1469,6 +2564,10 @@ async def dashboard(
         context={
             "user":         current_user,
             "default_env":  current_user.get("last_env", "test"),
+            "sub_status":   current_user.get("sub_status", "none"),
+            "sub_plan":     current_user.get("sub_plan", "free"),
+            "sub_period_end": current_user.get("sub_period_end"),
+            "paystack_public_key": PAYSTACK_PUBLIC_KEY,
             "api_keys":     [_serialise_key(k) for k in keys],
             "ledger_test":  [_serialise_ledger(r) for r in ledger_test_rows],
             "ledger_live":  [_serialise_ledger(r) for r in ledger_live_rows],
@@ -1927,5 +3026,6 @@ async def health_v1():
 # ===========================================================================
 
 app.include_router(auth_router)
+app.include_router(billing_router)
 app.include_router(dash_router)
 app.include_router(router)
