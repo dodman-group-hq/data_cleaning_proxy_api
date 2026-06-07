@@ -105,6 +105,11 @@ APP_BASE_URL              = os.getenv("APP_BASE_URL", "http://localhost:8000")
 # Paystack signs webhook payloads with this secret; verify before trusting
 PAYSTACK_WEBHOOK_SECRET   = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
 
+# Resend (transactional email)
+RESEND_API_KEY  = os.getenv("RESEND_API_KEY", "")
+RESEND_FROM     = os.getenv("RESEND_FROM", "billing@dodman.group")
+RESEND_API_URL  = "https://api.resend.com/emails"
+
 # ---------------------------------------------------------------------------
 # Key-prefix constants
 # ---------------------------------------------------------------------------
@@ -1568,6 +1573,171 @@ def _plan_name_from_code(plan_code: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Resend email helper
+# ---------------------------------------------------------------------------
+
+async def _send_email(
+    to:      str,
+    subject: str,
+    html:    str,
+) -> bool:
+    """
+    Send a transactional email via Resend.
+    Returns True on success, False on failure.
+    Never raises — email delivery is always fire-and-forget.
+    """
+    if not RESEND_API_KEY:
+        log.warning("RESEND_API_KEY not set — email not sent to %s", to)
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                RESEND_API_URL,
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "from":    RESEND_FROM,
+                    "to":      [to],
+                    "subject": subject,
+                    "html":    html,
+                },
+            )
+            resp.raise_for_status()
+            log.info("Email sent via Resend: to=%s subject=%r", to, subject)
+            return True
+    except Exception:
+        log.exception("Resend email failed: to=%s subject=%r", to, subject)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Invoice HTML builder
+# ---------------------------------------------------------------------------
+
+def _build_invoice_html(
+    invoice_ref:  str,
+    user_email:   str,
+    plan:         str,
+    amount_minor: int,
+    currency:     str,
+    paid_at:      str,
+    period_start: str,
+    period_end:   str,
+) -> str:
+    """Render a clean HTML invoice suitable for both email and browser download."""
+    amount_display = f"{currency} {amount_minor / 100:,.2f}"
+    now_str        = datetime.datetime.utcnow().strftime("%d %B %Y")
+    plan_display   = plan.title()
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<style>
+  body{{font-family:'IBM Plex Mono',monospace,sans-serif;background:#07070a;color:#d0d0e0;margin:0;padding:40px;}}
+  .card{{max-width:600px;margin:0 auto;background:#0f0f12;border:1px solid #232329;border-radius:12px;overflow:hidden;}}
+  .hdr{{background:#16161a;padding:28px 32px;border-bottom:1px solid #232329;}}
+  .brand{{font-size:11px;letter-spacing:.3em;text-transform:uppercase;color:#f59e0b;margin-bottom:6px;}}
+  .title{{font-size:22px;font-weight:700;color:#fff;margin:0;}}
+  .body{{padding:28px 32px;}}
+  .row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #16161a;font-size:13px;}}
+  .row:last-child{{border-bottom:none;}}
+  .label{{color:#6b6b7a;}}
+  .value{{color:#d0d0e0;text-align:right;}}
+  .amount{{font-size:24px;font-weight:700;color:#10b981;text-align:center;padding:20px 0;}}
+  .footer{{padding:18px 32px;border-top:1px solid #232329;font-size:11px;color:#3a3a44;text-align:center;}}
+  .badge{{display:inline-block;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);
+          color:#10b981;font-size:10px;padding:3px 10px;border-radius:4px;letter-spacing:.08em;text-transform:uppercase;}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="hdr">
+    <p class="brand">Dodman Group</p>
+    <p class="title">Invoice</p>
+  </div>
+  <div class="body">
+    <div class="amount">{amount_display}</div>
+    <div class="row"><span class="label">Reference</span><span class="value" style="font-family:monospace;">{invoice_ref}</span></div>
+    <div class="row"><span class="label">Status</span><span class="value"><span class="badge">Paid</span></span></div>
+    <div class="row"><span class="label">Billed to</span><span class="value">{user_email}</span></div>
+    <div class="row"><span class="label">Plan</span><span class="value">{plan_display}</span></div>
+    <div class="row"><span class="label">Paid at</span><span class="value">{paid_at[:19].replace("T"," ")}</span></div>
+    <div class="row"><span class="label">Period start</span><span class="value">{period_start[:10] if period_start else "—"}</span></div>
+    <div class="row"><span class="label">Period end</span><span class="value">{period_end[:10] if period_end else "—"}</span></div>
+    <div class="row"><span class="label">Invoice date</span><span class="value">{now_str}</span></div>
+  </div>
+  <div class="footer">Dodman Group · Data Cleaning Proxy API · {RESEND_FROM}</div>
+</div>
+</body>
+</html>"""
+
+
+async def _send_invoice_email(
+    to:          str,
+    invoice_ref: str,
+    plan:        str,
+    amount_minor: int,
+    currency:    str,
+    paid_at:     str,
+    period_start: str = "",
+    period_end:   str = "",
+) -> None:
+    """Render invoice HTML and send it via Resend."""
+    html = _build_invoice_html(
+        invoice_ref, to, plan, amount_minor, currency,
+        paid_at, period_start, period_end,
+    )
+    amount_display = f"{currency} {amount_minor / 100:,.2f}"
+    await _send_email(
+        to=to,
+        subject=f"Your Dodman invoice — {amount_display} · {invoice_ref[:12]}",
+        html=html,
+    )
+
+
+async def _send_subscription_email(
+    to:      str,
+    subject: str,
+    heading: str,
+    body:    str,
+    cta_text: str  = "",
+    cta_url:  str  = "",
+) -> None:
+    """Generic transactional email for subscription lifecycle events."""
+    cta_block = ""
+    if cta_text and cta_url:
+        cta_block = (
+            f'''<div style="text-align:center;margin:24px 0;">
+              <a href="{cta_url}" style="background:#10b981;color:#07070a;font-weight:700;
+                 font-size:12px;letter-spacing:.08em;text-transform:uppercase;padding:11px 28px;
+                 border-radius:6px;text-decoration:none;">{cta_text}</a>
+            </div>'''
+        )
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/>
+<style>
+  body{{font-family:'IBM Plex Mono',monospace;background:#07070a;color:#d0d0e0;margin:0;padding:40px;}}
+  .card{{max-width:560px;margin:0 auto;background:#0f0f12;border:1px solid #232329;border-radius:12px;overflow:hidden;}}
+  .hdr{{background:#16161a;padding:24px 28px;border-bottom:1px solid #232329;}}
+  .brand{{font-size:10px;letter-spacing:.3em;text-transform:uppercase;color:#f59e0b;margin:0 0 4px;}}
+  .heading{{font-size:18px;font-weight:700;color:#fff;margin:0;}}
+  .body{{padding:24px 28px;font-size:13px;line-height:1.7;color:#9a9aaa;}}
+  .footer{{padding:16px 28px;border-top:1px solid #232329;font-size:10px;color:#3a3a44;text-align:center;}}
+</style>
+</head><body>
+<div class="card">
+  <div class="hdr"><p class="brand">Dodman Group</p><p class="heading">{heading}</p></div>
+  <div class="body">{body}{cta_block}</div>
+  <div class="footer">Dodman Group · Data Cleaning Proxy API · Questions? Reply to this email.</div>
+</div>
+</body></html>"""
+    await _send_email(to=to, subject=subject, html=html)
+
+
+# ---------------------------------------------------------------------------
 # POST /billing/subscribe — start a Paystack subscription checkout
 # ---------------------------------------------------------------------------
 
@@ -1717,6 +1887,17 @@ async def billing_callback(
         ip_address=_client_ip(request),
         details={"plan": plan_name, "plan_code": plan_code, "ref": ref},
     ))
+    # Send invoice for the initial payment
+    asyncio.ensure_future(_send_invoice_email(
+        to=current_user["email"],
+        invoice_ref=ref,
+        plan=plan_name,
+        amount_minor=tx.get("amount", 0),
+        currency=tx.get("currency", ""),
+        paid_at=tx.get("paid_at") or tx.get("paidAt") or "",
+        period_start=sub.get("createdAt") or "",
+        period_end=sub.get("next_payment_date") or "",
+    ))
 
     log.info("Subscription activated: user=%s plan=%s", current_user["id"], plan_name)
     return RedirectResponse(url="/dashboard/?billing=success", status_code=303)
@@ -1809,6 +1990,17 @@ async def billing_webhook(
                 ip_address="paystack-webhook",
                 details={"plan": plan_name, "amount": data.get("amount"), "event": event_type},
             ))
+            # Send invoice email
+            asyncio.ensure_future(_send_invoice_email(
+                to=cust_email,
+                invoice_ref=data.get("reference", ""),
+                plan=plan_name,
+                amount_minor=data.get("amount", 0),
+                currency=data.get("currency", ""),
+                paid_at=data.get("paidAt") or data.get("paid_at") or "",
+                period_start=data.get("paidAt") or "",
+                period_end=(sub_code.get("next_payment_date") or ""),
+            ))
 
     # ── subscription.create ───────────────────────────────────────────────────
     elif event_type == "subscription.create":
@@ -1832,6 +2024,18 @@ async def billing_webhook(
                 ip_address="paystack-webhook",
                 details={"plan": plan_name, "event": event_type},
             ))
+            asyncio.ensure_future(_send_subscription_email(
+                to=cust_email,
+                subject=f"Welcome to Dodman {plan_name.title()} — subscription active",
+                heading="Subscription Activated",
+                body=(
+                    f"<p>Your <strong style=\"color:#10b981\">{plan_name.title()}</strong> subscription "
+                    f"is now active. Your <code>dk_live_</code> key is ready to use.</p>"
+                    f"<p>You can manage your subscription, view invoices, and monitor usage from your dashboard.</p>"
+                ),
+                cta_text="Go to Dashboard",
+                cta_url=f"{APP_BASE_URL}/dashboard/",
+            ))
 
     # ── subscription.disable / subscription.not_renew ─────────────────────────
     elif event_type in ("subscription.disable", "subscription.not_renew"):
@@ -1854,6 +2058,22 @@ async def billing_webhook(
                 ip_address="paystack-webhook",
                 details={"new_status": new_status, "event": event_type},
             ))
+            cancel_msg = (
+                "<p>Auto-renewal has been disabled. Your access remains active until "
+                "the end of your current billing period.</p>"
+                "<p>You can reactivate at any time from your dashboard.</p>"
+                if new_status == "non-renewing"
+                else "<p>Your subscription has been cancelled. Your live API key will stop working. "
+                     "You can re-subscribe at any time.</p>"
+            )
+            asyncio.ensure_future(_send_subscription_email(
+                to=cust_email,
+                subject="Your Dodman subscription has been cancelled",
+                heading="Subscription Cancelled",
+                body=cancel_msg,
+                cta_text="Re-subscribe",
+                cta_url=f"{APP_BASE_URL}/dashboard/",
+            ))
 
     # ── invoice.payment_failed ────────────────────────────────────────────────
     elif event_type == "invoice.payment_failed":
@@ -1875,6 +2095,19 @@ async def billing_webhook(
                 ip_address="paystack-webhook",
                 details={"event": event_type, "amount": data.get("amount")},
             ))
+            asyncio.ensure_future(_send_subscription_email(
+                to=cust_email,
+                subject="Action required: Dodman payment failed",
+                heading="Payment Failed",
+                body=(
+                    "<p>We were unable to charge your card for your Dodman subscription renewal.</p>"
+                    "<p>Please update your payment method on the Paystack customer portal to avoid "
+                    "losing access to your live API key.</p>"
+                    "<p>If payment is not resolved within 3 days, your subscription will be suspended.</p>"
+                ),
+                cta_text="Update Payment Method",
+                cta_url=f"{APP_BASE_URL}/dashboard/",
+            ))
 
     return JSONResponse(content={"status": "ok"})
 
@@ -1891,6 +2124,181 @@ async def billing_portal(
         "sub_status":     current_user.get("sub_status", "none"),
         "sub_plan":       current_user.get("sub_plan", "free"),
         "sub_period_end": current_user.get("sub_period_end"),
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /billing/invoices — list invoices for the current user
+# Fetches from Paystack /transaction list filtered to successful charges
+# and adds an invoice download link for each.
+# ---------------------------------------------------------------------------
+
+@billing_router.get("/invoices", summary="List all paid invoices for this account")
+async def billing_invoices(
+    request:      Request,
+    current_user: dict = Depends(get_current_user),
+    page:         int  = 1,
+    per_page:     int  = 20,
+) -> JSONResponse:
+    try:
+        data = await _paystack_get(
+            f"/transaction?email={current_user['email']}"
+            f"&page={page}&perPage={min(per_page,100)}&status=success"
+        )
+    except httpx.HTTPStatusError:
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Could not fetch invoices from Paystack.",
+                _get_request_id(request),
+            ),
+        )
+
+    raw  = data.get("data", []) or []
+    meta = data.get("meta", {})
+
+    invoices = [
+        {
+            "reference":      tx.get("reference", ""),
+            "amount_minor":   tx.get("amount", 0),
+            "amount_display": f"{tx.get('currency','')} {tx.get('amount',0)/100:,.2f}",
+            "currency":       tx.get("currency", ""),
+            "paid_at":        tx.get("paid_at") or tx.get("paidAt"),
+            "plan":           _plan_name_from_code(
+                                  (tx.get("plan") or {}).get("plan_code", "")
+                              ),
+            "download_url":   f"/billing/invoice/{tx.get('reference','')}/download",
+            "email_url":      f"/billing/invoice/{tx.get('reference','')}/email",
+        }
+        for tx in raw
+    ]
+
+    return JSONResponse(content={
+        "invoices": invoices,
+        "total":    meta.get("total", len(invoices)),
+        "page":     page,
+        "pages":    meta.get("pageCount", 1),
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /billing/invoice/{reference}/download
+# Generate and stream an HTML invoice as a downloadable file.
+# ---------------------------------------------------------------------------
+
+@billing_router.get(
+    "/invoice/{reference}/download",
+    summary="Download an invoice as an HTML file",
+    include_in_schema=False,
+)
+async def invoice_download(
+    reference:    str,
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> Response:
+    # Verify the transaction exists and belongs to this user
+    try:
+        data = await _paystack_get(f"/transaction/verify/{reference}")
+    except httpx.HTTPStatusError:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+
+    tx       = data.get("data", {})
+    customer = tx.get("customer", {}) or {}
+    tx_email = (customer.get("email") or "").lower().strip()
+
+    if tx_email and tx_email != current_user["email"].lower():
+        raise HTTPException(status_code=403, detail="This invoice does not belong to your account.")
+
+    if tx.get("status") != "success":
+        raise HTTPException(status_code=400, detail="Invoice only available for successful transactions.")
+
+    plan      = tx.get("plan", {}) or {}
+    sub       = tx.get("subscription", {}) or {}
+    plan_name = _plan_name_from_code(plan.get("plan_code", ""))
+
+    html = _build_invoice_html(
+        invoice_ref=reference,
+        user_email=current_user["email"],
+        plan=plan_name,
+        amount_minor=tx.get("amount", 0),
+        currency=tx.get("currency", ""),
+        paid_at=tx.get("paid_at") or tx.get("paidAt") or "",
+        period_start=sub.get("createdAt") or "",
+        period_end=sub.get("next_payment_date") or "",
+    )
+
+    asyncio.ensure_future(_write_audit_log(
+        pool, "billing.invoice_downloaded", True,
+        user_type="user", target_type="invoice",
+        target_id=reference, ip_address=_client_ip(request),
+        details={"reference": reference},
+    ))
+
+    return Response(
+        content=html.encode(),
+        media_type="text/html",
+        headers={"Content-Disposition": f"attachment; filename=invoice-{reference[:12]}.html"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /billing/invoice/{reference}/email
+# Re-send an invoice to the user's registered email address.
+# ---------------------------------------------------------------------------
+
+@billing_router.post(
+    "/invoice/{reference}/email",
+    summary="Re-send a specific invoice to the account email",
+)
+async def invoice_email(
+    reference:    str,
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    try:
+        data = await _paystack_get(f"/transaction/verify/{reference}")
+    except httpx.HTTPStatusError:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+
+    tx       = data.get("data", {})
+    customer = tx.get("customer", {}) or {}
+    tx_email = (customer.get("email") or "").lower().strip()
+
+    if tx_email and tx_email != current_user["email"].lower():
+        raise HTTPException(status_code=403, detail="This invoice does not belong to your account.")
+
+    if tx.get("status") != "success":
+        raise HTTPException(status_code=400, detail="Invoice only available for successful transactions.")
+
+    plan      = tx.get("plan", {}) or {}
+    sub       = tx.get("subscription", {}) or {}
+    plan_name = _plan_name_from_code(plan.get("plan_code", ""))
+
+    asyncio.ensure_future(_send_invoice_email(
+        to=current_user["email"],
+        invoice_ref=reference,
+        plan=plan_name,
+        amount_minor=tx.get("amount", 0),
+        currency=tx.get("currency", ""),
+        paid_at=tx.get("paid_at") or tx.get("paidAt") or "",
+        period_start=sub.get("createdAt") or "",
+        period_end=sub.get("next_payment_date") or "",
+    ))
+
+    asyncio.ensure_future(_write_audit_log(
+        pool, "billing.invoice_emailed", True,
+        user_type="user", target_type="invoice",
+        target_id=reference, ip_address=_client_ip(request),
+        details={"to": current_user["email"], "reference": reference},
+    ))
+
+    return JSONResponse(content={
+        "sent_to": current_user["email"],
+        "reference": reference,
+        "message": f"Invoice {reference[:12]}… sent to {current_user['email']}",
     })
 
 
@@ -2558,19 +2966,23 @@ async def dashboard(
             "key_prefix":  r["key_prefix"],
         }
 
+    # Detect billing query params for post-payment banner
+    billing_alert = request.query_params.get("billing", "")
+
     resp = templates.TemplateResponse(
         request=request,
         name="dashboard.html",
         context={
-            "user":         current_user,
-            "default_env":  current_user.get("last_env", "test"),
-            "sub_status":   current_user.get("sub_status", "none"),
-            "sub_plan":     current_user.get("sub_plan", "free"),
+            "user":           current_user,
+            "default_env":    current_user.get("last_env", "test"),
+            "sub_status":     current_user.get("sub_status", "none"),
+            "sub_plan":       current_user.get("sub_plan", "free"),
             "sub_period_end": current_user.get("sub_period_end"),
             "paystack_public_key": PAYSTACK_PUBLIC_KEY,
-            "api_keys":     [_serialise_key(k) for k in keys],
-            "ledger_test":  [_serialise_ledger(r) for r in ledger_test_rows],
-            "ledger_live":  [_serialise_ledger(r) for r in ledger_live_rows],
+            "billing_alert":  billing_alert,
+            "api_keys":       [_serialise_key(k) for k in keys],
+            "ledger_test":    [_serialise_ledger(r) for r in ledger_test_rows],
+            "ledger_live":    [_serialise_ledger(r) for r in ledger_live_rows],
         },
     )
     # Authenticated page — never cache so back-button after logout always

@@ -4,14 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Dodman · Dashboard</title>
-
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
-
   <style>
-    *, *::before, *::after { box-sizing: border-box; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
       background: #07070a; color: #d0d0e0;
       font-family: 'IBM Plex Mono', monospace;
@@ -26,19 +24,22 @@
     }
     .content { position: relative; z-index: 1; }
 
-    /* ── Environment pill ── */
-    .env-pill {
-      display: inline-flex; align-items: center;
-      background: #16161a; border: 1px solid #232329;
-      border-radius: 999px; padding: 3px;
+    /* ── Top-level tab bar ── */
+    .tab-bar { display: flex; gap: 0; border-bottom: 1px solid #232329; background: #0f0f12; }
+    .tab-btn {
+      padding: 12px 22px; font-size: 11px; font-family: 'IBM Plex Mono', monospace;
+      font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
+      border: none; background: none; color: #6b6b7a; cursor: pointer;
+      border-bottom: 2px solid transparent; transition: color .15s, border-color .15s;
     }
-    .env-pill button {
-      padding: 6px 20px; border-radius: 999px; font-size: 11px;
-      font-family: 'IBM Plex Mono', monospace; font-weight: 600;
-      letter-spacing: .1em; text-transform: uppercase; border: none;
-      transition: background .22s, color .22s, box-shadow .22s;
-      background: transparent; color: #6b6b7a; cursor: pointer;
-    }
+    .tab-btn.active { color: #f59e0b; border-bottom-color: #f59e0b; }
+    .tab-btn.active.billing-active { color: #10b981; border-bottom-color: #10b981; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; animation: fadein .22s ease; }
+
+    /* ── Env pill ── */
+    .env-pill { display: inline-flex; align-items: center; background: #16161a; border: 1px solid #232329; border-radius: 999px; padding: 3px; }
+    .env-pill button { padding: 6px 20px; border-radius: 999px; font-size: 11px; font-family: 'IBM Plex Mono', monospace; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; border: none; transition: all .22s; background: transparent; color: #6b6b7a; cursor: pointer; }
     .env-pill button.active-test { background: #f59e0b; color: #07070a; box-shadow: 0 0 14px #f59e0b44; }
     .env-pill button.active-live { background: #10b981; color: #07070a; box-shadow: 0 0 14px #10b98144; }
 
@@ -49,448 +50,547 @@
     /* ── Animations ── */
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
     .blink { animation: blink 1.4s ease-in-out infinite; }
-    @keyframes fadein { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
-    .fadein { animation: fadein .26s ease forwards; }
+    @keyframes fadein { from{opacity:0;transform:translateY(5px)} to{opacity:1;transform:translateY(0)} }
+    .fadein { animation: fadein .24s ease; }
 
     /* ── Env views ── */
     .env-view { display: none; }
-    .env-view.active { display: block; }
+    .env-view.active { display: block; animation: fadein .22s ease; }
 
-    /* ── Live warning bar ── */
-    .live-warning {
-      background: linear-gradient(90deg, #022c22, #064e3b 50%, #022c22);
-      border-bottom: 1px solid #059669;
-    }
+    /* ── Live warning ── */
+    .live-warning { background: linear-gradient(90deg, #022c22, #064e3b 50%, #022c22); border-bottom: 1px solid #059669; }
 
     /* ── Key masking ── */
     .key-plain { display: none; }
     .is-revealed .key-dots { display: none; }
     .is-revealed .key-plain { display: inline; }
 
-    /* ── Input ── */
-    .field-input {
-      background: #07070a; border: 1px solid #232329; border-radius: 6px;
-      padding: 9px 13px; font-family: 'IBM Plex Mono', monospace; font-size: 13px;
-      color: #d0d0e0; outline: none; transition: border-color .15s, box-shadow .15s; width: 100%;
-    }
+    /* ── Inputs ── */
+    .field-input { background: #07070a; border: 1px solid #232329; border-radius: 6px; padding: 9px 13px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #d0d0e0; outline: none; transition: border-color .15s, box-shadow .15s; width: 100%; }
     .field-input:focus { border-color: #f59e0b; box-shadow: 0 0 0 1px #f59e0b33; }
 
-    /* ── Ledger table ── */
-    .ledger-table th {
-      font-size: 10px; text-transform: uppercase; letter-spacing: .12em;
-      color: #6b6b7a; padding: 10px 14px; text-align: left;
-      border-bottom: 1px solid #232329; white-space: nowrap;
-    }
-    .ledger-table td { font-size: 12px; padding: 9px 14px; border-bottom: 1px solid #16161a; color: #9a9aaa; }
-    .ledger-table tr:last-child td { border-bottom: none; }
-    .ledger-table tr:hover td { background: #0f0f12; }
+    /* ── Buttons ── */
+    .btn { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; border: none; border-radius: 6px; padding: 9px 20px; cursor: pointer; transition: background .15s; }
+    .btn-amber { background: #f59e0b; color: #07070a; }
+    .btn-amber:hover { background: #fbbf24; }
+    .btn-emerald { background: #10b981; color: #07070a; }
+    .btn-emerald:hover { background: #34d399; }
+    .btn-rose { background: rgba(244,63,94,.12); color: #fb7185; border: 1px solid rgba(244,63,94,.3); }
+    .btn-rose:hover { background: rgba(244,63,94,.2); }
+    .btn-ghost { background: none; color: #6b6b7a; border: 1px solid #232329; border-radius: 6px; font-family: 'IBM Plex Mono', monospace; font-size: 10px; padding: 4px 10px; cursor: pointer; transition: color .15s, border-color .15s; }
+    .btn-ghost:hover { color: #d0d0e0; border-color: #3a3a44; }
+
+    /* ── Tables ── */
+    .data-table { width: 100%; border-collapse: collapse; }
+    .data-table th { font-size: 10px; text-transform: uppercase; letter-spacing: .12em; color: #6b6b7a; padding: 10px 14px; text-align: left; border-bottom: 1px solid #232329; white-space: nowrap; }
+    .data-table td { font-size: 12px; padding: 9px 14px; border-bottom: 1px solid #16161a; color: #9a9aaa; }
+    .data-table tr:last-child td { border-bottom: none; }
+    .data-table tr:hover td { background: #0f0f12; }
+
+    /* ── Status badges ── */
+    .badge { display: inline-block; font-size: 9px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; padding: 3px 8px; border-radius: 4px; }
+    .badge-active       { background: rgba(16,185,129,.1); color: #10b981; border: 1px solid rgba(16,185,129,.25); }
+    .badge-nonrenewing  { background: rgba(245,158,11,.1); color: #f59e0b; border: 1px solid rgba(245,158,11,.25); }
+    .badge-attention    { background: rgba(251,113,133,.1); color: #fb7185; border: 1px solid rgba(251,113,133,.25); }
+    .badge-cancelled    { background: rgba(107,107,122,.1); color: #6b6b7a; border: 1px solid rgba(107,107,122,.25); }
+    .badge-none         { background: rgba(107,107,122,.1); color: #6b6b7a; border: 1px solid rgba(107,107,122,.25); }
+
+    /* ── Plan cards ── */
+    .plan-card { background: #0f0f12; border: 1px solid #232329; border-radius: 12px; padding: 20px; flex: 1; min-width: 0; transition: border-color .2s; }
+    .plan-card.featured { border-color: #10b98144; box-shadow: 0 0 0 1px #10b98118; }
+    .plan-card:hover { border-color: #3a3a44; }
 
     /* ── Nav links ── */
-    .nav-link {
-      font-size: 11px; font-family: 'IBM Plex Mono', monospace;
-      color: #6b6b7a; text-decoration: none; padding: 5px 12px;
-      border: 1px solid #232329; border-radius: 6px;
-      transition: color .15s, border-color .15s;
-    }
+    .nav-link { font-size: 11px; font-family: 'IBM Plex Mono', monospace; color: #6b6b7a; text-decoration: none; padding: 5px 12px; border: 1px solid #232329; border-radius: 6px; transition: color .15s, border-color .15s; }
     .nav-link:hover { color: #d0d0e0; border-color: #3a3a44; }
 
-    /* ── Scrollbar ── */
+    /* ── Ledger sub-tabs ── */
+    .ledger-tab-bar { display: flex; border-bottom: 1px solid #232329; background: #0f0f12; }
+    .ledger-tab { padding: 9px 18px; font-size: 10px; font-family: 'IBM Plex Mono', monospace; letter-spacing: .1em; text-transform: uppercase; border: none; background: none; cursor: pointer; border-bottom: 2px solid transparent; color: #6b6b7a; transition: color .12s, border-color .12s; }
+
     ::-webkit-scrollbar { width: 4px; height: 4px; }
     ::-webkit-scrollbar-thumb { background: #3a3a44; border-radius: 2px; }
-
-    /* ── Section header ── */
-    .section-hdr {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 14px 20px; border-bottom: 1px solid #232329; background: #0f0f12;
-    }
-    .section-hdr-title {
-      display: flex; align-items: center; gap: 8px;
-      font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #6b6b7a;
-    }
   </style>
 </head>
-
 <body>
 <div class="content max-w-4xl mx-auto px-5 py-8 space-y-5">
 
-  <!-- ══════════════════════════════════════════════════════════
-       HEADER
-  ══════════════════════════════════════════════════════════ -->
-  <header class="flex flex-wrap items-center justify-between gap-3">
+  <!-- ═══════ HEADER ═══════════════════════════════════════════════════ -->
+  <header style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:4px;">
     <div>
-      <p style="font-family:Syne,sans-serif;font-weight:700;font-size:10px;letter-spacing:.35em;text-transform:uppercase;color:#f59e0b;opacity:.7;">DODMAN GROUP</p>
-      <h1 style="font-family:Syne,sans-serif;font-weight:800;font-size:22px;color:#ffffff;letter-spacing:-.02em;line-height:1.1;">API Dashboard</h1>
+      <p style="font-family:Syne,sans-serif;font-weight:700;font-size:10px;letter-spacing:.35em;text-transform:uppercase;color:#f59e0b;opacity:.7;margin-bottom:2px;">DODMAN GROUP</p>
+      <h1 style="font-family:Syne,sans-serif;font-weight:800;font-size:22px;color:#fff;letter-spacing:-.02em;line-height:1.1;">API Dashboard</h1>
     </div>
-
-    <!-- Navigation links (Q1) -->
-    <div class="flex items-center gap-2 flex-wrap">
-      <a href="/dashboard/data-cleaner" class="nav-link" target="_blank">
-        ↗ Try the Sandbox
-      </a>
-      <a href="/dashboard/api-docs" target="_blank" class="nav-link">
-        ⌗ API Docs
-      </a>
-      <span style="width:1px;height:16px;background:#232329;display:inline-block;margin:0 2px;"></span>
-      <span style="font-size:11px;color:#6b6b7a;font-family:'IBM Plex Mono',monospace;">{{ user.email }}</span>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <a href="/" class="nav-link" target="_blank">↗ Sandbox</a>
+      <a href="/dashboard/api-docs" class="nav-link">⌗ API Docs</a>
+      <span style="width:1px;height:16px;background:#232329;display:inline-block;"></span>
+      <span style="font-size:11px;color:#6b6b7a;">{{ user.email }}</span>
       <form action="/auth/logout" method="post" style="display:inline;">
         <button type="submit" class="nav-link" style="cursor:pointer;background:none;">Sign out</button>
       </form>
     </div>
   </header>
 
-  <!-- ══════════════════════════════════════════════════════════
-       ENVIRONMENT TOGGLE  (Q4 — default_env sets initial state)
-  ══════════════════════════════════════════════════════════ -->
-  <section style="background:#16161a;border:1px solid #232329;border-radius:14px;overflow:hidden;">
+  <!-- ═══════ BILLING SUCCESS BANNER ══════════════════════════════════ -->
+  {% if billing_alert == 'success' %}
+  <div style="padding:12px 16px;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.25);border-radius:8px;display:flex;align-items:center;gap:10px;">
+    <span style="color:#10b981;font-size:16px;">✓</span>
+    <div>
+      <p style="font-size:12px;font-weight:600;color:#10b981;margin:0;">Subscription activated successfully.</p>
+      <p style="font-size:11px;color:rgba(16,185,129,.6);margin:3px 0 0;">Your invoice has been sent to {{ user.email }}. Your dk_live_ key is ready to issue.</p>
+    </div>
+  </div>
+  {% endif %}
+  {% if billing_alert == 'failed' %}
+  <div style="padding:12px 16px;background:rgba(251,113,133,.08);border:1px solid rgba(251,113,133,.25);border-radius:8px;display:flex;align-items:center;gap:10px;">
+    <span style="color:#fb7185;font-size:16px;">✕</span>
+    <p style="font-size:12px;color:#fb7185;margin:0;">Payment was not completed. Please try again from the Billing tab.</p>
+  </div>
+  {% endif %}
 
-    <!-- Toggle header -->
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid #232329;background:#0f0f12;">
-      <div style="display:flex;align-items:center;gap:10px;">
-        <span id="env-dot" class="blink" style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block;flex-shrink:0;"></span>
-        <span id="env-label" style="font-family:Syne,sans-serif;font-weight:700;font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:#f59e0b;">Test Environment</span>
-      </div>
-      <div class="env-pill">
-        <button id="btn-test" onclick="switchEnv('test')">Test</button>
-        <button id="btn-live" onclick="switchEnv('live')">Live</button>
-      </div>
+  <!-- ═══════ MAIN CARD WITH TABS ══════════════════════════════════════ -->
+  <div style="background:#16161a;border:1px solid #232329;border-radius:14px;overflow:hidden;">
+
+    <!-- Tab bar -->
+    <div class="tab-bar">
+      <button class="tab-btn active" id="tab-keys"    onclick="switchTab('keys')">⊙ Keys</button>
+      <button class="tab-btn"        id="tab-billing" onclick="switchTab('billing')">💳 Billing</button>
+      <button class="tab-btn"        id="tab-usage"   onclick="switchTab('usage')">⌁ Usage</button>
     </div>
 
-    <!-- ── TEST VIEW ─────────────────────────────────────────── -->
-    <div id="view-test" class="env-view">
-      <!-- Sandbox notice -->
-      <div style="margin:16px 20px 0;padding:10px 14px;background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.22);border-radius:8px;display:flex;gap:10px;align-items:flex-start;">
-        <span style="color:#f59e0b;font-size:14px;flex-shrink:0;margin-top:1px;">⚠</span>
-        <div>
-          <p style="font-size:11px;font-weight:600;color:#f59e0b;margin:0;">Test mode — 20-row limit enforced on all requests</p>
-          <p style="font-size:11px;color:rgba(245,158,11,.55);margin:4px 0 0;">Keys prefixed <code>dk_test_</code>. No billing charges apply in this environment.</p>
+    <!-- ══════════════════════════════════════════════════════════════
+         TAB: KEYS
+    ══════════════════════════════════════════════════════════════ -->
+    <div id="panel-keys" class="tab-panel active">
+
+      <!-- Env toggle header -->
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid #232329;background:#0f0f12;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span id="env-dot" class="blink" style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block;flex-shrink:0;"></span>
+          <span id="env-label" style="font-family:Syne,sans-serif;font-weight:700;font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:#f59e0b;">Test Environment</span>
+        </div>
+        <div class="env-pill">
+          <button id="btn-test" onclick="switchEnv('test')">Test</button>
+          <button id="btn-live" onclick="switchEnv('live')">Live</button>
         </div>
       </div>
 
-      <div style="padding:16px 20px;space-y:12px;">
-        {% set test_key = api_keys | selectattr("environment","equalto","test") | selectattr("is_active","equalto",true) | first | default(none) %}
-
-        {% if test_key %}
-        <!-- Active test key card -->
-        <div class="key-card-test" style="background:#07070a;border:1px solid;border-radius:10px;padding:14px;margin-bottom:14px;">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-            <div style="display:flex;align-items:center;gap:6px;">
-              <span style="width:6px;height:6px;border-radius:50%;background:#f59e0b;display:inline-block;"></span>
-              <span style="font-size:10px;color:#6b6b7a;letter-spacing:.12em;text-transform:uppercase;">{{ test_key.tier }} · active</span>
-            </div>
-            <span style="font-size:10px;color:#3a3a44;">
-              Issued {{ test_key.created_at[:10] }}
-              {% if test_key.last_used_at %} · Last used {{ test_key.last_used_at[:10] }}{% endif %}
-            </span>
+      <!-- TEST VIEW -->
+      <div id="view-test" class="env-view">
+        <div style="margin:16px 20px 0;padding:10px 14px;background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.22);border-radius:8px;display:flex;gap:10px;align-items:flex-start;">
+          <span style="color:#f59e0b;font-size:14px;flex-shrink:0;margin-top:1px;">⚠</span>
+          <div>
+            <p style="font-size:11px;font-weight:600;color:#f59e0b;margin:0;">Test mode — 20-row limit on all requests</p>
+            <p style="font-size:11px;color:rgba(245,158,11,.55);margin:4px 0 0;">Keys prefixed <code>dk_test_</code>. No billing charges apply.</p>
           </div>
-          <div style="display:flex;align-items:center;gap:8px;background:#0f0f12;border-radius:6px;padding:10px 12px;">
-            <code style="flex:1;font-size:13px;color:#f59e0b;font-family:'IBM Plex Mono',monospace;word-break:break-all;">{{ test_key.key_prefix }}••••••••••••••••••••••</code>
-            <button onclick="copyText('{{ test_key.key_prefix }}', this)"
-              style="flex-shrink:0;font-size:10px;font-family:'IBM Plex Mono',monospace;color:#6b6b7a;background:none;border:1px solid #232329;border-radius:4px;padding:4px 10px;cursor:pointer;transition:color .15s,border-color .15s;"
-              onmouseover="this.style.color='#f59e0b';this.style.borderColor='#f59e0b44'"
-              onmouseout="this.style.color='#6b6b7a';this.style.borderColor='#232329'">Copy prefix</button>
-          </div>
-          <p style="font-size:10px;color:#3a3a44;margin-top:8px;">Key ID: {{ test_key.id }}</p>
         </div>
-        {% else %}
-        <p style="font-size:12px;color:#6b6b7a;text-align:center;padding:20px 0;">No active test key. Issue one below.</p>
-        {% endif %}
-
-        <!-- Re-issue section (Q2 — label removed, single action) -->
-        <div style="border:1px dashed #3a3a44;border-radius:8px;padding:14px;">
-          <p style="font-size:10px;color:#6b6b7a;letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px;">
-            {% if test_key %}Re-issue dk_test_ key{% else %}Issue dk_test_ key{% endif %}
-          </p>
+        <div style="padding:16px 20px;">
+          {% set test_key = api_keys | selectattr("environment","equalto","test") | selectattr("is_active","equalto",true) | first | default(none) %}
           {% if test_key %}
-          <p style="font-size:11px;color:rgba(245,158,11,.6);margin-bottom:10px;">
-            Your current test key will be <strong style="color:#f59e0b;">immediately deactivated</strong> and a new one issued.
-          </p>
+          <div class="key-card-test" style="background:#07070a;border:1px solid;border-radius:10px;padding:14px;margin-bottom:14px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:6px;height:6px;border-radius:50%;background:#f59e0b;display:inline-block;"></span>
+                <span style="font-size:10px;color:#6b6b7a;letter-spacing:.12em;text-transform:uppercase;">{{ test_key.tier }} · active</span>
+              </div>
+              <span style="font-size:10px;color:#3a3a44;">Issued {{ test_key.created_at[:10] }}{% if test_key.last_used_at %} · Last used {{ test_key.last_used_at[:10] }}{% endif %}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;background:#0f0f12;border-radius:6px;padding:10px 12px;">
+              <code style="flex:1;font-size:13px;color:#f59e0b;font-family:'IBM Plex Mono',monospace;word-break:break-all;">{{ test_key.key_prefix }}••••••••••••••••••••••</code>
+              <button class="btn-ghost" onclick="copyText('{{ test_key.key_prefix }}', this)">Copy prefix</button>
+            </div>
+            <p style="font-size:10px;color:#3a3a44;margin-top:8px;">Key ID: {{ test_key.id }}</p>
+          </div>
+          {% else %}
+          <p style="font-size:12px;color:#6b6b7a;text-align:center;padding:20px 0;">No active test key. Issue one below.</p>
           {% endif %}
-          <button onclick="reissueKey('test')"
-            style="background:#f59e0b;color:#07070a;font-family:Syne,sans-serif;font-weight:700;font-size:11px;letter-spacing:.08em;text-transform:uppercase;border:none;border-radius:6px;padding:9px 20px;cursor:pointer;transition:background .15s;"
-            onmouseover="this.style.background='#fbbf24'"
-            onmouseout="this.style.background='#f59e0b'">
-            {% if test_key %}↻ Re-issue Test Key{% else %}⊕ Issue Test Key{% endif %}
-          </button>
-          <div id="test-key-result" style="display:none;margin-top:12px;padding:12px;background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.25);border-radius:6px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#f59e0b;word-break:break-all;"></div>
+          <div style="border:1px dashed #3a3a44;border-radius:8px;padding:14px;">
+            <p style="font-size:10px;color:#6b6b7a;letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px;">{% if test_key %}Re-issue dk_test_ key{% else %}Issue dk_test_ key{% endif %}</p>
+            {% if test_key %}<p style="font-size:11px;color:rgba(245,158,11,.6);margin-bottom:10px;">Current test key will be <strong style="color:#f59e0b;">immediately deactivated</strong>.</p>{% endif %}
+            <button class="btn btn-amber" onclick="reissueKey('test')">{% if test_key %}↻ Re-issue Test Key{% else %}⊕ Issue Test Key{% endif %}</button>
+            <div id="test-key-result" style="display:none;margin-top:12px;padding:12px;background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.25);border-radius:6px;font-size:12px;color:#f59e0b;word-break:break-all;"></div>
+          </div>
+        </div>
+      </div><!-- /view-test -->
+
+      <!-- LIVE VIEW -->
+      <div id="view-live" class="env-view">
+        <div class="live-warning" style="padding:10px 20px;display:flex;align-items:center;gap:10px;">
+          <span style="font-size:14px;flex-shrink:0;">💳</span>
+          <div>
+            <span style="font-size:11px;font-weight:600;color:#10b981;">LIVE ENVIRONMENT — BILLING ACTIVE</span>
+            <p style="font-size:11px;color:rgba(16,185,129,.55);margin:3px 0 0;">Every request is logged. <strong style="color:#10b981;">Never share your dk_live_ key.</strong></p>
+          </div>
+        </div>
+        <div style="padding:16px 20px;">
+          {% set live_key = api_keys | selectattr("environment","equalto","live") | selectattr("is_active","equalto",true) | first | default(none) %}
+
+          {% if sub_status != 'active' %}
+          <!-- Paywall notice -->
+          <div style="padding:20px;background:rgba(251,113,133,.06);border:1px solid rgba(251,113,133,.2);border-radius:10px;text-align:center;margin-bottom:14px;">
+            <p style="font-size:14px;margin-bottom:8px;">🔒</p>
+            <p style="font-size:13px;font-weight:600;color:#fb7185;margin-bottom:6px;">Active subscription required</p>
+            <p style="font-size:11px;color:rgba(251,113,133,.6);margin-bottom:14px;">A live API key requires an active Starter or Pro subscription. Current status: <strong>{{ sub_status }}</strong></p>
+            <button class="btn btn-emerald" onclick="switchTab('billing')">View Billing Plans →</button>
+          </div>
+          {% else %}
+          {% if live_key %}
+          <div class="key-card-live" style="background:#07070a;border:1px solid;border-radius:10px;padding:14px;margin-bottom:14px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:6px;height:6px;border-radius:50%;background:#10b981;display:inline-block;"></span>
+                <span style="font-size:10px;color:#6b6b7a;letter-spacing:.12em;text-transform:uppercase;">{{ live_key.tier }} · active</span>
+              </div>
+              <span style="font-size:10px;color:#3a3a44;">Issued {{ live_key.created_at[:10] }}{% if live_key.last_used_at %} · Last used {{ live_key.last_used_at[:10] }}{% endif %}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;background:#0f0f12;border-radius:6px;padding:10px 12px;">
+              <div id="live-key-wrap" style="flex:1;min-width:0;">
+                <code class="key-dots" style="font-size:13px;color:#10b981;font-family:'IBM Plex Mono',monospace;word-break:break-all;">{{ live_key.key_prefix }}<span style="opacity:.4;">••••••••••••••••••••••••••</span></code>
+                <code class="key-plain" style="font-size:13px;color:#10b981;font-family:'IBM Plex Mono',monospace;word-break:break-all;">{{ live_key.key_prefix }}[re-issue to obtain plaintext]</code>
+              </div>
+              <div style="display:flex;flex-shrink:0;gap:6px;">
+                <button id="reveal-btn" class="btn-ghost" onclick="revealLiveKey(this)" onmouseover="this.style.color='#10b981';this.style.borderColor='#10b98144'" onmouseout="this.style.color='#6b6b7a';this.style.borderColor='#232329'">Reveal</button>
+                <button class="btn-ghost" onclick="copyText('{{ live_key.key_prefix }}', this)" onmouseover="this.style.color='#10b981';this.style.borderColor='#10b98144'" onmouseout="this.style.color='#6b6b7a';this.style.borderColor='#232329'">Copy prefix</button>
+              </div>
+            </div>
+            <p style="font-size:10px;color:#3a3a44;margin-top:8px;">Key ID: {{ live_key.id }}</p>
+          </div>
+          {% else %}
+          <p style="font-size:12px;color:#6b6b7a;text-align:center;padding:20px 0;">No active live key. Issue one below.</p>
+          {% endif %}
+          <div style="border:1px dashed #3a3a44;border-radius:8px;padding:14px;">
+            <p style="font-size:10px;color:#6b6b7a;letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px;">{% if live_key %}Re-issue dk_live_ key{% else %}Issue dk_live_ key{% endif %}</p>
+            {% if live_key %}<p style="font-size:11px;color:rgba(16,185,129,.6);margin-bottom:10px;">Current live key will be <strong style="color:#10b981;">immediately deactivated</strong>. Update your integrations.</p>{% endif %}
+            <button class="btn btn-emerald" onclick="reissueKey('live')">{% if live_key %}↻ Re-issue Live Key{% else %}⊕ Issue Live Key{% endif %}</button>
+            <div id="live-key-result" style="display:none;margin-top:12px;padding:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:6px;font-size:12px;color:#10b981;word-break:break-all;"></div>
+          </div>
+          {% endif %}
+        </div>
+      </div><!-- /view-live -->
+    </div><!-- /panel-keys -->
+
+    <!-- ══════════════════════════════════════════════════════════════
+         TAB: BILLING
+    ══════════════════════════════════════════════════════════════ -->
+    <div id="panel-billing" class="tab-panel">
+
+      <!-- ── Current subscription status ── -->
+      <div style="padding:20px;border-bottom:1px solid #232329;">
+        <p style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6b7a;margin-bottom:14px;">Current Subscription</p>
+
+        {% if sub_status == 'active' %}
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:14px;padding:16px;background:#0f0f12;border:1px solid #10b98133;border-radius:10px;">
+          <div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+              <span class="badge badge-active">Active</span>
+              <span style="font-family:Syne,sans-serif;font-weight:700;font-size:16px;color:#fff;">{{ sub_plan | title }}</span>
+            </div>
+            {% if sub_period_end %}
+            <p style="font-size:11px;color:#6b6b7a;">Renews {{ sub_period_end[:10] }}</p>
+            {% endif %}
+          </div>
+          <button class="btn btn-rose" onclick="cancelSubscription()" style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">Cancel Subscription</button>
+        </div>
+
+        {% elif sub_status == 'non-renewing' %}
+        <div style="padding:16px;background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.2);border-radius:10px;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+            <span class="badge badge-nonrenewing">Non-Renewing</span>
+            <span style="font-family:Syne,sans-serif;font-weight:700;font-size:16px;color:#fff;">{{ sub_plan | title }}</span>
+          </div>
+          <p style="font-size:11px;color:rgba(245,158,11,.7);">Auto-renewal is off. Access expires {{ sub_period_end[:10] if sub_period_end else 'soon' }}. Re-subscribe below to continue.</p>
+        </div>
+
+        {% elif sub_status == 'attention' %}
+        <div style="padding:16px;background:rgba(251,113,133,.06);border:1px solid rgba(251,113,133,.2);border-radius:10px;">
+          <span class="badge badge-attention" style="margin-bottom:8px;display:inline-block;">Payment Failed</span>
+          <p style="font-size:11px;color:rgba(251,113,133,.7);">Your last renewal payment failed. Please update your payment method to avoid losing access.</p>
+        </div>
+
+        {% else %}
+        <div style="padding:16px;background:#0f0f12;border:1px solid #232329;border-radius:10px;text-align:center;">
+          <p style="font-size:12px;color:#6b6b7a;margin-bottom:4px;">No active subscription</p>
+          <p style="font-size:11px;color:#3a3a44;">Choose a plan below to unlock live API keys.</p>
+        </div>
+        {% endif %}
+      </div>
+
+      <!-- ── Pricing plans ── -->
+      {% if sub_status not in ('active',) %}
+      <div style="padding:20px;border-bottom:1px solid #232329;">
+        <p style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6b7a;margin-bottom:14px;">Choose a Plan</p>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;">
+
+          <!-- Starter -->
+          <div class="plan-card featured" style="flex:1;min-width:220px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+              <span style="font-family:Syne,sans-serif;font-weight:700;font-size:15px;color:#fff;">Starter</span>
+              <span class="badge" style="background:rgba(16,185,129,.1);color:#10b981;border-color:rgba(16,185,129,.25);">Popular</span>
+            </div>
+            <ul style="list-style:none;font-size:11px;color:#9a9aaa;space-y:4px;margin-bottom:16px;line-height:1.8;">
+              <li>✓ dk_live_ key access</li>
+              <li>✓ 500 requests / hour</li>
+              <li>✓ Full file processing</li>
+              <li>✓ Billing ledger</li>
+              <li>✓ Invoice emails</li>
+            </ul>
+            <button class="btn btn-emerald" style="width:100%;" onclick="startSubscription('starter')">Subscribe — Starter</button>
+          </div>
+
+          <!-- Pro -->
+          <div class="plan-card" style="flex:1;min-width:220px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+              <span style="font-family:Syne,sans-serif;font-weight:700;font-size:15px;color:#fff;">Pro</span>
+            </div>
+            <ul style="list-style:none;font-size:11px;color:#9a9aaa;space-y:4px;margin-bottom:16px;line-height:1.8;">
+              <li>✓ Everything in Starter</li>
+              <li>✓ Unlimited requests</li>
+              <li>✓ Priority support</li>
+              <li>✓ Webhook delivery</li>
+              <li>✓ Advanced telemetry</li>
+            </ul>
+            <button class="btn btn-emerald" style="width:100%;background:#6b6b7a;" onmouseover="this.style.background='#9a9aaa'" onmouseout="this.style.background='#6b6b7a'" onclick="startSubscription('pro')">Subscribe — Pro</button>
+          </div>
+        </div>
+        <div id="subscribe-result" style="display:none;margin-top:14px;padding:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:6px;font-size:12px;color:#10b981;"></div>
+      </div>
+      {% endif %}
+
+      <!-- ── Invoice history ── -->
+      <div>
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid #232329;background:#0f0f12;">
+          <p style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6b7a;margin:0;">Invoice History</p>
+          <button class="btn-ghost" onclick="loadInvoices()" id="reload-invoices-btn">↻ Refresh</button>
+        </div>
+
+        <div id="invoice-loading" style="padding:30px;text-align:center;font-size:12px;color:#6b6b7a;">Loading invoices…</div>
+        <div id="invoice-empty"   style="display:none;padding:30px;text-align:center;font-size:12px;color:#6b6b7a;">No invoices yet. Payments will appear here.</div>
+        <div id="invoice-error"   style="display:none;padding:16px 20px;font-size:12px;color:#fb7185;"></div>
+
+        <div id="invoice-table-wrap" style="display:none;overflow-x:auto;">
+          <table class="data-table">
+            <thead><tr>
+              <th>Date</th>
+              <th>Reference</th>
+              <th>Plan</th>
+              <th style="text-align:right;">Amount</th>
+              <th style="text-align:center;">Actions</th>
+            </tr></thead>
+            <tbody id="invoice-tbody"></tbody>
+          </table>
         </div>
       </div>
-    </div><!-- /view-test -->
 
-    <!-- ── LIVE VIEW ──────────────────────────────────────────── -->
-    <div id="view-live" class="env-view">
-      <!-- Billing warning banner -->
-      <div class="live-warning" style="padding:10px 20px;display:flex;align-items:center;gap:10px;">
-        <span style="font-size:14px;flex-shrink:0;">💳</span>
-        <div>
-          <span style="font-size:11px;font-weight:600;color:#10b981;">LIVE ENVIRONMENT — BILLING ACTIVE</span>
-          <p style="font-size:11px;color:rgba(16,185,129,.55);margin:3px 0 0;">Every request is logged to the billing ledger. <strong style="color:#10b981;">Never share your dk_live_ key.</strong></p>
-        </div>
+    </div><!-- /panel-billing -->
+
+    <!-- ══════════════════════════════════════════════════════════════
+         TAB: USAGE (request ledger)
+    ══════════════════════════════════════════════════════════════ -->
+    <div id="panel-usage" class="tab-panel">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid #232329;background:#0f0f12;">
+        <p style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6b7a;margin:0;">Request Ledger · Last 50 per environment</p>
       </div>
 
-      <div style="padding:16px 20px;">
-        {% set live_key = api_keys | selectattr("environment","equalto","live") | selectattr("is_active","equalto",true) | first | default(none) %}
+      <!-- Ledger env sub-tabs -->
+      <div class="ledger-tab-bar">
+        <button id="ledger-tab-test" class="ledger-tab" onclick="switchLedgerTab('test')" style="border-bottom-color:#f59e0b;color:#f59e0b;">dk_test_</button>
+        <button id="ledger-tab-live" class="ledger-tab" onclick="switchLedgerTab('live')">dk_live_</button>
+      </div>
 
-        {% if live_key %}
-        <!-- Active live key card with masking (Q1 bullet — key reveal) -->
-        <div class="key-card-live" id="live-key-card" style="background:#07070a;border:1px solid;border-radius:10px;padding:14px;margin-bottom:14px;">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-            <div style="display:flex;align-items:center;gap:6px;">
-              <span style="width:6px;height:6px;border-radius:50%;background:#10b981;display:inline-block;"></span>
-              <span style="font-size:10px;color:#6b6b7a;letter-spacing:.12em;text-transform:uppercase;">{{ live_key.tier }} · active</span>
-            </div>
-            <span style="font-size:10px;color:#3a3a44;">
-              Issued {{ live_key.created_at[:10] }}
-              {% if live_key.last_used_at %} · Last used {{ live_key.last_used_at[:10] }}{% endif %}
-            </span>
-          </div>
-          <div style="display:flex;align-items:center;gap:8px;background:#0f0f12;border-radius:6px;padding:10px 12px;">
-            <div id="live-key-wrap" style="flex:1;min-width:0;">
-              <code class="key-dots" style="font-size:13px;color:#10b981;font-family:'IBM Plex Mono',monospace;word-break:break-all;">{{ live_key.key_prefix }}<span style="opacity:.4;">••••••••••••••••••••••••••</span></code>
-              <code class="key-plain" style="font-size:13px;color:#10b981;font-family:'IBM Plex Mono',monospace;word-break:break-all;" id="live-key-value">{{ live_key.key_prefix }}[re-issue to obtain plaintext]</code>
-            </div>
-            <div style="display:flex;flex-shrink:0;gap:6px;">
-              <button id="reveal-btn" onclick="revealLiveKey(this)"
-                style="font-size:10px;font-family:'IBM Plex Mono',monospace;color:#6b6b7a;background:none;border:1px solid #232329;border-radius:4px;padding:4px 10px;cursor:pointer;transition:color .15s,border-color .15s;"
-                onmouseover="this.style.color='#10b981';this.style.borderColor='#10b98144'"
-                onmouseout="this.style.color='#6b6b7a';this.style.borderColor='#232329'">Reveal</button>
-              <button onclick="copyText('{{ live_key.key_prefix }}', this)"
-                style="font-size:10px;font-family:'IBM Plex Mono',monospace;color:#6b6b7a;background:none;border:1px solid #232329;border-radius:4px;padding:4px 10px;cursor:pointer;transition:color .15s,border-color .15s;"
-                onmouseover="this.style.color='#10b981';this.style.borderColor='#10b98144'"
-                onmouseout="this.style.color='#6b6b7a';this.style.borderColor='#232329'">Copy prefix</button>
-            </div>
-          </div>
-          <p style="font-size:10px;color:#3a3a44;margin-top:8px;">Key ID: {{ live_key.id }}</p>
+      <!-- Test ledger -->
+      <div id="ledger-test" class="env-view active">
+        {% if ledger_test %}
+        <div style="overflow-x:auto;">
+          <table class="data-table">
+            <thead><tr><th>Timestamp</th><th>Key Prefix</th><th>File</th><th style="text-align:right;">Rows In</th><th style="text-align:right;">Rows Out</th><th style="text-align:right;">Duration</th></tr></thead>
+            <tbody>
+              {% for row in ledger_test %}
+              <tr>
+                <td style="color:#9a9aaa;white-space:nowrap;font-family:'IBM Plex Mono',monospace;">{{ row.timestamp[:19].replace("T"," ") }}</td>
+                <td><code style="font-size:11px;padding:2px 6px;border-radius:4px;background:rgba(245,158,11,.08);color:#f59e0b;">{{ row.key_prefix }}</code></td>
+                <td style="text-transform:uppercase;font-size:11px;">{{ row.file_type }}</td>
+                <td style="text-align:right;">{{ row.rows_in }}</td>
+                <td style="text-align:right;">{{ row.rows_out }}</td>
+                <td style="text-align:right;"><span style="color:{% if row.duration_ms > 2000 %}#fb7185{% elif row.duration_ms > 500 %}#f59e0b{% else %}#10b981{% endif %};">{{ row.duration_ms }}ms</span></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
         </div>
         {% else %}
-        <p style="font-size:12px;color:#6b6b7a;text-align:center;padding:20px 0;">No active live key. Issue one below.</p>
-        {% endif %}
-
-        <!-- Re-issue live key (Q2) -->
-        <div style="border:1px dashed #3a3a44;border-radius:8px;padding:14px;">
-          <p style="font-size:10px;color:#6b6b7a;letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px;">
-            {% if live_key %}Re-issue dk_live_ key{% else %}Issue dk_live_ key{% endif %}
-          </p>
-          {% if live_key %}
-          <p style="font-size:11px;color:rgba(16,185,129,.6);margin-bottom:10px;">
-            Your current live key will be <strong style="color:#10b981;">immediately deactivated</strong>. Update your integration before proceeding.
-          </p>
-          {% endif %}
-          <button onclick="reissueKey('live')"
-            style="background:#10b981;color:#07070a;font-family:Syne,sans-serif;font-weight:700;font-size:11px;letter-spacing:.08em;text-transform:uppercase;border:none;border-radius:6px;padding:9px 20px;cursor:pointer;transition:background .15s;"
-            onmouseover="this.style.background='#34d399'"
-            onmouseout="this.style.background='#10b981'">
-            {% if live_key %}↻ Re-issue Live Key{% else %}⊕ Issue Live Key{% endif %}
-          </button>
-          <div id="live-key-result" style="display:none;margin-top:12px;padding:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:6px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#10b981;word-break:break-all;"></div>
+        <div style="padding:40px;text-align:center;">
+          <p style="font-size:12px;color:#6b6b7a;">No test requests yet.</p>
+          <p style="font-size:11px;color:#3a3a44;margin-top:6px;">Use the <a href="/" style="color:#f59e0b;text-decoration:none;">sandbox</a> with your dk_test_ key to generate entries.</p>
         </div>
+        {% endif %}
       </div>
-    </div><!-- /view-live -->
-  </section>
 
-  <!-- ══════════════════════════════════════════════════════════
-       REQUEST LEDGER  (Q3 — split by environment)
-  ══════════════════════════════════════════════════════════ -->
-  <section style="background:#16161a;border:1px solid #232329;border-radius:14px;overflow:hidden;">
-    <div class="section-hdr">
-      <div class="section-hdr-title">
-        <span style="width:6px;height:6px;border-radius:50%;background:#6b6b7a;display:inline-block;"></span>
-        Request Ledger
+      <!-- Live ledger -->
+      <div id="ledger-live" class="env-view">
+        {% if ledger_live %}
+        <div style="overflow-x:auto;">
+          <table class="data-table">
+            <thead><tr><th>Timestamp</th><th>Key Prefix</th><th>File</th><th style="text-align:right;">Rows In</th><th style="text-align:right;">Rows Out</th><th style="text-align:right;">Duration</th></tr></thead>
+            <tbody>
+              {% for row in ledger_live %}
+              <tr>
+                <td style="color:#9a9aaa;white-space:nowrap;font-family:'IBM Plex Mono',monospace;">{{ row.timestamp[:19].replace("T"," ") }}</td>
+                <td><code style="font-size:11px;padding:2px 6px;border-radius:4px;background:rgba(16,185,129,.08);color:#10b981;">{{ row.key_prefix }}</code></td>
+                <td style="text-transform:uppercase;font-size:11px;">{{ row.file_type }}</td>
+                <td style="text-align:right;">{{ row.rows_in }}</td>
+                <td style="text-align:right;">{{ row.rows_out }}</td>
+                <td style="text-align:right;"><span style="color:{% if row.duration_ms > 2000 %}#fb7185{% elif row.duration_ms > 500 %}#f59e0b{% else %}#10b981{% endif %};">{{ row.duration_ms }}ms</span></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <div style="padding:40px;text-align:center;">
+          <p style="font-size:12px;color:#6b6b7a;">No live requests yet.</p>
+          <p style="font-size:11px;color:#3a3a44;margin-top:6px;">Requests using a dk_live_ key will appear here.</p>
+        </div>
+        {% endif %}
       </div>
-      <span style="font-size:10px;color:#3a3a44;">Last 50 per environment</span>
-    </div>
 
-    <!-- Ledger env tabs — mirror the main toggle -->
-    <div style="display:flex;border-bottom:1px solid #232329;background:#0f0f12;">
-      <button id="ledger-tab-test" onclick="switchLedgerTab('test')"
-        style="padding:9px 18px;font-size:10px;font-family:'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;border:none;background:none;cursor:pointer;border-bottom:2px solid #f59e0b;color:#f59e0b;">
-        dk_test_
-      </button>
-      <button id="ledger-tab-live" onclick="switchLedgerTab('live')"
-        style="padding:9px 18px;font-size:10px;font-family:'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;border:none;background:none;cursor:pointer;border-bottom:2px solid transparent;color:#6b6b7a;">
-        dk_live_
-      </button>
-    </div>
+    </div><!-- /panel-usage -->
+  </div><!-- /main card -->
 
-    <!-- Test ledger -->
-    <div id="ledger-test" class="env-view active">
-      {% if ledger_test %}
-      <div style="overflow-x:auto;">
-        <table class="ledger-table" style="width:100%;border-collapse:collapse;">
-          <thead><tr>
-            <th>Timestamp</th><th>Key Prefix</th><th>File</th>
-            <th style="text-align:right;">Rows In</th>
-            <th style="text-align:right;">Rows Out</th>
-            <th style="text-align:right;">Duration</th>
-          </tr></thead>
-          <tbody>
-            {% for row in ledger_test %}
-            <tr>
-              <td style="font-family:'IBM Plex Mono',monospace;color:#9a9aaa;white-space:nowrap;">{{ row.timestamp[:19].replace("T"," ") }}</td>
-              <td><code style="font-size:11px;padding:2px 6px;border-radius:4px;background:rgba(245,158,11,.08);color:#f59e0b;">{{ row.key_prefix }}</code></td>
-              <td style="text-transform:uppercase;font-size:11px;">{{ row.file_type }}</td>
-              <td style="text-align:right;">{{ row.rows_in }}</td>
-              <td style="text-align:right;">{{ row.rows_out }}</td>
-              <td style="text-align:right;">
-                <span style="color:{% if row.duration_ms > 2000 %}#fb7185{% elif row.duration_ms > 500 %}#f59e0b{% else %}#10b981{% endif %};">{{ row.duration_ms }}ms</span>
-              </td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      {% else %}
-      <div style="padding:40px;text-align:center;">
-        <p style="font-size:12px;color:#6b6b7a;">No test requests logged yet.</p>
-        <p style="font-size:11px;color:#3a3a44;margin-top:6px;">Use the <a href="/" style="color:#f59e0b;text-decoration:none;">sandbox</a> with your dk_test_ key to generate entries.</p>
-      </div>
-      {% endif %}
-    </div>
-
-    <!-- Live ledger -->
-    <div id="ledger-live" class="env-view">
-      {% if ledger_live %}
-      <div style="overflow-x:auto;">
-        <table class="ledger-table" style="width:100%;border-collapse:collapse;">
-          <thead><tr>
-            <th>Timestamp</th><th>Key Prefix</th><th>File</th>
-            <th style="text-align:right;">Rows In</th>
-            <th style="text-align:right;">Rows Out</th>
-            <th style="text-align:right;">Duration</th>
-          </tr></thead>
-          <tbody>
-            {% for row in ledger_live %}
-            <tr>
-              <td style="font-family:'IBM Plex Mono',monospace;color:#9a9aaa;white-space:nowrap;">{{ row.timestamp[:19].replace("T"," ") }}</td>
-              <td><code style="font-size:11px;padding:2px 6px;border-radius:4px;background:rgba(16,185,129,.08);color:#10b981;">{{ row.key_prefix }}</code></td>
-              <td style="text-transform:uppercase;font-size:11px;">{{ row.file_type }}</td>
-              <td style="text-align:right;">{{ row.rows_in }}</td>
-              <td style="text-align:right;">{{ row.rows_out }}</td>
-              <td style="text-align:right;">
-                <span style="color:{% if row.duration_ms > 2000 %}#fb7185{% elif row.duration_ms > 500 %}#f59e0b{% else %}#10b981{% endif %};">{{ row.duration_ms }}ms</span>
-              </td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      {% else %}
-      <div style="padding:40px;text-align:center;">
-        <p style="font-size:12px;color:#6b6b7a;">No live requests logged yet.</p>
-        <p style="font-size:11px;color:#3a3a44;margin-top:6px;">Requests using a dk_live_ key will appear here.</p>
-      </div>
-      {% endif %}
-    </div>
-  </section>
-
-  <!-- Footer -->
   <footer style="text-align:center;font-size:10px;color:#3a3a44;padding:16px 0;border-top:1px solid #16161a;">
     Dodman Group · Data Cleaning Proxy API v2.0 · <a href="/docs" style="color:#6b6b7a;text-decoration:none;" target="_blank">OpenAPI</a>
   </footer>
-
 </div>
 
 <!-- Toast -->
-<div id="toast" style="display:none;position:fixed;bottom:20px;right:20px;z-index:999;
-  padding:10px 16px;background:#16161a;border:1px solid #232329;border-radius:8px;
-  font-family:'IBM Plex Mono',monospace;font-size:11px;color:#d0d0e0;
-  box-shadow:0 8px 32px rgba(0,0,0,.5);max-width:320px;"></div>
+<div id="toast" style="display:none;position:fixed;bottom:20px;right:20px;z-index:999;padding:10px 16px;background:#16161a;border:1px solid #232329;border-radius:8px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#d0d0e0;box-shadow:0 8px 32px rgba(0,0,0,.5);max-width:320px;"></div>
 
 <script>
 // ════════════════════════════════════════════════════════
-// Q4 — Initialise to server-persisted default environment
+// Top-level tab switching
+// ════════════════════════════════════════════════════════
+const TABS = ['keys', 'billing', 'usage'];
+
+function switchTab(name) {
+  TABS.forEach(t => {
+    document.getElementById(`tab-${t}`).classList.toggle('active', t === name);
+    document.getElementById(`panel-${t}`).classList.toggle('active', t === name);
+  });
+  // Load invoices lazily on first visit to billing tab
+  if (name === 'billing' && !window._invoicesLoaded) loadInvoices();
+}
+
+// ════════════════════════════════════════════════════════
+// Environment toggle (Keys tab)
 // ════════════════════════════════════════════════════════
 const DEFAULT_ENV = '{{ default_env }}';
 let currentEnv = DEFAULT_ENV;
 
-// ════════════════════════════════════════════════════════
-// Environment toggle
-// ════════════════════════════════════════════════════════
 function switchEnv(env, persist = true) {
   currentEnv = env;
   const isTest = env === 'test';
 
-  // Main views
   document.getElementById('view-test').classList.toggle('active', isTest);
   document.getElementById('view-live').classList.toggle('active', !isTest);
-
-  // Pill buttons
   document.getElementById('btn-test').className = isTest ? 'active-test' : '';
   document.getElementById('btn-live').className = !isTest ? 'active-live' : '';
 
-  // Dot + label
   const dot   = document.getElementById('env-dot');
   const label = document.getElementById('env-label');
-  dot.style.background   = isTest ? '#f59e0b' : '#10b981';
-  label.style.color      = isTest ? '#f59e0b' : '#10b981';
-  label.textContent      = isTest ? 'Test Environment' : 'Live Environment';
+  dot.style.background = isTest ? '#f59e0b' : '#10b981';
+  label.style.color    = isTest ? '#f59e0b' : '#10b981';
+  label.textContent    = isTest ? 'Test Environment' : 'Live Environment';
 
-  // Sync ledger tabs
+  // Sync usage ledger tabs
   switchLedgerTab(env, false);
 
-  // Fade in active view
-  const view = document.getElementById(`view-${env}`);
-  view.classList.remove('fadein');
-  void view.offsetWidth;
-  view.classList.add('fadein');
-
-  // Q4 — Persist to server (fire-and-forget) when user manually toggles
   if (persist) {
     fetch('/auth/me/env', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ env }),
-    }).catch(() => {}); // non-critical — silently ignore network errors
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ env }),
+    }).catch(() => {});
   }
 }
 
 // ════════════════════════════════════════════════════════
-// Q3 — Ledger tab switching (independent of env toggle
-//       when called directly; synced when called from switchEnv)
+// Usage ledger sub-tabs
 // ════════════════════════════════════════════════════════
-function switchLedgerTab(env, updateMainToggle = false) {
+function switchLedgerTab(env, updateMain = false) {
   const isTest = env === 'test';
-
   document.getElementById('ledger-test').classList.toggle('active', isTest);
   document.getElementById('ledger-live').classList.toggle('active', !isTest);
-
-  const tabTest = document.getElementById('ledger-tab-test');
-  const tabLive = document.getElementById('ledger-tab-live');
-
-  tabTest.style.borderBottomColor = isTest ? '#f59e0b' : 'transparent';
-  tabTest.style.color              = isTest ? '#f59e0b' : '#6b6b7a';
-  tabLive.style.borderBottomColor  = !isTest ? '#10b981' : 'transparent';
-  tabLive.style.color               = !isTest ? '#10b981' : '#6b6b7a';
-
-  if (updateMainToggle) switchEnv(env);
+  const tTest = document.getElementById('ledger-tab-test');
+  const tLive = document.getElementById('ledger-tab-live');
+  tTest.style.borderBottomColor = isTest  ? '#f59e0b' : 'transparent';
+  tTest.style.color              = isTest  ? '#f59e0b' : '#6b6b7a';
+  tLive.style.borderBottomColor  = !isTest ? '#10b981' : 'transparent';
+  tLive.style.color               = !isTest ? '#10b981' : '#6b6b7a';
+  if (updateMain) switchEnv(env);
 }
 
 // ════════════════════════════════════════════════════════
-// Q2 — Re-issue key  (auto-deactivates previous)
+// Key re-issue
 // ════════════════════════════════════════════════════════
 async function reissueKey(env) {
   const resultEl = document.getElementById(`${env}-key-result`);
   const color    = env === 'live' ? '#10b981' : '#f59e0b';
 
-  // Confirm before deactivating an existing live key
   if (env === 'live') {
-    const ok = confirm(
-      '⚠ This will immediately deactivate your current dk_live_ key.\n\n' +
-      'Any running integrations will stop working until you update them ' +
-      'with the new key.\n\nProceed?'
-    );
-    if (!ok) return;
+    if (!confirm('⚠ This will immediately deactivate your current dk_live_ key.\n\nAny running integrations will stop until you update them.\n\nProceed?')) return;
   }
 
-  resultEl.textContent = 'Generating…';
+  resultEl.textContent   = 'Generating…';
   resultEl.style.display = 'block';
 
   try {
     const res  = await fetch('/api/v1/keys/user', {
-      method:      'POST',
-      headers:     { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body:        JSON.stringify({ label: 'dashboard', environment: env, tier: 'free' }),
+      body: JSON.stringify({ label: 'dashboard', environment: env, tier: 'free' }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      // 402 means subscription required — redirect to billing tab
+      if (res.status === 402) {
+        resultEl.style.display = 'none';
+        showToast('Subscription required. Redirecting to Billing…');
+        setTimeout(() => switchTab('billing'), 800);
+        return;
+      }
+      resultEl.innerHTML = `<span style="color:#fb7185;">⚠ ${escHtml(data?.error?.message ?? 'Error ' + res.status)}</span>`;
+      return;
+    }
+
+    const key = data.api_key;
+    resultEl.innerHTML =
+      (data.previous_deactivated > 0 ? `<p style="margin:0 0 8px;font-size:11px;opacity:.55;">✓ Previous key deactivated.</p>` : '') +
+      `<p style="margin:0 0 6px;font-size:11px;opacity:.6;">Store this key — it will not be shown again.</p>` +
+      `<span style="word-break:break-all;user-select:all;">${escHtml(key)}</span>` +
+      `<br/><button onclick="navigator.clipboard.writeText('${escHtml(key)}').then(()=>showToast('Copied!'))"
+         style="margin-top:8px;font-size:10px;font-family:'IBM Plex Mono',monospace;color:${color};
+                background:none;border:1px solid ${color}44;border-radius:4px;padding:4px 10px;cursor:pointer;">Copy key</button>`;
+
+    showToast(`${env === 'live' ? 'dk_live_' : 'dk_test_'} key issued — save it immediately.`);
+    setTimeout(() => location.reload(), 10_000);
+  } catch (err) {
+    resultEl.innerHTML = `<span style="color:#fb7185;">Network error: ${escHtml(err.message)}</span>`;
+  }
+}
+
+// ════════════════════════════════════════════════════════
+// Billing — subscribe
+// ════════════════════════════════════════════════════════
+async function startSubscription(plan) {
+  const resultEl = document.getElementById('subscribe-result');
+  resultEl.textContent   = `Preparing ${plan} checkout…`;
+  resultEl.style.display = 'block';
+  resultEl.style.color   = '#10b981';
+
+  try {
+    const res  = await fetch('/billing/subscribe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ plan }),
     });
     const data = await res.json();
 
@@ -499,28 +599,116 @@ async function reissueKey(env) {
       return;
     }
 
-    const key      = data.api_key;
-    const deactMsg = data.previous_deactivated > 0
-      ? `<p style="margin:0 0 8px;color:rgba(${env==='live'?'16,185,129':'245,158,11'},.55);font-size:11px;">✓ Previous key deactivated.</p>`
-      : '';
-
-    resultEl.innerHTML =
-      deactMsg +
-      `<p style="margin:0 0 6px;font-size:11px;opacity:.6;">Store this key now — it will not be shown again.</p>` +
-      `<span id="new-key-text" style="word-break:break-all;user-select:all;">${escHtml(key)}</span>` +
-      `<br/><button onclick="navigator.clipboard.writeText('${escHtml(key)}').then(()=>showToast('Copied!'))"
-         style="margin-top:8px;font-size:10px;font-family:'IBM Plex Mono',monospace;color:${color};
-                background:none;border:1px solid ${color}44;border-radius:4px;padding:4px 10px;cursor:pointer;">
-         Copy key
-       </button>`;
-
-    showToast(`${env === 'live' ? 'dk_live_' : 'dk_test_'} key issued — save it immediately.`);
-
-    // Reload after 10s so the new prefix shows in the card without plaintext
-    setTimeout(() => location.reload(), 10_000);
-
+    resultEl.textContent = 'Redirecting to Paystack…';
+    window.location.href = data.authorization_url;
   } catch (err) {
     resultEl.innerHTML = `<span style="color:#fb7185;">Network error: ${escHtml(err.message)}</span>`;
+  }
+}
+
+// ════════════════════════════════════════════════════════
+// Billing — cancel
+// ════════════════════════════════════════════════════════
+async function cancelSubscription() {
+  if (!confirm('Cancel your subscription?\n\nAuto-renewal will be disabled. You keep access until the end of your current billing period.')) return;
+
+  try {
+    const res  = await fetch('/billing/cancel', { method: 'POST', credentials: 'include' });
+    const data = await res.json();
+
+    if (!res.ok) {
+      showToast('Cancellation failed: ' + (data?.error?.message ?? res.status));
+      return;
+    }
+
+    showToast(`Subscription set to non-renewing. Access until ${(data.access_until || '').slice(0,10)}`);
+    setTimeout(() => location.reload(), 2000);
+  } catch (err) {
+    showToast('Network error: ' + err.message);
+  }
+}
+
+// ════════════════════════════════════════════════════════
+// Billing — load invoices (lazy, called on tab open)
+// ════════════════════════════════════════════════════════
+window._invoicesLoaded = false;
+
+async function loadInvoices() {
+  document.getElementById('invoice-loading').style.display    = 'block';
+  document.getElementById('invoice-empty').style.display      = 'none';
+  document.getElementById('invoice-error').style.display      = 'none';
+  document.getElementById('invoice-table-wrap').style.display = 'none';
+
+  try {
+    const res  = await fetch('/billing/invoices', { credentials: 'include' });
+    const data = await res.json();
+
+    document.getElementById('invoice-loading').style.display = 'none';
+
+    if (!res.ok) {
+      document.getElementById('invoice-error').textContent   = data?.error?.message ?? 'Failed to load invoices.';
+      document.getElementById('invoice-error').style.display = 'block';
+      return;
+    }
+
+    const invoices = data.invoices || [];
+    if (invoices.length === 0) {
+      document.getElementById('invoice-empty').style.display = 'block';
+      return;
+    }
+
+    const tbody = document.getElementById('invoice-tbody');
+    tbody.innerHTML = invoices.map(inv => `
+      <tr>
+        <td style="white-space:nowrap;">${escHtml((inv.paid_at || '').slice(0,10))}</td>
+        <td><code style="font-size:11px;color:#9a9aaa;">${escHtml(inv.reference.slice(0,16))}…</code></td>
+        <td><span class="badge badge-active">${escHtml(inv.plan || 'starter')}</span></td>
+        <td style="text-align:right;color:#10b981;font-weight:600;">${escHtml(inv.amount_display)}</td>
+        <td style="text-align:center;">
+          <div style="display:flex;gap:6px;justify-content:center;">
+            <a href="/billing/invoice/${encodeURIComponent(inv.reference)}/download"
+               style="font-size:10px;font-family:'IBM Plex Mono',monospace;color:#6b6b7a;border:1px solid #232329;border-radius:4px;padding:3px 8px;text-decoration:none;transition:color .12s,border-color .12s;"
+               onmouseover="this.style.color='#10b981';this.style.borderColor='#10b98144'"
+               onmouseout="this.style.color='#6b6b7a';this.style.borderColor='#232329'"
+               download>⬇ Download</a>
+            <button onclick="emailInvoice('${escHtml(inv.reference)}', this)"
+               style="font-size:10px;font-family:'IBM Plex Mono',monospace;color:#6b6b7a;background:none;border:1px solid #232329;border-radius:4px;padding:3px 8px;cursor:pointer;transition:color .12s,border-color .12s;"
+               onmouseover="this.style.color='#10b981';this.style.borderColor='#10b98144'"
+               onmouseout="this.style.color='#6b6b7a';this.style.borderColor='#232329'">✉ Email</button>
+          </div>
+        </td>
+      </tr>`).join('');
+
+    document.getElementById('invoice-table-wrap').style.display = 'block';
+    window._invoicesLoaded = true;
+  } catch (err) {
+    document.getElementById('invoice-loading').style.display  = 'none';
+    document.getElementById('invoice-error').textContent      = 'Network error: ' + err.message;
+    document.getElementById('invoice-error').style.display    = 'block';
+  }
+}
+
+async function emailInvoice(reference, btn) {
+  const prev = btn.textContent;
+  btn.textContent = '…';
+  btn.disabled    = true;
+  try {
+    const res = await fetch(`/billing/invoice/${encodeURIComponent(reference)}/email`, {
+      method: 'POST', credentials: 'include',
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`Invoice sent to ${data.sent_to}`);
+      btn.textContent = '✓ Sent';
+    } else {
+      showToast('Failed: ' + (data?.error?.message ?? res.status));
+      btn.textContent = prev;
+    }
+  } catch (err) {
+    showToast('Network error: ' + err.message);
+    btn.textContent = prev;
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -529,40 +717,32 @@ async function reissueKey(env) {
 // ════════════════════════════════════════════════════════
 let _revealTimer = null;
 function revealLiveKey(btn) {
-  const wrap = document.getElementById('live-key-wrap');
+  const wrap       = document.getElementById('live-key-wrap');
   const isRevealed = wrap.classList.contains('is-revealed');
-
-  if (isRevealed) {
-    wrap.classList.remove('is-revealed');
-    btn.textContent = 'Reveal';
-    if (_revealTimer) clearTimeout(_revealTimer);
-  } else {
-    wrap.classList.add('is-revealed');
-    btn.textContent = 'Hide';
-    if (_revealTimer) clearTimeout(_revealTimer);
+  wrap.classList.toggle('is-revealed', !isRevealed);
+  btn.textContent = isRevealed ? 'Reveal' : 'Hide';
+  if (_revealTimer) clearTimeout(_revealTimer);
+  if (!isRevealed) {
     _revealTimer = setTimeout(() => {
       wrap.classList.remove('is-revealed');
       btn.textContent = 'Reveal';
-      showToast('Live key automatically hidden after 15 seconds.');
+      showToast('Live key hidden after 15 seconds.');
     }, 15_000);
   }
 }
 
 // ════════════════════════════════════════════════════════
-// Clipboard
+// Utilities
 // ════════════════════════════════════════════════════════
 function copyText(text, btn) {
   navigator.clipboard.writeText(text).then(() => {
     const prev = btn.textContent;
     btn.textContent = '✓ Copied';
     setTimeout(() => btn.textContent = prev, 1500);
-    showToast(`Copied: ${text.slice(0, 20)}…`);
+    showToast('Copied.');
   });
 }
 
-// ════════════════════════════════════════════════════════
-// Toast
-// ════════════════════════════════════════════════════════
 let _toastTimer = null;
 function showToast(msg) {
   const el = document.getElementById('toast');
@@ -579,9 +759,14 @@ function escHtml(s) {
 }
 
 // ════════════════════════════════════════════════════════
-// Boot — apply server-persisted default (Q4)
+// Boot
 // ════════════════════════════════════════════════════════
-switchEnv(DEFAULT_ENV, false);  // false = don't re-persist on initial load
+switchEnv(DEFAULT_ENV, false);
+
+// If redirected back from Paystack with ?billing=success, open billing tab
+{% if billing_alert %}
+switchTab('billing');
+{% endif %}
 </script>
 </body>
 </html>
