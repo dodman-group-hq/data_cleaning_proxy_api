@@ -1773,9 +1773,40 @@ async def billing_subscribe(
 
     callback_url = f"{APP_BASE_URL}/billing/callback"
 
+    # Fetch the plan from Paystack to get the amount — required by
+    # /transaction/initialize even when a plan code is provided.
+    # Paystack returns amount in the smallest currency unit (e.g. kobo).
+    try:
+        plan_data   = await _paystack_get(f"/plan/{plan_code}")
+        plan_amount = plan_data.get("data", {}).get("amount", 0)
+        if not plan_amount or plan_amount <= 0:
+            raise HTTPException(
+                status_code=503,
+                detail=_error_envelope(
+                    "CONFIGURATION_ERROR",
+                    f"Could not determine plan amount for '{plan_key}'. "
+                    "Check that the plan code is correct in your Paystack dashboard.",
+                    _get_request_id(request),
+                ),
+            )
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:
+        log.error("Paystack plan fetch failed: %s", exc.response.text)
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Could not retrieve plan details from Paystack. "
+                "Verify your plan code in PAYSTACK_PLAN_STARTER / PAYSTACK_PLAN_PRO.",
+                _get_request_id(request),
+            ),
+        )
+
     try:
         data = await _paystack_post("/transaction/initialize", {
             "email":        current_user["email"],
+            "amount":       plan_amount,   # required — in smallest currency unit
             "plan":         plan_code,
             "callback_url": callback_url,
             "metadata": {
@@ -1844,6 +1875,11 @@ async def billing_callback(
     sub      = tx.get("subscription", {}) or {}
     customer = tx.get("customer",     {}) or {}
     plan     = tx.get("plan",         {}) or {}
+
+    # Paystack sometimes returns "plan" as a bare plan-code string rather than
+    # an object.  Normalise to a dict so .get() calls below are always safe.
+    if isinstance(plan, str):
+        plan = {"plan_code": plan}
 
     plan_code = plan.get("plan_code", "")
     plan_name = _plan_name_from_code(plan_code)
@@ -1956,6 +1992,12 @@ async def billing_webhook(
     cust_email  = customer.get("email", "")
     cust_id     = str(customer.get("id", ""))
     plan        = data.get("plan", {}) or {}
+
+    # Paystack sometimes returns "plan" as a bare plan-code string rather than
+    # an object.  Normalise to a dict so .get() calls below are always safe.
+    if isinstance(plan, str):
+        plan = {"plan_code": plan}
+
     plan_code   = plan.get("plan_code", "")
     plan_name   = _plan_name_from_code(plan_code)
 
@@ -2128,22 +2170,44 @@ async def billing_portal(
 
 
 # ---------------------------------------------------------------------------
-# GET /billing/invoices — list invoices for the current user
-# Fetches from Paystack /transaction list filtered to successful charges
-# and adds an invoice download link for each.
+# GET /billing/invoices — invoices scoped strictly to the authenticated user.
+#
+# Ownership is enforced at two levels:
+#   1. Paystack query filtered by the user's registered email address
+#   2. Each transaction's customer email is verified against current_user
+#      before inclusion — so even if Paystack returns unexpected rows,
+#      they are stripped out before the response is sent.
+#
+# This endpoint is for dashboard use only.
+# Admin-wide invoice listing is at GET /billing/admin/invoices (godkey only).
 # ---------------------------------------------------------------------------
 
-@billing_router.get("/invoices", summary="List all paid invoices for this account")
+@billing_router.get("/invoices", summary="List paid invoices for the authenticated user only")
 async def billing_invoices(
     request:      Request,
-    current_user: dict = Depends(get_current_user),
-    page:         int  = 1,
-    per_page:     int  = 20,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+    page:         int          = 1,
+    per_page:     int          = 20,
 ) -> JSONResponse:
+    user_email = current_user["email"].lower().strip()
+
+    # Confirm the user has a subscription row before hitting Paystack —
+    # avoids unnecessary external calls for users who never subscribed.
+    async with pool.acquire() as conn:
+        sub_row = await conn.fetchrow(
+            "SELECT paystack_customer_id FROM subscriptions WHERE user_id = $1",
+            uuid.UUID(current_user["id"]),
+        )
+
+    if not sub_row:
+        # No subscription record at all — return empty list, not an error.
+        return JSONResponse(content={"invoices": [], "total": 0, "page": page, "pages": 1})
+
     try:
         data = await _paystack_get(
-            f"/transaction?email={current_user['email']}"
-            f"&page={page}&perPage={min(per_page,100)}&status=success"
+            f"/transaction?email={user_email}"
+            f"&page={page}&perPage={min(per_page, 100)}&status=success"
         )
     except httpx.HTTPStatusError:
         raise HTTPException(
@@ -2158,21 +2222,113 @@ async def billing_invoices(
     raw  = data.get("data", []) or []
     meta = data.get("meta", {})
 
-    invoices = [
-        {
+    invoices = []
+    for tx in raw:
+        # Double-check ownership: strip any row whose customer email
+        # does not exactly match the authenticated user.
+        tx_customer = tx.get("customer", {}) or {}
+        tx_email    = (tx_customer.get("email") or "").lower().strip()
+        if tx_email and tx_email != user_email:
+            log.warning(
+                "billing_invoices: email mismatch — user=%s tx_email=%s ref=%s",
+                user_email, tx_email, tx.get("reference", ""),
+            )
+            continue
+
+        invoices.append({
             "reference":      tx.get("reference", ""),
             "amount_minor":   tx.get("amount", 0),
-            "amount_display": f"{tx.get('currency','')} {tx.get('amount',0)/100:,.2f}",
+            "amount_display": f"{tx.get('currency', '')} {tx.get('amount', 0) / 100:,.2f}",
             "currency":       tx.get("currency", ""),
             "paid_at":        tx.get("paid_at") or tx.get("paidAt"),
             "plan":           _plan_name_from_code(
-                                  (tx.get("plan") or {}).get("plan_code", "")
+                                  tx.get("plan") if isinstance(tx.get("plan"), str)
+                                  else (tx.get("plan") or {}).get("plan_code", "")
                               ),
-            "download_url":   f"/billing/invoice/{tx.get('reference','')}/download",
-            "email_url":      f"/billing/invoice/{tx.get('reference','')}/email",
-        }
+            "download_url":   f"/billing/invoice/{tx.get('reference', '')}/download",
+            "email_url":      f"/billing/invoice/{tx.get('reference', '')}/email",
+        })
+
+    return JSONResponse(content={
+        "invoices": invoices,
+        "total":    meta.get("total", len(invoices)),
+        "page":     page,
+        "pages":    meta.get("pageCount", 1),
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /billing/admin/invoices — all invoices across all users (admin/godkey)
+# Protected by X-Internal-Secret. Never exposed in the user dashboard.
+# ---------------------------------------------------------------------------
+
+@billing_router.get(
+    "/admin/invoices",
+    summary="List all invoices across all users — admin only",
+    dependencies=[Depends(verify_internal_secret)],
+)
+async def billing_admin_invoices(
+    request:  Request,
+    pool:     asyncpg.Pool = Depends(get_pool),
+    page:     int          = 1,
+    per_page: int          = 50,
+) -> JSONResponse:
+    """
+    Returns paginated Paystack transaction history for every customer,
+    joined with local user data so each row includes user_id and email.
+
+    Protected by X-Internal-Secret — godkey dashboard use only.
+    """
+    try:
+        data = await _paystack_get(
+            f"/transaction?page={page}&perPage={min(per_page, 100)}&status=success"
+        )
+    except httpx.HTTPStatusError:
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Could not fetch transactions from Paystack.",
+                _get_request_id(request),
+            ),
+        )
+
+    raw  = data.get("data", []) or []
+    meta = data.get("meta", {})
+
+    # Build a lookup of email → user_id from our local users table
+    emails = list({
+        (tx.get("customer") or {}).get("email", "").lower()
         for tx in raw
-    ]
+        if (tx.get("customer") or {}).get("email")
+    })
+    email_to_uid: dict[str, str] = {}
+    if emails:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, email FROM users WHERE email = ANY($1::text[])",
+                emails,
+            )
+        email_to_uid = {r["email"].lower(): str(r["id"]) for r in rows}
+
+    invoices = []
+    for tx in raw:
+        cust      = tx.get("customer", {}) or {}
+        cust_email = (cust.get("email") or "").lower()
+        invoices.append({
+            "reference":      tx.get("reference", ""),
+            "amount_minor":   tx.get("amount", 0),
+            "amount_display": f"{tx.get('currency', '')} {tx.get('amount', 0) / 100:,.2f}",
+            "currency":       tx.get("currency", ""),
+            "paid_at":        tx.get("paid_at") or tx.get("paidAt"),
+            "plan":           _plan_name_from_code(
+                                  tx.get("plan") if isinstance(tx.get("plan"), str)
+                                  else (tx.get("plan") or {}).get("plan_code", "")
+                              ),
+            "customer_email": cust_email,
+            "user_id":        email_to_uid.get(cust_email, None),
+            "channel":        tx.get("channel", ""),
+        })
 
     return JSONResponse(content={
         "invoices": invoices,
@@ -2216,6 +2372,8 @@ async def invoice_download(
 
     plan      = tx.get("plan", {}) or {}
     sub       = tx.get("subscription", {}) or {}
+    if isinstance(plan, str):
+        plan = {"plan_code": plan}
     plan_name = _plan_name_from_code(plan.get("plan_code", ""))
 
     html = _build_invoice_html(
@@ -2275,6 +2433,8 @@ async def invoice_email(
 
     plan      = tx.get("plan", {}) or {}
     sub       = tx.get("subscription", {}) or {}
+    if isinstance(plan, str):
+        plan = {"plan_code": plan}
     plan_name = _plan_name_from_code(plan.get("plan_code", ""))
 
     asyncio.ensure_future(_send_invoice_email(
@@ -2358,6 +2518,11 @@ async def billing_verify(
     sub      = tx.get("subscription", {}) or {}
     customer = tx.get("customer",     {}) or {}
     plan     = tx.get("plan",         {}) or {}
+
+    # Paystack sometimes returns "plan" as a bare plan-code string rather than
+    # an object.  Normalise to a dict so .get() calls below are always safe.
+    if isinstance(plan, str):
+        plan = {"plan_code": plan}
 
     plan_code = plan.get("plan_code", "")
     plan_name = _plan_name_from_code(plan_code)
@@ -2491,7 +2656,8 @@ async def billing_transactions(
             "currency":       tx.get("currency", ""),
             "paid_at":        tx.get("paid_at") or tx.get("paidAt"),
             "channel":        tx.get("channel", ""),
-            "plan_code":      (tx.get("plan", {}) or {}).get("plan_code", ""),
+            "plan_code":      tx.get("plan") if isinstance(tx.get("plan"), str)
+                              else (tx.get("plan", {}) or {}).get("plan_code", ""),
         }
         for tx in raw_list
     ]
