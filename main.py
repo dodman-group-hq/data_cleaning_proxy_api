@@ -41,6 +41,7 @@ from typing import Any, Callable
 import asyncpg
 import httpx
 import openpyxl
+import pdfkit
 from dotenv import load_dotenv
 from fastapi import (
     APIRouter, BackgroundTasks, Cookie, Depends, FastAPI,
@@ -1616,6 +1617,21 @@ async def _send_email(
 # Invoice HTML builder
 # ---------------------------------------------------------------------------
 
+def _fmt_invoice_date(val: str) -> str:
+    """Format an ISO timestamp or date string to 'DD Mon YYYY', or return '—'."""
+    if not val:
+        return "—"
+    try:
+        dt = datetime.datetime.fromisoformat(val.replace("Z", "+00:00"))
+        return dt.strftime("%d %b %Y")
+    except Exception:
+        # val may already be a plain date string like "2025-06-01"
+        try:
+            return datetime.datetime.strptime(val[:10], "%Y-%m-%d").strftime("%d %b %Y")
+        except Exception:
+            return val[:10] if len(val) >= 10 else val
+
+
 def _build_invoice_html(
     invoice_ref:  str,
     user_email:   str,
@@ -1626,53 +1642,127 @@ def _build_invoice_html(
     period_start: str,
     period_end:   str,
 ) -> str:
-    """Render a clean HTML invoice suitable for both email and browser download."""
-    amount_display = f"{currency} {amount_minor / 100:,.2f}"
-    now_str        = datetime.datetime.utcnow().strftime("%d %B %Y")
-    plan_display   = plan.title()
+    """
+    Render a fully inline-styled HTML invoice.
+    Inline styles are used throughout so the output renders correctly in both
+    PDF converters (wkhtmltopdf) and email clients (Gmail, Outlook, Apple Mail)
+    that strip <style> blocks.
+    """
+    amount_display  = f"{currency} {amount_minor / 100:,.2f}"
+    now_str         = datetime.datetime.utcnow().strftime("%d %B %Y")
+    plan_display    = plan.title() if plan else "—"
+    paid_at_display = _fmt_invoice_date(paid_at) if paid_at else "—"
+    ps_display      = _fmt_invoice_date(period_start)
+    pe_display      = _fmt_invoice_date(period_end)
+
+    # Shared inline style fragments
+    _S_BODY  = "font-family:'IBM Plex Mono',Courier,monospace;background:#07070a;color:#d0d0e0;margin:0;padding:40px;"
+    _S_CARD  = "max-width:600px;margin:0 auto;background:#0f0f12;border:1px solid #232329;border-radius:12px;overflow:hidden;"
+    _S_HDR   = "background:#16161a;padding:28px 32px;border-bottom:1px solid #232329;"
+    _S_BRAND = "font-size:11px;letter-spacing:.3em;text-transform:uppercase;color:#f59e0b;margin:0 0 6px 0;"
+    _S_TITLE = "font-size:22px;font-weight:700;color:#ffffff;margin:0;"
+    _S_BODYD = "padding:28px 32px;"
+    _S_AMT   = "font-size:26px;font-weight:700;color:#10b981;text-align:center;padding:16px 0 24px;"
+    _S_ROW   = "display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #16161a;font-size:13px;"
+    _S_ROW_L = "display:flex;justify-content:space-between;padding:10px 0;font-size:13px;"  # last row — no border
+    _S_LBL   = "color:#6b6b7a;"
+    _S_VAL   = "color:#d0d0e0;text-align:right;"
+    _S_MONO  = "color:#d0d0e0;text-align:right;font-family:'IBM Plex Mono',Courier,monospace;font-size:12px;"
+    _S_BADGE = ("display:inline-block;background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);"
+                "color:#10b981;font-size:10px;padding:3px 10px;border-radius:4px;"
+                "letter-spacing:.08em;text-transform:uppercase;")
+    _S_FTR   = "padding:18px 32px;border-top:1px solid #232329;font-size:11px;color:#3a3a44;text-align:center;"
+
+    def row(label: str, value: str, last: bool = False, mono_val: bool = False) -> str:
+        val_style = _S_MONO if mono_val else _S_VAL
+        return (
+            f'<div style="{_S_ROW_L if last else _S_ROW}">'
+            f'<span style="{_S_LBL}">{label}</span>'
+            f'<span style="{val_style}">{value}</span>'
+            f'</div>'
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<style>
-  body{{font-family:'IBM Plex Mono',monospace,sans-serif;background:#07070a;color:#d0d0e0;margin:0;padding:40px;}}
-  .card{{max-width:600px;margin:0 auto;background:#0f0f12;border:1px solid #232329;border-radius:12px;overflow:hidden;}}
-  .hdr{{background:#16161a;padding:28px 32px;border-bottom:1px solid #232329;}}
-  .brand{{font-size:11px;letter-spacing:.3em;text-transform:uppercase;color:#f59e0b;margin-bottom:6px;}}
-  .title{{font-size:22px;font-weight:700;color:#fff;margin:0;}}
-  .body{{padding:28px 32px;}}
-  .row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #16161a;font-size:13px;}}
-  .row:last-child{{border-bottom:none;}}
-  .label{{color:#6b6b7a;}}
-  .value{{color:#d0d0e0;text-align:right;}}
-  .amount{{font-size:24px;font-weight:700;color:#10b981;text-align:center;padding:20px 0;}}
-  .footer{{padding:18px 32px;border-top:1px solid #232329;font-size:11px;color:#3a3a44;text-align:center;}}
-  .badge{{display:inline-block;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);
-          color:#10b981;font-size:10px;padding:3px 10px;border-radius:4px;letter-spacing:.08em;text-transform:uppercase;}}
-</style>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Invoice {invoice_ref[:12]}</title>
 </head>
-<body>
-<div class="card">
-  <div class="hdr">
-    <p class="brand">Dodman Group</p>
-    <p class="title">Invoice</p>
+<body style="{_S_BODY}">
+<div style="{_S_CARD}">
+  <div style="{_S_HDR}">
+    <p style="{_S_BRAND}">Dodman Group</p>
+    <p style="{_S_TITLE}">Invoice</p>
   </div>
-  <div class="body">
-    <div class="amount">{amount_display}</div>
-    <div class="row"><span class="label">Reference</span><span class="value" style="font-family:monospace;">{invoice_ref}</span></div>
-    <div class="row"><span class="label">Status</span><span class="value"><span class="badge">Paid</span></span></div>
-    <div class="row"><span class="label">Billed to</span><span class="value">{user_email}</span></div>
-    <div class="row"><span class="label">Plan</span><span class="value">{plan_display}</span></div>
-    <div class="row"><span class="label">Paid at</span><span class="value">{paid_at[:19].replace("T"," ")}</span></div>
-    <div class="row"><span class="label">Period start</span><span class="value">{period_start[:10] if period_start else "—"}</span></div>
-    <div class="row"><span class="label">Period end</span><span class="value">{period_end[:10] if period_end else "—"}</span></div>
-    <div class="row"><span class="label">Invoice date</span><span class="value">{now_str}</span></div>
+  <div style="{_S_BODYD}">
+    <div style="{_S_AMT}">{amount_display}</div>
+    {row("Reference",    invoice_ref,    mono_val=True)}
+    {row("Status",       f'<span style="{_S_BADGE}">Paid</span>')}
+    {row("Billed to",    user_email)}
+    {row("Plan",         plan_display)}
+    {row("Paid on",      paid_at_display)}
+    {row("Period start", ps_display)}
+    {row("Period end",   pe_display)}
+    {row("Invoice date", now_str, last=True)}
   </div>
-  <div class="footer">Dodman Group · Data Cleaning Proxy API · {RESEND_FROM}</div>
+  <div style="{_S_FTR}">Dodman Group &middot; Data Cleaning Proxy API &middot; {RESEND_FROM}</div>
 </div>
 </body>
 </html>"""
+
+
+def _resolve_period_dates(tx: dict, sub: dict, plan: dict) -> tuple[str, str]:
+    """
+    Return (period_start, period_end) as ISO strings, using the best available
+    source from the Paystack transaction object.
+
+    Priority:
+      1. Subscription object fields (createdAt / next_payment_date) — most accurate
+      2. paid_at  as start + plan interval as end (typical for new subscriptions
+         where the sub object hasn't fully populated yet)
+      3. Empty strings (rendered as "—" by the invoice builder)
+    """
+    # 1 — subscription object
+    ps = sub.get("createdAt") or sub.get("created_at") or ""
+    pe = sub.get("next_payment_date") or sub.get("nextPaymentDate") or ""
+
+    if ps and pe:
+        return ps, pe
+
+    # 2 — derive from paid_at + plan interval
+    paid_at_raw = tx.get("paid_at") or tx.get("paidAt") or ""
+    if paid_at_raw:
+        try:
+            start_dt = datetime.datetime.fromisoformat(paid_at_raw.replace("Z", "+00:00"))
+            ps = start_dt.isoformat()
+
+            # Determine billing interval from plan object
+            interval = (plan.get("interval") or "monthly").lower()
+            if interval in ("annually", "yearly"):
+                end_dt = start_dt.replace(year=start_dt.year + 1)
+            elif interval == "quarterly":
+                # Add ~91 days
+                end_dt = start_dt + datetime.timedelta(days=91)
+            elif interval in ("weekly",):
+                end_dt = start_dt + datetime.timedelta(weeks=1)
+            else:
+                # Default: monthly — advance one month
+                month = start_dt.month + 1
+                year  = start_dt.year + (month - 1) // 12
+                month = ((month - 1) % 12) + 1
+                try:
+                    end_dt = start_dt.replace(year=year, month=month)
+                except ValueError:
+                    # e.g. Jan 31 → Feb 28
+                    import calendar
+                    last_day = calendar.monthrange(year, month)[1]
+                    end_dt = start_dt.replace(year=year, month=month, day=last_day)
+            pe = end_dt.isoformat()
+        except Exception:
+            pass
+
+    return ps, pe
 
 
 async def _send_invoice_email(
@@ -1893,6 +1983,8 @@ async def billing_callback(
         except Exception:
             return None
 
+    period_start_str, period_end_str = _resolve_period_dates(tx, sub, plan)
+
     await _upsert_subscription(
         pool,
         current_user["id"],
@@ -1900,8 +1992,8 @@ async def billing_callback(
         subscription_id=str(sub.get("id", "")),
         plan_code=plan_code,
         status="active",
-        period_start=_parse_dt(sub.get("createdAt")),
-        period_end=_parse_dt(sub.get("next_payment_date")),
+        period_start=_parse_dt(period_start_str),
+        period_end=_parse_dt(period_end_str),
         plan_name=plan_name,
         raw_event=tx,
     )
@@ -1931,8 +2023,8 @@ async def billing_callback(
         amount_minor=tx.get("amount", 0),
         currency=tx.get("currency", ""),
         paid_at=tx.get("paid_at") or tx.get("paidAt") or "",
-        period_start=sub.get("createdAt") or "",
-        period_end=sub.get("next_payment_date") or "",
+        period_start=period_start_str,
+        period_end=period_end_str,
     ))
 
     log.info("Subscription activated: user=%s plan=%s", current_user["id"], plan_name)
@@ -2376,6 +2468,8 @@ async def invoice_download(
         plan = {"plan_code": plan}
     plan_name = _plan_name_from_code(plan.get("plan_code", ""))
 
+    period_start, period_end = _resolve_period_dates(tx, sub, plan)
+
     html = _build_invoice_html(
         invoice_ref=reference,
         user_email=current_user["email"],
@@ -2383,8 +2477,8 @@ async def invoice_download(
         amount_minor=tx.get("amount", 0),
         currency=tx.get("currency", ""),
         paid_at=tx.get("paid_at") or tx.get("paidAt") or "",
-        period_start=sub.get("createdAt") or "",
-        period_end=sub.get("next_payment_date") or "",
+        period_start=period_start,
+        period_end=period_end,
     )
 
     asyncio.ensure_future(_write_audit_log(
@@ -2394,11 +2488,37 @@ async def invoice_download(
         details={"reference": reference},
     ))
 
-    return Response(
-        content=html.encode(),
-        media_type="text/html",
-        headers={"Content-Disposition": f"attachment; filename=invoice-{reference[:12]}.html"},
-    )
+    # Convert HTML → PDF using wkhtmltopdf (via pdfkit)
+    try:
+        pdf_bytes = pdfkit.from_string(
+            html,
+            False,  # False = return bytes, not write to file
+            options={
+                "page-size":       "A4",
+                "margin-top":      "0mm",
+                "margin-right":    "0mm",
+                "margin-bottom":   "0mm",
+                "margin-left":     "0mm",
+                "encoding":        "UTF-8",
+                "enable-local-file-access": "",
+                "background":      "",          # render background colours
+                "print-media-type": "",
+                "quiet":           "",
+            },
+        )
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=invoice-{reference[:12]}.pdf"},
+        )
+    except Exception:
+        log.exception("PDF generation failed for reference=%s — falling back to HTML", reference)
+        # Graceful fallback: serve the HTML so the user isn't left with an error
+        return Response(
+            content=html.encode(),
+            media_type="text/html",
+            headers={"Content-Disposition": f"attachment; filename=invoice-{reference[:12]}.html"},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2437,6 +2557,8 @@ async def invoice_email(
         plan = {"plan_code": plan}
     plan_name = _plan_name_from_code(plan.get("plan_code", ""))
 
+    period_start, period_end = _resolve_period_dates(tx, sub, plan)
+
     asyncio.ensure_future(_send_invoice_email(
         to=current_user["email"],
         invoice_ref=reference,
@@ -2444,8 +2566,8 @@ async def invoice_email(
         amount_minor=tx.get("amount", 0),
         currency=tx.get("currency", ""),
         paid_at=tx.get("paid_at") or tx.get("paidAt") or "",
-        period_start=sub.get("createdAt") or "",
-        period_end=sub.get("next_payment_date") or "",
+        period_start=period_start,
+        period_end=period_end,
     ))
 
     asyncio.ensure_future(_write_audit_log(
@@ -2535,6 +2657,8 @@ async def billing_verify(
         except Exception:
             return None
 
+    period_start_str, period_end_str = _resolve_period_dates(tx, sub, plan)
+
     synced = False
     if tx_status == "success":
         # Only sync if this transaction belongs to the requesting user
@@ -2555,8 +2679,8 @@ async def billing_verify(
             subscription_id=str(sub.get("id", "")),
             plan_code=plan_code,
             status="active",
-            period_start=_parse_dt(paid_at),
-            period_end=_parse_dt(sub.get("next_payment_date")),
+            period_start=_parse_dt(period_start_str),
+            period_end=_parse_dt(period_end_str),
             plan_name=plan_name,
             raw_event=tx,
         )
