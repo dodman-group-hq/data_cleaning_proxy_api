@@ -41,7 +41,12 @@ from typing import Any, Callable
 import asyncpg
 import httpx
 import openpyxl
-import pdfkit
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from dotenv import load_dotenv
 from fastapi import (
     APIRouter, BackgroundTasks, Cookie, Depends, FastAPI,
@@ -1649,7 +1654,7 @@ def _build_invoice_html(
     that strip <style> blocks.
     """
     amount_display  = f"{currency} {amount_minor / 100:,.2f}"
-    now_str         = datetime.datetime.utcnow().strftime("%d %B %Y")
+    now_str         = datetime.datetime.now(datetime.timezone.utc).strftime("%d %B %Y")
     plan_display    = plan.title() if plan else "—"
     paid_at_display = _fmt_invoice_date(paid_at) if paid_at else "—"
     ps_display      = _fmt_invoice_date(period_start)
@@ -1710,6 +1715,164 @@ def _build_invoice_html(
 </div>
 </body>
 </html>"""
+
+
+def _build_invoice_pdf(
+    invoice_ref:  str,
+    user_email:   str,
+    plan:         str,
+    amount_minor: int,
+    currency:     str,
+    paid_at:      str,
+    period_start: str,
+    period_end:   str,
+) -> bytes:
+    """
+    Build a styled A4 PDF invoice using reportlab (pure Python, no binaries).
+    Returns raw PDF bytes.
+    """
+    buf = io.BytesIO()
+
+    # ── Colours ──────────────────────────────────────────────────────────────
+    C_BG        = colors.HexColor("#07070a")
+    C_CARD      = colors.HexColor("#0f0f12")
+    C_BORDER    = colors.HexColor("#232329")
+    C_HDR_BG    = colors.HexColor("#16161a")
+    C_AMBER     = colors.HexColor("#f59e0b")
+    C_WHITE     = colors.HexColor("#ffffff")
+    C_MUTED     = colors.HexColor("#6b6b7a")
+    C_BODY      = colors.HexColor("#d0d0e0")
+    C_GREEN     = colors.HexColor("#10b981")
+    C_ROW_ALT   = colors.HexColor("#0d0d10")
+    C_BADGE_BG  = colors.HexColor("#0d2e22")
+    C_BADGE_BDR = colors.HexColor("#1a5c3a")
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    def ps(name, **kw) -> ParagraphStyle:
+        defaults = dict(fontName="Courier", fontSize=10, textColor=C_BODY,
+                        leading=14, spaceAfter=0)
+        defaults.update(kw)
+        return ParagraphStyle(name, **defaults)
+
+    S_BRAND    = ps("brand",   fontSize=8,  textColor=C_AMBER,  spaceAfter=2)
+    S_TITLE    = ps("title",   fontSize=20, textColor=C_WHITE,  fontName="Courier-Bold")
+    S_AMOUNT   = ps("amount",  fontSize=26, textColor=C_GREEN,  fontName="Courier-Bold",
+                               alignment=TA_CENTER, spaceAfter=4)
+    S_LABEL    = ps("label",   fontSize=10, textColor=C_MUTED,  alignment=TA_LEFT)
+    S_VALUE    = ps("value",   fontSize=10, textColor=C_BODY,   alignment=TA_RIGHT)
+    S_MONO     = ps("mono",    fontSize=9,  textColor=C_BODY,   alignment=TA_RIGHT)
+    S_BADGE    = ps("badge",   fontSize=8,  textColor=C_GREEN,  alignment=TA_RIGHT,
+                               fontName="Courier-Bold")
+    S_FOOTER   = ps("footer",  fontSize=8,  textColor=C_MUTED,  alignment=TA_CENTER)
+
+    # ── Derived values ────────────────────────────────────────────────────────
+    amount_display  = f"{currency} {amount_minor / 100:,.2f}"
+    now_str         = datetime.datetime.now(datetime.timezone.utc).strftime("%d %B %Y")
+    plan_display    = plan.title() if plan else "—"
+    paid_at_display = _fmt_invoice_date(paid_at)
+    ps_display      = _fmt_invoice_date(period_start)
+    pe_display      = _fmt_invoice_date(period_end)
+
+    # ── Page setup ────────────────────────────────────────────────────────────
+    W, H  = A4
+    LEFT  = RIGHT = TOP = BOT = 20 * mm
+    doc   = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=LEFT, rightMargin=RIGHT,
+        topMargin=TOP,   bottomMargin=BOT,
+    )
+
+    card_w = W - LEFT - RIGHT
+
+    # ── Background canvas callback ────────────────────────────────────────────
+    def _draw_bg(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(C_BG)
+        canvas.rect(0, 0, W, H, fill=1, stroke=0)
+        # Card background
+        card_x = LEFT - 6 * mm
+        card_y = BOT - 6 * mm
+        card_w2 = W - LEFT - RIGHT + 12 * mm
+        card_h2 = H - TOP - BOT + 12 * mm
+        canvas.setFillColor(C_CARD)
+        canvas.setStrokeColor(C_BORDER)
+        canvas.roundRect(card_x, card_y, card_w2, card_h2, 6, fill=1, stroke=1)
+        # Header band
+        hdr_h = 22 * mm
+        canvas.setFillColor(C_HDR_BG)
+        canvas.roundRect(card_x, H - TOP - hdr_h + 6 * mm, card_w2, hdr_h + 6 * mm,
+                         6, fill=1, stroke=0)
+        # Clip the bottom corners of the header rectangle flat
+        canvas.setFillColor(C_HDR_BG)
+        canvas.rect(card_x, H - TOP - hdr_h, card_w2, 6 * mm + 1, fill=1, stroke=0)
+        # Header bottom border line
+        canvas.setStrokeColor(C_BORDER)
+        canvas.setLineWidth(0.5)
+        canvas.line(card_x, H - TOP - hdr_h, card_x + card_w2, H - TOP - hdr_h)
+        canvas.restoreState()
+
+    # ── Story ─────────────────────────────────────────────────────────────────
+    story = []
+
+    # Header
+    story.append(Spacer(1, 2 * mm))
+    story.append(Paragraph("DODMAN GROUP", S_BRAND))
+    story.append(Paragraph("Invoice", S_TITLE))
+    story.append(Spacer(1, 10 * mm))
+
+    # Amount
+    story.append(Paragraph(amount_display, S_AMOUNT))
+    story.append(Spacer(1, 4 * mm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=C_BORDER))
+    story.append(Spacer(1, 2 * mm))
+
+    # Detail rows — alternating background via TableStyle
+    rows = [
+        ("Reference",    Paragraph(invoice_ref,   S_MONO)),
+        ("Status",       Paragraph("PAID",         S_BADGE)),
+        ("Billed to",    Paragraph(user_email,     S_VALUE)),
+        ("Plan",         Paragraph(plan_display,   S_VALUE)),
+        ("Paid on",      Paragraph(paid_at_display, S_VALUE)),
+        ("Period start", Paragraph(ps_display,     S_VALUE)),
+        ("Period end",   Paragraph(pe_display,     S_VALUE)),
+        ("Invoice date", Paragraph(now_str,        S_VALUE)),
+    ]
+    table_data = [
+        [Paragraph(label, S_LABEL), val]
+        for label, val in rows
+    ]
+
+    col_w = [card_w * 0.38, card_w * 0.62]
+    tbl = Table(table_data, colWidths=col_w, repeatRows=0)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, -1),  C_CARD),
+        ("BACKGROUND",  (0, 1), (-1, 1),   C_ROW_ALT),
+        ("BACKGROUND",  (0, 3), (-1, 3),   C_ROW_ALT),
+        ("BACKGROUND",  (0, 5), (-1, 5),   C_ROW_ALT),
+        ("BACKGROUND",  (0, 7), (-1, 7),   C_ROW_ALT),
+        # Badge cell highlight
+        ("BACKGROUND",  (1, 1), (1, 1),    C_BADGE_BG),
+        ("BOX",         (1, 1), (1, 1),    0.5, C_BADGE_BDR),
+        ("LINEBELOW",   (0, 0), (-1, -2),  0.5, C_BORDER),
+        ("TOPPADDING",  (0, 0), (-1, -1),  6),
+        ("BOTTOMPADDING",(0,0), (-1, -1),  6),
+        ("LEFTPADDING", (0, 0), (-1, -1),  4),
+        ("RIGHTPADDING",(0, 0), (-1, -1),  4),
+        ("VALIGN",      (0, 0), (-1, -1),  "MIDDLE"),
+    ]))
+    story.append(tbl)
+
+    story.append(Spacer(1, 6 * mm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=C_BORDER))
+    story.append(Spacer(1, 3 * mm))
+    story.append(Paragraph(
+        f"Dodman Group · Data Cleaning Proxy API · {RESEND_FROM}",
+        S_FOOTER,
+    ))
+
+    doc.build(story, onFirstPage=_draw_bg, onLaterPages=_draw_bg)
+    return buf.getvalue()
 
 
 def _resolve_period_dates(tx: dict, sub: dict, plan: dict) -> tuple[str, str]:
@@ -2488,23 +2651,17 @@ async def invoice_download(
         details={"reference": reference},
     ))
 
-    # Convert HTML → PDF using wkhtmltopdf (via pdfkit)
+    # Convert to PDF using reportlab (pure Python — no external binaries)
     try:
-        pdf_bytes = pdfkit.from_string(
-            html,
-            False,  # False = return bytes, not write to file
-            options={
-                "page-size":       "A4",
-                "margin-top":      "0mm",
-                "margin-right":    "0mm",
-                "margin-bottom":   "0mm",
-                "margin-left":     "0mm",
-                "encoding":        "UTF-8",
-                "enable-local-file-access": "",
-                "background":      "",          # render background colours
-                "print-media-type": "",
-                "quiet":           "",
-            },
+        pdf_bytes = _build_invoice_pdf(
+            invoice_ref=reference,
+            user_email=current_user["email"],
+            plan=plan_name,
+            amount_minor=tx.get("amount", 0),
+            currency=tx.get("currency", ""),
+            paid_at=tx.get("paid_at") or tx.get("paidAt") or "",
+            period_start=period_start,
+            period_end=period_end,
         )
         return Response(
             content=pdf_bytes,
