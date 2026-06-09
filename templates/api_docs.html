@@ -26,19 +26,16 @@
     /* ── Layout ── */
     .layout { display: flex; min-height: 100vh; position: relative; z-index: 1; }
     .sidebar {
-      width: 220px; flex-shrink: 0; position: sticky; top: 0; height: 100vh;
+      width: 224px; flex-shrink: 0; position: sticky; top: 0; height: 100vh;
       overflow-y: auto; border-right: 1px solid #16161a;
       background: #07070a; padding: 28px 0;
     }
-    .main { flex: 1; max-width: 760px; padding: 40px 48px 80px; min-width: 0; }
+    .main { flex: 1; max-width: 780px; padding: 40px 48px 80px; min-width: 0; }
 
     /* ── Sidebar nav ── */
     .sidebar-brand { padding: 0 20px 20px; border-bottom: 1px solid #16161a; margin-bottom: 16px; }
-    .sidebar-brand-name {
-      font-family: Syne, sans-serif; font-weight: 800; font-size: 13px;
-      color: #ffffff; letter-spacing: -.01em;
-    }
-    .sidebar-brand-sub { font-size: 9px; color: #6b6b7a; letter-spacing: .12em; text-transform: uppercase; margin-top: 2px; }
+    .sidebar-brand-name { font-family: Syne, sans-serif; font-weight: 800; font-size: 13px; color: #ffffff; letter-spacing: -.01em; }
+    .sidebar-brand-sub  { font-size: 9px; color: #6b6b7a; letter-spacing: .12em; text-transform: uppercase; margin-top: 2px; }
     .nav-section { padding: 0 20px; margin-bottom: 18px; }
     .nav-section-title { font-size: 9px; color: #3a3a44; letter-spacing: .18em; text-transform: uppercase; margin-bottom: 8px; }
     .nav-item { display: block; font-size: 11px; color: #6b6b7a; text-decoration: none; padding: 4px 0; transition: color .12s; }
@@ -62,25 +59,12 @@
     ul li { margin-bottom: 4px; }
 
     /* ── Code blocks ── */
-    .code-block {
-      background: #0f0f12; border: 1px solid #232329; border-radius: 10px;
-      margin: 16px 0; overflow: hidden;
-    }
-    .code-block-header {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 8px 14px; background: #16161a; border-bottom: 1px solid #232329;
-    }
+    .code-block { background: #0f0f12; border: 1px solid #232329; border-radius: 10px; margin: 16px 0; overflow: hidden; }
+    .code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 14px; background: #16161a; border-bottom: 1px solid #232329; }
     .code-lang { font-size: 10px; color: #6b6b7a; letter-spacing: .1em; text-transform: uppercase; }
-    .copy-btn {
-      font-size: 10px; font-family: 'IBM Plex Mono', monospace; color: #6b6b7a;
-      background: none; border: 1px solid #232329; border-radius: 4px;
-      padding: 3px 10px; cursor: pointer; transition: color .12s, border-color .12s;
-    }
+    .copy-btn { font-size: 10px; font-family: 'IBM Plex Mono', monospace; color: #6b6b7a; background: none; border: 1px solid #232329; border-radius: 4px; padding: 3px 10px; cursor: pointer; transition: color .12s, border-color .12s; }
     .copy-btn:hover { color: #f59e0b; border-color: #f59e0b44; }
-    pre {
-      padding: 16px; overflow-x: auto; font-size: 12px; line-height: 1.6;
-      color: #9a9aaa; white-space: pre;
-    }
+    pre { padding: 16px; overflow-x: auto; font-size: 12px; line-height: 1.6; color: #9a9aaa; white-space: pre; }
     pre .kw  { color: #c084fc; }
     pre .str { color: #86efac; }
     pre .cm  { color: #4b5563; }
@@ -89,29 +73,30 @@
     pre .url { color: #67e8f9; }
     pre .err { color: #fb7185; }
 
-    /* ── Method badge ── */
-    .method {
-      display: inline-block; font-size: 10px; font-weight: 600; font-family: 'IBM Plex Mono', monospace;
-      letter-spacing: .06em; padding: 3px 8px; border-radius: 4px; margin-right: 8px; vertical-align: middle;
-    }
+    /* ── Badges ── */
+    .method { display: inline-block; font-size: 10px; font-weight: 600; font-family: 'IBM Plex Mono', monospace; letter-spacing: .06em; padding: 3px 8px; border-radius: 4px; margin-right: 8px; vertical-align: middle; }
     .method-post { background: rgba(245,158,11,.12); color: #f59e0b; border: 1px solid rgba(245,158,11,.3); }
     .method-get  { background: rgba(16,185,129,.12); color: #10b981; border: 1px solid rgba(16,185,129,.3); }
+    .tier-badge  { display: inline-block; font-size: 9px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; padding: 2px 7px; border-radius: 10px; vertical-align: middle; margin-left: 6px; }
+    .tier-pro     { background: rgba(192,132,252,.12); color: #c084fc; border: 1px solid rgba(192,132,252,.3); }
+    .tier-starter { background: rgba(16,185,129,.10); color: #10b981; border: 1px solid rgba(16,185,129,.28); }
+    .tier-free    { background: rgba(107,107,122,.12); color: #6b6b7a; border: 1px solid #232329; }
 
     /* ── Endpoint line ── */
     .endpoint-line { font-size: 14px; color: #67e8f9; margin-bottom: 6px; }
 
     /* ── Alert boxes ── */
-    .alert {
-      display: flex; gap: 10px; padding: 12px 14px; border-radius: 8px; margin: 16px 0;
-    }
-    .alert-amber { background: rgba(245,158,11,.07); border: 1px solid rgba(245,158,11,.22); }
-    .alert-emerald { background: rgba(16,185,129,.07); border: 1px solid rgba(16,185,129,.22); }
-    .alert-rose   { background: rgba(244,63,94,.07); border: 1px solid rgba(244,63,94,.22); }
+    .alert { display: flex; gap: 10px; padding: 12px 14px; border-radius: 8px; margin: 16px 0; }
+    .alert-amber   { background: rgba(245,158,11,.07);  border: 1px solid rgba(245,158,11,.22); }
+    .alert-emerald { background: rgba(16,185,129,.07);  border: 1px solid rgba(16,185,129,.22); }
+    .alert-rose    { background: rgba(244,63,94,.07);   border: 1px solid rgba(244,63,94,.22); }
+    .alert-violet  { background: rgba(192,132,252,.07); border: 1px solid rgba(192,132,252,.22); }
     .alert-icon { flex-shrink: 0; font-size: 15px; margin-top: 1px; }
     .alert p { margin: 0; font-size: 12px; }
     .alert-amber   p { color: #f59e0b; }
     .alert-emerald p { color: #10b981; }
     .alert-rose    p { color: #fb7185; }
+    .alert-violet  p { color: #c084fc; }
 
     /* ── Param table ── */
     .param-table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; font-size: 12px; }
@@ -122,17 +107,22 @@
     .param-table td:last-child { color: #9a9aaa; }
     .required { color: #fb7185; font-size: 9px; vertical-align: super; }
 
-    /* ── Response envelope ── */
+    /* ── Response tabs ── */
     .resp-tab-bar { display: flex; gap: 0; border-bottom: 1px solid #232329; }
-    .resp-tab {
-      font-size: 10px; font-family: 'IBM Plex Mono', monospace; letter-spacing: .08em;
-      text-transform: uppercase; padding: 7px 14px; cursor: pointer;
-      background: none; border: none; color: #6b6b7a;
-      border-bottom: 2px solid transparent; transition: color .12s;
-    }
+    .resp-tab { font-size: 10px; font-family: 'IBM Plex Mono', monospace; letter-spacing: .08em; text-transform: uppercase; padding: 7px 14px; cursor: pointer; background: none; border: none; color: #6b6b7a; border-bottom: 2px solid transparent; transition: color .12s; }
     .resp-tab.active { color: #f59e0b; border-bottom-color: #f59e0b; }
     .resp-panel { display: none; }
     .resp-panel.active { display: block; }
+
+    /* ── Rule category pill ── */
+    .rule-cat { display: inline-block; font-size: 9px; padding: 1px 6px; border-radius: 3px; letter-spacing: .06em; text-transform: uppercase; margin-right: 4px; }
+    .cat-contact  { background: rgba(16,185,129,.12); color: #10b981; }
+    .cat-text     { background: rgba(147,197,253,.10); color: #93c5fd; }
+    .cat-numeric  { background: rgba(251,191,36,.10);  color: #fbbf24; }
+    .cat-missing  { background: rgba(107,107,122,.14); color: #9a9aaa; }
+    .cat-pii      { background: rgba(244,63,94,.10);   color: #fb7185; }
+    .cat-locale   { background: rgba(245,158,11,.10);  color: #f59e0b; }
+    .cat-dedupe   { background: rgba(192,132,252,.10); color: #c084fc; }
 
     ::-webkit-scrollbar { width: 4px; }
     ::-webkit-scrollbar-thumb { background: #232329; border-radius: 2px; }
@@ -141,11 +131,11 @@
 <body>
 <div class="layout">
 
-  <!-- ── Sidebar nav ── -->
+  <!-- ── Sidebar ── -->
   <nav class="sidebar">
     <div class="sidebar-brand">
       <div class="sidebar-brand-name">Dodman API</div>
-      <div class="sidebar-brand-sub">v1 · Integration Docs</div>
+      <div class="sidebar-brand-sub">v2 · Integration Docs</div>
     </div>
 
     <div class="nav-section">
@@ -153,12 +143,14 @@
       <a href="#overview"       class="nav-item active">Overview</a>
       <a href="#authentication" class="nav-item">Authentication</a>
       <a href="#environments"   class="nav-item">Environments</a>
-      <a href="#rate-limits"    class="nav-item">Rate Limits</a>
+      <a href="#rate-limits"    class="nav-item">Rate Limits &amp; Quotas</a>
+      <a href="#file-limits"    class="nav-item">File Size Limits</a>
     </div>
 
     <div class="nav-section">
       <div class="nav-section-title">Endpoints</div>
-      <a href="#endpoint-clean"  class="nav-item">POST /clean</a>
+      <a href="#endpoint-clean" class="nav-item">POST /clean</a>
+      <a href="#endpoint-jobs"  class="nav-item">GET /jobs/{job_id}</a>
       <a href="#endpoint-health" class="nav-item">GET /health</a>
     </div>
 
@@ -166,13 +158,17 @@
       <div class="nav-section-title">Configuration</div>
       <a href="#config-schema"  class="nav-item">Config Schema</a>
       <a href="#column-rules"   class="nav-item">Column Rules</a>
+      <a href="#dry-run"        class="nav-item">Dry-Run Mode</a>
+      <a href="#deduplication"  class="nav-item">Deduplication</a>
+      <a href="#pii-masking"    class="nav-item">PII &amp; Encryption</a>
       <a href="#output-formats" class="nav-item">Output Formats</a>
     </div>
 
     <div class="nav-section">
       <div class="nav-section-title">Responses</div>
-      <a href="#error-envelope" class="nav-item">Error Envelope</a>
-      <a href="#error-codes"    class="nav-item">Error Codes</a>
+      <a href="#response-headers" class="nav-item">Response Headers</a>
+      <a href="#error-envelope"   class="nav-item">Error Envelope</a>
+      <a href="#error-codes"      class="nav-item">Error Codes</a>
     </div>
 
     <div class="nav-section">
@@ -180,35 +176,32 @@
       <a href="#example-python"  class="nav-item">Python</a>
       <a href="#example-node"    class="nav-item">Node.js</a>
       <a href="#example-curl"    class="nav-item">cURL</a>
-      <a href="#example-webhook" class="nav-item">Webhook</a>
+      <a href="#example-webhook" class="nav-item">Webhook + Polling</a>
+      <a href="#example-pii"     class="nav-item">PII Masking</a>
+      <a href="#example-locale"  class="nav-item">Locale Cleaning</a>
     </div>
 
-    <div class="nav-section" style="margin-top: auto; padding-top: 20px; border-top: 1px solid #16161a;">
+    <div class="nav-section" style="margin-top:auto;padding-top:20px;border-top:1px solid #16161a;">
       <a href="/dashboard/" class="nav-item">← Dashboard</a>
-      <a href="/docs"       class="nav-item" target="_blank">OpenAPI /docs</a>
+      <a href="/docs" class="nav-item" target="_blank">OpenAPI /docs</a>
     </div>
   </nav>
 
-  <!-- ── Main content ── -->
+  <!-- ── Main ── -->
   <main class="main">
 
     <!-- OVERVIEW -->
     <section id="overview">
       <p style="font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:#6b6b7a;margin-bottom:10px;">Dodman Group · Data Cleaning Proxy</p>
       <h1>API Integration Guide</h1>
-      <p>A stateless, in-memory CSV and XLSX cleaning service. Send a file, receive cleaned rows as JSON or CSV — either streamed directly back in the response or POSTed to your webhook endpoint asynchronously.</p>
-
+      <p>A stateless, in-memory CSV and XLSX cleaning service. Send a file and a JSON config describing what to do with each column — receive cleaned rows as JSON or CSV, either streamed directly back in the response or delivered to your webhook endpoint asynchronously.</p>
       <div class="alert alert-amber">
         <span class="alert-icon">⚑</span>
         <p>All requests require an API key sent as a <strong>Bearer token</strong> in the <code>Authorization</code> header. Obtain your key from the <a href="/dashboard/">dashboard</a>.</p>
       </div>
-
       <h3>Base URL</h3>
       <div class="code-block">
-        <div class="code-block-header">
-          <span class="code-lang">endpoint</span>
-          <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-        </div>
+        <div class="code-block-header"><span class="code-lang">endpoint</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
         <pre>https://your-deployment-url.com/api/v1</pre>
       </div>
     </section>
@@ -217,12 +210,10 @@
     <section id="authentication">
       <h2>Authentication</h2>
       <p>Pass your API key as a Bearer token on every request.</p>
-
       <div class="code-block">
         <div class="code-block-header"><span class="code-lang">http header</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
         <pre>Authorization: Bearer dk_test_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</pre>
       </div>
-
       <div class="alert alert-rose">
         <span class="alert-icon">✕</span>
         <p>Never send your API key in a URL query string, request body, or client-side JavaScript. Treat it like a password.</p>
@@ -233,39 +224,37 @@
     <section id="environments">
       <h2>Environments</h2>
       <p>Every key is scoped to exactly one environment. The environment is encoded in the key prefix and enforced server-side on every request.</p>
-
       <table class="param-table">
         <thead><tr><th>Prefix</th><th>Environment</th><th>Behaviour</th></tr></thead>
         <tbody>
           <tr>
-            <td><code>dk_test_</code></td>
-            <td>Test</td>
-            <td>Files are silently truncated to the first 20 rows. No billing. Safe for development and CI pipelines.</td>
+            <td><code>dk_test_</code></td><td>Test</td>
+            <td>Files silently truncated to the first <strong>20 rows</strong>. 1 MB file cap. No billing. Safe for development and CI pipelines.</td>
           </tr>
           <tr>
-            <td><code>dk_live_</code></td>
-            <td>Live</td>
-            <td>Full file processing, no row cap. Every request is logged to the billing ledger. Rejected unless the server is running in <code>DODMAN_ENV=production</code>.</td>
+            <td><code>dk_live_</code></td><td>Live</td>
+            <td>Full file processing. File cap and row quota enforced by tier. Every request is logged to the billing ledger. Rejected unless the server runs in <code>DODMAN_ENV=production</code>.</td>
           </tr>
           <tr>
-            <td><code>sk_sandbox_test_99</code></td>
-            <td>Open Sandbox</td>
-            <td>Public key for the interactive sandbox UI. Limited to 5 requests per day per IP. 20-row cap.</td>
+            <td><code>dk_sandbox_test_99</code></td><td>Open Sandbox</td>
+            <td>Public key for the interactive sandbox UI. Limited to 5 requests per day per IP. 20-row cap. Free.</td>
           </tr>
         </tbody>
       </table>
-
       <div class="alert alert-amber">
         <span class="alert-icon">⚠</span>
-        <p>Using a <code>dk_live_</code> key against a development server returns a <code>400 INVALID_ENVIRONMENT_KEY</code> error. This is intentional — it prevents accidental production data from being sent to non-production infrastructure.</p>
+        <p>Using a <code>dk_live_</code> key against a development server returns a <code>400 INVALID_ENVIRONMENT_KEY</code> error. This prevents accidental production data from being sent to non-production infrastructure.</p>
       </div>
     </section>
 
     <!-- RATE LIMITS -->
     <section id="rate-limits">
-      <h2>Rate Limits</h2>
+      <h2>Rate Limits &amp; Monthly Quotas</h2>
+      <p>Requests are rate-limited per API key. Separately, each key has a monthly row quota. Both are enforced independently.</p>
+
+      <h3>Request Rate Limits</h3>
       <table class="param-table">
-        <thead><tr><th>Tier</th><th>Limit</th><th>Scope</th></tr></thead>
+        <thead><tr><th>Tier</th><th>Rate Limit</th><th>Scope</th></tr></thead>
         <tbody>
           <tr><td>free</td><td>60 requests / hour</td><td>Per API key</td></tr>
           <tr><td>starter</td><td>500 requests / hour</td><td>Per API key</td></tr>
@@ -274,32 +263,66 @@
         </tbody>
       </table>
       <p>Rate-limited requests return <code>429 Too Many Requests</code> with a <code>Retry-After: 60</code> header.</p>
+
+      <h3>Monthly Row Quotas</h3>
+      <table class="param-table">
+        <thead><tr><th>Tier</th><th>Rows / Month</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>free / sandbox</td><td>10,000</td><td>Shared across test and sandbox keys.</td></tr>
+          <tr><td>starter</td><td>500,000</td><td>Counted against live keys only.</td></tr>
+          <tr><td>pro</td><td>5,000,000</td><td>Counted against live keys only.</td></tr>
+        </tbody>
+      </table>
+      <p>When you are near your quota and the uploaded file would push you over, the file is trimmed to the remaining rows rather than rejected outright. The response includes an <code>X-Quota-Rows-Remaining</code> header so you can track consumption programmatically.</p>
+    </section>
+
+    <!-- FILE SIZE LIMITS -->
+    <section id="file-limits">
+      <h2>File Size Limits</h2>
+      <p>File size is enforced at the gateway <em>before</em> any parsing begins, returning a clean <code>413</code> immediately on oversized uploads.</p>
+      <table class="param-table">
+        <thead><tr><th>Tier</th><th>Max File Size</th></tr></thead>
+        <tbody>
+          <tr><td>test / sandbox keys</td><td>1 MB</td></tr>
+          <tr><td>starter</td><td>50 MB</td></tr>
+          <tr><td>pro</td><td>500 MB</td></tr>
+        </tbody>
+      </table>
+      <div class="alert alert-emerald">
+        <span class="alert-icon">✦</span>
+        <p><strong>Pro chunk-streaming:</strong> Pro-tier files over 10,000 rows are processed in 10,000-row volatile batches, keeping server RAM flat regardless of file size. A 500 MB file uses no more memory than a 10 MB file.</p>
+      </div>
     </section>
 
     <!-- ENDPOINT: /clean -->
     <section id="endpoint-clean">
       <h2>POST /clean</h2>
       <p class="endpoint-line"><span class="method method-post">POST</span><code>/api/v1/clean</code></p>
-      <p>Upload a CSV or XLSX file for in-memory cleaning. Returns the cleaned data directly (stream download) or, if <code>X-Webhook-URL</code> is provided, queues delivery and returns immediately with <code>202 Accepted</code>.</p>
+      <p>Upload a <code>.csv</code> or <code>.xlsx</code> file for in-memory cleaning. Returns cleaned data directly (stream download) or, if <code>X-Webhook-URL</code> is provided, queues delivery and returns <code>202 Accepted</code> immediately.</p>
 
-      <h3>Request — multipart/form-data</h3>
+      <h3>Form Fields</h3>
       <table class="param-table">
         <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
         <tbody>
           <tr>
-            <td>file <span class="required">*</span></td>
-            <td>File</td>
-            <td>The <code>.csv</code> or <code>.xlsx</code> file to clean.</td>
+            <td>file <span class="required">*</span></td><td>File</td>
+            <td>The <code>.csv</code> or <code>.xlsx</code> file to clean. Encoding is auto-detected (UTF-8, UTF-16, Latin-1, Shift-JIS, Windows-1252, and more).</td>
           </tr>
           <tr>
-            <td>config</td>
-            <td>JSON string</td>
-            <td>Cleaning configuration object (see <a href="#config-schema">Config Schema</a>). Optional — omit to strip whitespace from all columns.</td>
+            <td>config</td><td>JSON string</td>
+            <td>Cleaning configuration object. See <a href="#config-schema">Config Schema</a>. Optional — omit to strip whitespace from all columns.</td>
           </tr>
           <tr>
-            <td>output_format</td>
-            <td><code>"json"</code> | <code>"csv"</code></td>
+            <td>output_format</td><td><code>"json"</code> | <code>"csv"</code></td>
             <td>Response format when no webhook URL is supplied. Defaults to <code>"json"</code>.</td>
+          </tr>
+          <tr>
+            <td>dry_run</td><td>bool</td>
+            <td>When <code>true</code>, validates the config against the file's column headers and returns immediately — no rows are cleaned, no credits consumed. See <a href="#dry-run">Dry-Run Mode</a>.</td>
+          </tr>
+          <tr>
+            <td>dedupe_all</td><td>bool</td>
+            <td>When <code>true</code>, removes rows where every column is identical (whole-row deduplication). Starter tier: max 10,000 rows. Pro: unlimited. See <a href="#deduplication">Deduplication</a>.</td>
           </tr>
         </tbody>
       </table>
@@ -309,44 +332,140 @@
         <thead><tr><th>Header</th><th>Required</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td>Authorization</td><td>Yes</td><td><code>Bearer dk_test_…</code> or <code>Bearer dk_live_…</code></td></tr>
-          <tr><td>X-Webhook-URL</td><td>No</td><td>When present, cleaned JSON is POSTed to this URL asynchronously and the endpoint returns 202.</td></tr>
-          <tr><td>X-Clean-Config</td><td>No</td><td>Cleaning config as a JSON string (overrides the <code>config</code> form field).</td></tr>
+          <tr>
+            <td>X-Webhook-URL</td><td>No</td>
+            <td>When present, cleaned JSON is POSTed to this URL asynchronously and the endpoint returns <code>202</code> with a <code>job_id</code> you can poll. <span class="tier-badge tier-starter">Starter+</span></td>
+          </tr>
+          <tr><td>X-Clean-Config</td><td>No</td><td>Cleaning config as a JSON string. Overrides the <code>config</code> form field.</td></tr>
           <tr><td>X-Output-Format</td><td>No</td><td>Header alternative to the <code>output_format</code> form field.</td></tr>
+          <tr><td>X-Dry-Run</td><td>No</td><td>Set to <code>true</code> to activate dry-run mode. Header alternative to the <code>dry_run</code> form field.</td></tr>
+          <tr><td>X-Dedupe-All</td><td>No</td><td>Set to <code>true</code> to activate whole-row deduplication. Header alternative to <code>dedupe_all</code>.</td></tr>
+          <tr>
+            <td>X-Crypto-Salt</td><td>No</td>
+            <td>Salt string used when applying the <code>ENCRYPT</code> rule. Combined with each cell value before hashing. Kept entirely in volatile memory — never logged or stored. <span class="tier-badge tier-pro">Pro only</span></td>
+          </tr>
         </tbody>
       </table>
 
       <h3>Responses</h3>
       <div class="code-block" style="border-radius:10px 10px 0 0;margin-bottom:0;">
         <div class="resp-tab-bar">
-          <button class="resp-tab active" onclick="showTab('r1','resp-200')">200 Download</button>
-          <button class="resp-tab"        onclick="showTab('r1','resp-202')">202 Queued</button>
-          <button class="resp-tab"        onclick="showTab('r1','resp-4xx')">4xx Error</button>
+          <button class="resp-tab active" onclick="showTab('r1','200')">200 Download</button>
+          <button class="resp-tab"        onclick="showTab('r1','202')">202 Queued</button>
+          <button class="resp-tab"        onclick="showTab('r1','dryrun')">200 Dry-Run</button>
+          <button class="resp-tab"        onclick="showTab('r1','4xx')">4xx Error</button>
         </div>
-        <div id="r1-resp-200" class="resp-panel active"><pre><span class="cm">// Content-Type: application/json  (or text/csv)
+        <div id="r1-200" class="resp-panel active"><pre><span class="cm">// Content-Type: application/json  (or text/csv)
 // Content-Disposition: attachment; filename=cleaned_file.json
-// X-Duration-Ms: 142</span>
+// X-Duration-Ms: 142
+// X-Quota-Rows-Used: 2
+// X-Quota-Rows-Limit: 500000
+// X-Quota-Rows-Remaining: 499998</span>
 
 [
-  { <span class="key">"name"</span>: <span class="str">"Alice Kamau"</span>, <span class="key">"phone"</span>: <span class="str">"254712345678"</span>, <span class="key">"date"</span>: <span class="str">"2024-01-15"</span> },
-  { <span class="key">"name"</span>: <span class="str">"Brian Ochieng"</span>, <span class="key">"phone"</span>: <span class="str">"254798765432"</span>, <span class="key">"date"</span>: <span class="str">"2024-02-03"</span> }
+  { <span class="key">"name"</span>: <span class="str">"Alice Kamau"</span>, <span class="key">"phone"</span>: <span class="str">"254712345678"</span>, <span class="key">"dob"</span>: <span class="str">"1990-04-12"</span> },
+  { <span class="key">"name"</span>: <span class="str">"Brian Ochieng"</span>, <span class="key">"phone"</span>: <span class="str">"254798765432"</span>, <span class="key">"dob"</span>: <span class="str">"1985-11-03"</span> }
 ]</pre></div>
-        <div id="r1-resp-202" class="resp-panel"><pre><span class="cm">// HTTP 202 Accepted
-// Webhook delivery is enqueued as a background task.</span>
+        <div id="r1-202" class="resp-panel"><pre><span class="cm">// HTTP 202 Accepted — webhook delivery queued as a background task.
+// Poll GET /api/v1/jobs/{job_id} for status.</span>
 
 {
   <span class="key">"status"</span>:          <span class="str">"queued"</span>,
   <span class="key">"rows_processed"</span>:  <span class="val">847</span>,
-  <span class="key">"duration_ms"</span>:     <span class="val">312</span>
+  <span class="key">"duration_ms"</span>:     <span class="val">312</span>,
+  <span class="key">"job_id"</span>:          <span class="str">"3fa85f64-5717-4562-b3fc-2c963f66afa6"</span>,
+  <span class="key">"poll_url"</span>:        <span class="str">"/api/v1/jobs/3fa85f64-5717-4562-b3fc-2c963f66afa6"</span>
 }</pre></div>
-        <div id="r1-resp-4xx" class="resp-panel"><pre><span class="cm">// Every error follows the standard envelope (see Error Envelope)</span>
+        <div id="r1-dryrun" class="resp-panel"><pre><span class="cm">// HTTP 200 — no rows cleaned, no credits consumed.</span>
+
+{
+  <span class="key">"dry_run"</span>:          <span class="val">true</span>,
+  <span class="key">"valid"</span>:            <span class="val">true</span>,
+  <span class="key">"file_type"</span>:        <span class="str">"csv"</span>,
+  <span class="key">"total_columns"</span>:   <span class="val">6</span>,
+  <span class="key">"mapped_columns"</span>:  [<span class="str">"Phone"</span>, <span class="str">"Name"</span>, <span class="str">"JoinDate"</span>],
+  <span class="key">"unmapped_columns"</span>:[<span class="str">"Notes"</span>, <span class="str">"Region"</span>, <span class="str">"Status"</span>],
+  <span class="key">"missing_columns"</span>: [],
+  <span class="key">"error"</span>:            <span class="val">null</span>,
+  <span class="key">"rules_preview"</span>: {
+    <span class="key">"Phone"</span>:    [<span class="str">"PHONE"</span>],
+    <span class="key">"Name"</span>:     [<span class="str">"NAME"</span>],
+    <span class="key">"JoinDate"</span>: [<span class="str">"DATE"</span>]
+  }
+}</pre></div>
+        <div id="r1-4xx" class="resp-panel"><pre><span class="cm">// Every error follows the standard envelope (see Error Envelope)</span>
 
 {
   <span class="key">"error"</span>: {
-    <span class="key">"code"</span>:       <span class="str">"INVALID_ENVIRONMENT_KEY"</span>,
-    <span class="key">"message"</span>:    <span class="str">"A dk_live_ key cannot be used outside a production environment."</span>,
+    <span class="key">"code"</span>:       <span class="str">"PAYLOAD_TOO_LARGE"</span>,
+    <span class="key">"message"</span>:    <span class="str">"File size 62 MB exceeds the 50 MB limit for the starter tier."</span>,
     <span class="key">"request_id"</span>: <span class="str">"b3d2f1a0-4c1e-4a2b-9f3d-e5a7c8b9d0e1"</span>
   }
 }</pre></div>
+      </div>
+    </section>
+
+    <!-- ENDPOINT: /jobs/{job_id} -->
+    <section id="endpoint-jobs">
+      <h2>GET /jobs/{job_id}</h2>
+      <p class="endpoint-line"><span class="method method-get">GET</span><code>/api/v1/jobs/{job_id}</code></p>
+      <p>Poll the status of an async cleaning job created by a webhook-mode <code>POST /clean</code>. The <code>job_id</code> is returned in the <code>202</code> response body. Requires the same API key that created the job.</p>
+
+      <div class="alert alert-amber">
+        <span class="alert-icon">⚑</span>
+        <p>Jobs are only created when <code>X-Webhook-URL</code> is supplied. Direct download requests do not create job records. <span class="tier-badge tier-starter">Starter+</span></p>
+      </div>
+
+      <h3>Status Lifecycle</h3>
+      <table class="param-table">
+        <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>queued</code></td><td>Job created. Webhook dispatch has not yet started.</td></tr>
+          <tr><td><code>processing</code></td><td>First delivery attempt is in progress.</td></tr>
+          <tr><td><code>delivered</code></td><td>Webhook accepted the payload with a <code>2xx</code> response. Terminal state.</td></tr>
+          <tr><td><code>failed</code></td><td>All retry attempts exhausted. See the <code>error</code> field for details. Terminal state.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Webhook Retry Schedule</h3>
+      <p>On a non-<code>2xx</code> response or timeout, delivery is retried automatically. <code>4xx</code> errors from your server short-circuit the retry loop immediately (retrying a bad config won't help).</p>
+      <table class="param-table">
+        <thead><tr><th>Attempt</th><th>Delay</th></tr></thead>
+        <tbody>
+          <tr><td>1st (initial)</td><td>Immediate</td></tr>
+          <tr><td>2nd</td><td>30 seconds</td></tr>
+          <tr><td>3rd</td><td>5 minutes</td></tr>
+          <tr><td>4th (final)</td><td>30 minutes</td></tr>
+        </tbody>
+      </table>
+      <p>After all four attempts fail, the job is marked <code>failed</code> and a record is written to the internal dead-letter queue. Contact support with your <code>job_id</code> to recover the payload.</p>
+
+      <h3>Response — 200 OK</h3>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">json</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>{
+  <span class="key">"job_id"</span>:      <span class="str">"3fa85f64-5717-4562-b3fc-2c963f66afa6"</span>,
+  <span class="key">"status"</span>:      <span class="str">"delivered"</span>,
+  <span class="key">"webhook_url"</span>: <span class="str">"https://your-server.com/hooks/cleaned"</span>,
+  <span class="key">"rows_in"</span>:     <span class="val">847</span>,
+  <span class="key">"rows_out"</span>:    <span class="val">841</span>,
+  <span class="key">"file_type"</span>:   <span class="str">"csv"</span>,
+  <span class="key">"duration_ms"</span>: <span class="val">312</span>,
+  <span class="key">"error"</span>:       <span class="val">null</span>,
+  <span class="key">"created_at"</span>:  <span class="str">"2025-06-08T09:14:32.000000+00:00"</span>,
+  <span class="key">"updated_at"</span>:  <span class="str">"2025-06-08T09:14:34.000000+00:00"</span>
+}</pre>
+      </div>
+    </section>
+
+    <!-- ENDPOINT: /health -->
+    <section id="endpoint-health">
+      <h2>GET /health</h2>
+      <p class="endpoint-line"><span class="method method-get">GET</span><code>/api/v1/health</code></p>
+      <p>Liveness probe. Returns <code>200 OK</code> when the API is up. No authentication required.</p>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">json</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>{ <span class="key">"status"</span>: <span class="str">"ok"</span>, <span class="key">"version"</span>: <span class="str">"2.0.0"</span>, <span class="key">"docs"</span>: <span class="str">"/docs"</span> }</pre>
       </div>
     </section>
 
@@ -354,56 +473,262 @@
     <section id="config-schema">
       <h2>Config Schema</h2>
       <p>Pass a JSON-encoded config object in the <code>config</code> form field or <code>X-Clean-Config</code> header.</p>
-
       <div class="code-block">
         <div class="code-block-header"><span class="code-lang">json schema</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
         <pre>{
   <span class="key">"columns"</span>: {
-    <span class="str">"ColumnName"</span>: [<span class="str">"rule1"</span>, <span class="str">"rule2"</span>],
-    <span class="str">"Phone"</span>:      [<span class="str">"PHONE"</span>],
-    <span class="str">"Full Name"</span>:  [<span class="str">"NAME"</span>],
-    <span class="str">"DOB"</span>:        [<span class="str">"DATE"</span>],
-    <span class="str">"Amount"</span>:     [<span class="str">"strip"</span>, <span class="str">"to_float"</span>, <span class="str">"clamp:0:1000000"</span>]
+    <span class="str">"ColumnName"</span>:    [<span class="str">"rule1"</span>, <span class="str">"rule2"</span>],
+    <span class="str">"Phone"</span>:         [<span class="str">"PHONE_INTL:NG"</span>],
+    <span class="str">"Full Name"</span>:     [<span class="str">"NAME"</span>],
+    <span class="str">"Email"</span>:         [<span class="str">"EMAIL"</span>],
+    <span class="str">"DOB"</span>:           [<span class="str">"DATE"</span>],
+    <span class="str">"Amount"</span>:        [<span class="str">"strip"</span>, <span class="str">"CURRENCY"</span>],
+    <span class="str">"TxnID"</span>:         [<span class="str">"KE_MPESA_ID"</span>],
+    <span class="str">"NationalID"</span>:    [<span class="str">"MASK:4"</span>],
+    <span class="str">"CreditCard"</span>:    [<span class="str">"ENCRYPT"</span>],
+    <span class="str">"Score"</span>:         [<span class="str">"to_float"</span>, <span class="str">"clamp:0:100"</span>]
   },
   <span class="key">"output_format"</span>: <span class="str">"json"</span>
 }</pre>
       </div>
-
-      <p>Columns not listed in <code>columns</code> are included in the output with whitespace stripped. Columns listed with an empty rule array <code>[]</code> pass through unchanged.</p>
+      <p>Columns not listed in <code>columns</code> are included in the output with whitespace stripped. A column listed with an empty array <code>[]</code> passes through unchanged.</p>
     </section>
 
     <!-- COLUMN RULES -->
     <section id="column-rules">
       <h2>Column Rules</h2>
-      <p>Rules are applied left to right. Multiple rules can be chained on one column.</p>
+      <p>Rules are applied left-to-right. Multiple rules can be chained on one column. Rules that return objects (marked below) produce a nested JSON object in the output — the original column value is replaced.</p>
 
+      <h3>Phone</h3>
       <table class="param-table">
-        <thead><tr><th>Rule</th><th>Input Type</th><th>Description</th></tr></thead>
+        <thead><tr><th>Rule</th><th>Returns</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td><code>PHONE</code></td><td>any</td><td>Normalise to Kenyan E.164 format (<code>2547xxxxxxxx</code>). Returns <code>null</code> if invalid.</td></tr>
-          <tr><td><code>NAME</code></td><td>string</td><td>Strip and title-case the value.</td></tr>
-          <tr><td><code>DATE</code></td><td>string / number</td><td>Parse 10+ common date formats and Excel serial numbers → ISO 8601 (<code>YYYY-MM-DD</code>).</td></tr>
-          <tr><td><code>strip</code></td><td>string</td><td>Remove leading/trailing whitespace.</td></tr>
-          <tr><td><code>lowercase</code></td><td>string</td><td>Convert to lowercase.</td></tr>
-          <tr><td><code>uppercase</code></td><td>string</td><td>Convert to uppercase.</td></tr>
-          <tr><td><code>title_case</code></td><td>string</td><td>Title-case each word.</td></tr>
-          <tr><td><code>to_int</code></td><td>any</td><td>Cast to integer. Returns <code>null</code> if not numeric.</td></tr>
-          <tr><td><code>to_float</code></td><td>any</td><td>Cast to float. Returns <code>null</code> if not numeric.</td></tr>
-          <tr><td><code>drop_empty</code></td><td>any</td><td>Drop the entire row if this column is null or blank.</td></tr>
-          <tr><td><code>fill_mean</code></td><td>number</td><td>Fill null/blank cells with the column mean.</td></tr>
-          <tr><td><code>fill_median</code></td><td>number</td><td>Fill null/blank cells with the column median.</td></tr>
-          <tr><td><code>fill_value:X</code></td><td>any</td><td>Fill null/blank cells with the literal string <code>X</code>.</td></tr>
-          <tr><td><code>clamp:lo:hi</code></td><td>number</td><td>Clamp value to [lo, hi]. Either bound can be empty (<code>clamp::1000</code>).</td></tr>
-          <tr><td><code>regex:pattern:replace</code></td><td>string</td><td>Apply <code>re.sub(pattern, replace, value)</code>.</td></tr>
+          <tr>
+            <td><code>PHONE</code></td><td>string | null</td>
+            <td><span class="rule-cat cat-contact">contact</span> Normalise to Kenyan E.164 (<code>254712345678</code>). Returns <code>null</code> if the number is invalid or cannot be formatted.</td>
+          </tr>
+          <tr>
+            <td><code>PHONE_INTL</code></td><td>string | null</td>
+            <td><span class="rule-cat cat-contact">contact</span> Normalise to international E.164 using auto-detected region. Falls back to <code>PHONE</code> (KE) if detection fails.</td>
+          </tr>
+          <tr>
+            <td><code>PHONE_INTL:CC</code></td><td>string | null</td>
+            <td><span class="rule-cat cat-contact">contact</span> Same as <code>PHONE_INTL</code> but forces a specific country code. Replace <code>CC</code> with an ISO 3166-1 alpha-2 code: <code>PHONE_INTL:NG</code>, <code>PHONE_INTL:US</code>, <code>PHONE_INTL:GB</code>, <code>PHONE_INTL:ZA</code>, etc.</td>
+          </tr>
         </tbody>
       </table>
+
+      <h3>Email</h3>
+      <table class="param-table">
+        <thead><tr><th>Rule</th><th>Returns</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>EMAIL</code></td><td>object</td>
+            <td><span class="rule-cat cat-contact">contact</span> Validate and normalise. Returns <code>{"email":"…","valid":true,"reason":null}</code>. Checks RFC 5322 structure, local part ≤ 64 chars, address ≤ 254 chars, no consecutive dots, domain has TLD. Normalises to lowercase.</td>
+          </tr>
+          <tr>
+            <td><code>EMAIL_NORMALIZE</code></td><td>string | null</td>
+            <td><span class="rule-cat cat-contact">contact</span> Lowercase and trim only. No validation. Returns the cleaned string or <code>null</code> if empty.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Text</h3>
+      <table class="param-table">
+        <thead><tr><th>Rule</th><th>Returns</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>NAME</code></td><td>string | null</td><td><span class="rule-cat cat-text">text</span> Strip whitespace, title-case, and remove stray punctuation.</td></tr>
+          <tr><td><code>strip</code></td><td>string</td><td><span class="rule-cat cat-text">text</span> Remove leading and trailing whitespace.</td></tr>
+          <tr><td><code>lowercase</code></td><td>string</td><td><span class="rule-cat cat-text">text</span> Convert to lowercase.</td></tr>
+          <tr><td><code>uppercase</code></td><td>string</td><td><span class="rule-cat cat-text">text</span> Convert to uppercase.</td></tr>
+          <tr><td><code>title_case</code></td><td>string</td><td><span class="rule-cat cat-text">text</span> Title-case each word.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Dates &amp; Numbers</h3>
+      <table class="param-table">
+        <thead><tr><th>Rule</th><th>Returns</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>DATE</code></td><td>string | null</td><td><span class="rule-cat cat-numeric">numeric</span> Parse 10+ common date formats and Excel serial numbers → ISO 8601 (<code>YYYY-MM-DD</code>).</td></tr>
+          <tr><td><code>to_int</code></td><td>int | null</td><td><span class="rule-cat cat-numeric">numeric</span> Cast to integer. Returns <code>null</code> if not numeric.</td></tr>
+          <tr><td><code>to_float</code></td><td>float | null</td><td><span class="rule-cat cat-numeric">numeric</span> Cast to float. Returns <code>null</code> if not numeric.</td></tr>
+          <tr>
+            <td><code>CURRENCY</code></td><td>object | null</td>
+            <td><span class="rule-cat cat-numeric">numeric</span> Extract currency symbol and amount. Returns <code>{"amount":1234.56,"currency":"USD"}</code>. Recognises <code>$</code>, <code>€</code>, <code>£</code>, <code>KSh</code>, <code>₦</code>, <code>₹</code>, ISO codes (<code>USD</code>, <code>KES</code>, <code>NGN</code>, …) and more.</td>
+          </tr>
+          <tr><td><code>clamp:lo:hi</code></td><td>float | null</td><td><span class="rule-cat cat-numeric">numeric</span> Clamp value to [lo, hi]. Either bound can be omitted: <code>clamp::100</code>, <code>clamp:0:</code>.</td></tr>
+          <tr><td><code>regex:pattern:replace</code></td><td>string</td><td><span class="rule-cat cat-text">text</span> Apply <code>re.sub(pattern, replace, value)</code>. Use Python regex syntax.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Missing Values</h3>
+      <table class="param-table">
+        <thead><tr><th>Rule</th><th>Returns</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>drop_empty</code></td><td>—</td><td><span class="rule-cat cat-missing">missing</span> Drop the entire row if this column is null or blank.</td></tr>
+          <tr><td><code>fill_mean</code></td><td>float</td><td><span class="rule-cat cat-missing">missing</span> Fill null/blank cells with the column mean (numeric columns).</td></tr>
+          <tr><td><code>fill_median</code></td><td>float</td><td><span class="rule-cat cat-missing">missing</span> Fill null/blank cells with the column median (numeric columns).</td></tr>
+          <tr><td><code>fill_value:X</code></td><td>string</td><td><span class="rule-cat cat-missing">missing</span> Fill null/blank cells with the literal string <code>X</code>. Example: <code>fill_value:N/A</code>, <code>fill_value:0</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Kenya (KE) Locale</h3>
+      <table class="param-table">
+        <thead><tr><th>Rule</th><th>Returns</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>KE_MPESA_ID</code></td><td>object</td>
+            <td><span class="rule-cat cat-locale">locale</span> Validate and normalise an M-Pesa transaction ID (10-char alphanumeric, e.g. <code>RK12345678</code>). Returns <code>{"mpesa_id":"RK12345678","valid":true,"reason":null}</code>.</td>
+          </tr>
+          <tr>
+            <td><code>KE_COUNTY</code></td><td>string | null</td>
+            <td><span class="rule-cat cat-locale">locale</span> Normalise any of Kenya's 47 county names (including common aliases and misspellings) to the official title-case form. Returns <code>null</code> if unrecognised. Examples: <code>"nairobi city"</code> → <code>"Nairobi"</code>, <code>"muranga"</code> → <code>"Murang'a"</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>USA (US) Locale</h3>
+      <table class="param-table">
+        <thead><tr><th>Rule</th><th>Returns</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>US_ZIP</code></td><td>object</td>
+            <td><span class="rule-cat cat-locale">locale</span> Validate and normalise a US ZIP code (5-digit or ZIP+4). Returns <code>{"zip":"90210","valid":true,"zip4":null}</code>. Accepts 9-digit runs and auto-inserts the hyphen.</td>
+          </tr>
+          <tr>
+            <td><code>US_SSN</code></td><td>object</td>
+            <td><span class="rule-cat cat-locale">locale</span> Validate and mask a US Social Security Number. Returns <code>{"ssn_masked":"***-**-6789","valid":true}</code>. The full SSN is <strong>never</strong> returned. Applies IIRC invalid-range checks (000/666/900+ area codes).</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>PII &amp; Security</h3>
+      <table class="param-table">
+        <thead><tr><th>Rule</th><th>Returns</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>MASK</code></td><td>string | null</td>
+            <td><span class="rule-cat cat-pii">pii</span> Replace every character with <code>*</code>. E.g. <code>"john@example.com"</code> → <code>"****************"</code>.</td>
+          </tr>
+          <tr>
+            <td><code>MASK:N</code></td><td>string | null</td>
+            <td><span class="rule-cat cat-pii">pii</span> Keep the last <code>N</code> characters visible. E.g. <code>MASK:4</code> → <code>"************5678"</code>.</td>
+          </tr>
+          <tr>
+            <td><code>MASK:N:C</code></td><td>string | null</td>
+            <td><span class="rule-cat cat-pii">pii</span> Keep last <code>N</code> chars, use <code>C</code> as the mask character. E.g. <code>MASK:4:X</code> → <code>"XXXXXXXXXXXX5678"</code>.</td>
+          </tr>
+          <tr>
+            <td><code>ENCRYPT</code> <span class="tier-badge tier-pro">Pro only</span></td><td>string | null</td>
+            <td><span class="rule-cat cat-pii">pii</span> One-way SHA-256 hash of the value. Returns a 64-character hex digest. Zero-knowledge — irreversible by design. Optionally salted via the <code>X-Crypto-Salt</code> header.</td>
+          </tr>
+          <tr>
+            <td><code>ENCRYPT:salt</code> <span class="tier-badge tier-pro">Pro only</span></td><td>string | null</td>
+            <td><span class="rule-cat cat-pii">pii</span> Same as <code>ENCRYPT</code> but with a custom per-rule salt embedded directly in the rule string. Takes precedence over <code>X-Crypto-Salt</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Deduplication</h3>
+      <table class="param-table">
+        <thead><tr><th>Rule</th><th>Scope</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>dedupe</code></td><td>Per-column</td>
+            <td><span class="rule-cat cat-dedupe">dedupe</span> Remove rows that are exact duplicates on <em>this specific column</em>. Apply to multiple columns to deduplicate on a composite key.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- DRY-RUN -->
+    <section id="dry-run">
+      <h2>Dry-Run Mode</h2>
+      <p>Set <code>dry_run=true</code> (form field) or <code>X-Dry-Run: true</code> (header) to validate your config against the uploaded file's column headers without processing any rows.</p>
+      <ul>
+        <li>Returns <code>200 OK</code> immediately — no rows are cleaned.</li>
+        <li>No credits consumed, no billing ledger entry written.</li>
+        <li><code>valid: true</code> means every column referenced in your config was found in the file.</li>
+        <li><code>missing_columns</code> lists config columns absent from the file.</li>
+        <li><code>unmapped_columns</code> lists file columns not in your config (they will pass through).</li>
+        <li><code>rules_preview</code> shows the exact rules that will run on each matched column.</li>
+      </ul>
+      <div class="alert alert-emerald">
+        <span class="alert-icon">✦</span>
+        <p>Use dry-run as part of your pipeline setup to verify column name mapping before sending real data. It is available on all tiers including test keys.</p>
+      </div>
+    </section>
+
+    <!-- DEDUPLICATION -->
+    <section id="deduplication">
+      <h2>Deduplication</h2>
+      <p>Two deduplication modes are available and can be combined.</p>
+
+      <h3>Global (whole-row) deduplication</h3>
+      <p>Set <code>dedupe_all=true</code> as a form field or <code>X-Dedupe-All: true</code> as a header. Removes rows where <strong>every column value</strong> is identical. Applied after all column-level rules have run.</p>
+      <div class="alert alert-amber">
+        <span class="alert-icon">⚑</span>
+        <p><strong>Starter</strong> tier: <code>dedupe_all</code> is limited to files with ≤ 10,000 rows. <strong>Pro</strong> tier: no row-count restriction. <span class="tier-badge tier-starter">Starter</span> <span class="tier-badge tier-pro">Pro</span></p>
+      </div>
+
+      <h3>Per-column deduplication</h3>
+      <p>Apply the <code>dedupe</code> rule to one or more specific columns in your config. Rows are removed when the value in that column (or combination of columns) has already appeared.</p>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">json — dedupe on a composite key</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>{
+  <span class="key">"columns"</span>: {
+    <span class="str">"Email"</span>:  [<span class="str">"EMAIL_NORMALIZE"</span>, <span class="str">"dedupe"</span>],
+    <span class="str">"Phone"</span>:  [<span class="str">"PHONE"</span>, <span class="str">"dedupe"</span>]
+  }
+}</pre>
+      </div>
+      <p>The above removes any row whose <code>Email</code> + <code>Phone</code> combination has already appeared. Both columns contribute to the deduplication key.</p>
+    </section>
+
+    <!-- PII MASKING -->
+    <section id="pii-masking">
+      <h2>PII &amp; Encryption</h2>
+      <p>The <code>MASK</code> and <code>ENCRYPT</code> rules are designed so your data never leaves the cleaning pipeline in its original form.</p>
+
+      <h3>MASK</h3>
+      <p>Replaces characters with a mask character. Operates entirely in volatile RAM — the original value is not stored or logged anywhere.</p>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">examples</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre><span class="cm">// Input: "07712345678"</span>
+<span class="str">"MASK"</span>    → <span class="str">"***********"</span>     <span class="cm">// fully masked</span>
+<span class="str">"MASK:4"</span>  → <span class="str">"*******5678"</span>     <span class="cm">// last 4 visible</span>
+<span class="str">"MASK:4:X"</span>→ <span class="str">"XXXXXXX5678"</span>     <span class="cm">// last 4 visible, custom char</span></pre>
+      </div>
+
+      <h3>ENCRYPT <span class="tier-badge tier-pro">Pro only</span></h3>
+      <p>Produces a one-way SHA-256 hex digest. The hash is computed in memory and the original value is discarded. Supply a salt via the <code>X-Crypto-Salt</code> header to prevent rainbow-table attacks.</p>
+      <div class="alert alert-violet">
+        <span class="alert-icon">⚿</span>
+        <p>The salt is never logged, never stored, and never included in any response. Your data remains zero-knowledge — Dodman cannot reverse the hash. Store your salt securely on your end.</p>
+      </div>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">python — ENCRYPT with salt</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>resp = requests.post(
+    ENDPOINT,
+    headers={
+        <span class="str">"Authorization"</span>:  <span class="str">f"Bearer {API_KEY}"</span>,
+        <span class="str">"X-Crypto-Salt"</span>:  <span class="str">"my-secret-salt-32chars-minimum"</span>,
+    },
+    files={<span class="str">"file"</span>: (<span class="str">"data.csv"</span>, f, <span class="str">"text/csv"</span>)},
+    data={<span class="str">"config"</span>: json.dumps({
+        <span class="str">"columns"</span>: {
+            <span class="str">"NationalID"</span>: [<span class="str">"ENCRYPT"</span>],
+            <span class="str">"CreditCard"</span>: [<span class="str">"ENCRYPT"</span>],
+        }
+    })},
+)</pre>
+      </div>
     </section>
 
     <!-- OUTPUT FORMATS -->
     <section id="output-formats">
       <h2>Output Formats</h2>
-      <p>Set <code>output_format</code> to <code>"json"</code> (default) or <code>"csv"</code>. The response <code>Content-Disposition</code> header triggers a file download automatically.</p>
-
+      <p>Set <code>output_format</code> to <code>"json"</code> (default) or <code>"csv"</code>. The <code>Content-Disposition</code> header triggers a browser file download automatically.</p>
       <table class="param-table">
         <thead><tr><th>Format</th><th>Content-Type</th><th>Filename</th></tr></thead>
         <tbody>
@@ -411,15 +736,34 @@
           <tr><td><code>csv</code></td><td><code>text/csv</code></td><td><code>cleaned_file.csv</code></td></tr>
         </tbody>
       </table>
+      <div class="alert alert-amber">
+        <span class="alert-icon">⚑</span>
+        <p>Rules that return objects — <code>EMAIL</code>, <code>CURRENCY</code>, <code>KE_MPESA_ID</code>, <code>US_ZIP</code>, <code>US_SSN</code> — produce nested JSON. In CSV output these objects are serialised as JSON strings within the cell.</p>
+      </div>
+      <p>When a webhook URL is supplied, the payload is always delivered as a JSON array regardless of <code>output_format</code>.</p>
+    </section>
 
-      <p>When a webhook URL is supplied, the payload is always sent as a JSON array regardless of <code>output_format</code>.</p>
+    <!-- RESPONSE HEADERS -->
+    <section id="response-headers">
+      <h2>Response Headers</h2>
+      <p>Every successful cleaning response includes these headers.</p>
+      <table class="param-table">
+        <thead><tr><th>Header</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>X-Request-ID</code></td><td>UUID per request. Present on every response — including errors — for log correlation.</td></tr>
+          <tr><td><code>X-Duration-Ms</code></td><td>Server-side processing time in milliseconds (parse + clean, excludes webhook dispatch).</td></tr>
+          <tr><td><code>X-Rows-Truncated</code></td><td>Present only on test/sandbox responses where the row cap was applied. Value = number of rows dropped.</td></tr>
+          <tr><td><code>X-Quota-Rows-Used</code></td><td>Cumulative rows used against your monthly quota after this request. Live keys only.</td></tr>
+          <tr><td><code>X-Quota-Rows-Limit</code></td><td>Your tier's monthly row cap.</td></tr>
+          <tr><td><code>X-Quota-Rows-Remaining</code></td><td>Rows remaining in your monthly quota after this request.</td></tr>
+        </tbody>
+      </table>
     </section>
 
     <!-- ERROR ENVELOPE -->
     <section id="error-envelope">
       <h2>Error Envelope</h2>
-      <p>Every error response across the API uses this exact structure. Parse <code>error.code</code> for programmatic handling and <code>error.message</code> for display to end-users.</p>
-
+      <p>Every error response across the API uses this exact structure. Parse <code>error.code</code> for programmatic handling and <code>error.message</code> for display.</p>
       <div class="code-block">
         <div class="code-block-header"><span class="code-lang">json</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
         <pre>{
@@ -430,7 +774,6 @@
   }
 }</pre>
       </div>
-
       <p>The <code>request_id</code> is also sent as the <code>X-Request-ID</code> response header on every request (including successful ones) for log correlation.</p>
     </section>
 
@@ -440,14 +783,21 @@
       <table class="param-table">
         <thead><tr><th>HTTP</th><th>code</th><th>Cause</th></tr></thead>
         <tbody>
-          <tr><td>400</td><td><code>INVALID_ENVIRONMENT_KEY</code></td><td><code>dk_live_</code> key used outside a production environment, or key/environment mismatch in the database.</td></tr>
-          <tr><td>401</td><td><code>INVALID_API_KEY</code></td><td>Missing, malformed, or inactive API key.</td></tr>
+          <tr><td>400</td><td><code>INVALID_ENVIRONMENT_KEY</code></td><td><code>dk_live_</code> key used outside a production environment, or key/environment mismatch.</td></tr>
+          <tr><td>400</td><td><code>INVALID_JOB_ID</code></td><td>The <code>job_id</code> path parameter is not a valid UUID.</td></tr>
+          <tr><td>401</td><td><code>INVALID_API_KEY</code></td><td>Missing, malformed, revoked, or inactive API key.</td></tr>
           <tr><td>401</td><td><code>UNAUTHORIZED</code></td><td>Session expired or cookie missing on a dashboard route.</td></tr>
+          <tr><td>403</td><td><code>FEATURE_NOT_AVAILABLE</code></td><td>Feature requires a higher tier. E.g. <code>ENCRYPT</code> rule on a Starter key, or <code>X-Webhook-URL</code> on a Free key.</td></tr>
+          <tr><td>403</td><td><code>FORBIDDEN</code></td><td>Job or resource belongs to a different API key.</td></tr>
+          <tr><td>404</td><td><code>JOB_NOT_FOUND</code></td><td>No job found with the specified <code>job_id</code>.</td></tr>
           <tr><td>409</td><td><code>CONFLICT</code></td><td>Email already registered (signup).</td></tr>
+          <tr><td>413</td><td><code>PAYLOAD_TOO_LARGE</code></td><td>File exceeds the size limit for your tier. Compress the file or upgrade.</td></tr>
           <tr><td>415</td><td><code>UNSUPPORTED_MEDIA_TYPE</code></td><td>File is not <code>.csv</code> or <code>.xlsx</code>.</td></tr>
-          <tr><td>422</td><td><code>VALIDATION_FAILED</code></td><td>Missing required field or invalid value.</td></tr>
-          <tr><td>429</td><td><code>RATE_LIMIT_EXCEEDED</code></td><td>Request quota exhausted for this key or IP.</td></tr>
+          <tr><td>422</td><td><code>VALIDATION_FAILED</code></td><td>Missing required field or invalid config value.</td></tr>
+          <tr><td>429</td><td><code>RATE_LIMIT_EXCEEDED</code></td><td>Request rate quota exhausted. Retry after the <code>Retry-After</code> header value (seconds).</td></tr>
+          <tr><td>429</td><td><code>MONTHLY_QUOTA_EXCEEDED</code></td><td>Monthly row quota exhausted. Resets at the start of next month. Upgrade for a higher limit.</td></tr>
           <tr><td>500</td><td><code>INTERNAL_SERVER_ERROR</code></td><td>Unexpected server error. Logged with the <code>request_id</code> for diagnosis.</td></tr>
+          <tr><td>503</td><td><code>DB_ERROR</code></td><td>Database unavailable. Retry after a short delay.</td></tr>
         </tbody>
       </table>
     </section>
@@ -464,10 +814,11 @@ ENDPOINT = <span class="url">"https://your-deployment-url.com/api/v1/clean"</spa
 
 config = {
     <span class="str">"columns"</span>: {
-        <span class="str">"Phone"</span>:    [<span class="str">"PHONE"</span>],
+        <span class="str">"Phone"</span>:    [<span class="str">"PHONE_INTL:KE"</span>],
         <span class="str">"Name"</span>:     [<span class="str">"NAME"</span>],
+        <span class="str">"Email"</span>:    [<span class="str">"EMAIL"</span>],
         <span class="str">"JoinDate"</span>: [<span class="str">"DATE"</span>],
-        <span class="str">"Amount"</span>:   [<span class="str">"strip"</span>, <span class="str">"to_float"</span>],
+        <span class="str">"Amount"</span>:   [<span class="str">"strip"</span>, <span class="str">"CURRENCY"</span>],
     },
     <span class="str">"output_format"</span>: <span class="str">"json"</span>,
 }
@@ -482,7 +833,8 @@ config = {
 
 resp.raise_for_status()
 cleaned_rows = resp.json()
-print(<span class="str">f"Cleaned {len(cleaned_rows)} rows"</span>)</pre>
+print(<span class="str">f"Cleaned {len(cleaned_rows)} rows"</span>)
+print(<span class="str">f"Quota remaining: {resp.headers.get('X-Quota-Rows-Remaining')}"</span>)</pre>
       </div>
     </section>
 
@@ -491,19 +843,20 @@ print(<span class="str">f"Cleaned {len(cleaned_rows)} rows"</span>)</pre>
       <h2>Node.js Example</h2>
       <div class="code-block">
         <div class="code-block-header"><span class="code-lang">javascript · fetch + form-data</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
-        <pre><span class="kw">import</span> fs   from <span class="str">'fs'</span>;
+        <pre><span class="kw">import</span> fs       from <span class="str">'fs'</span>;
 <span class="kw">import</span> FormData from <span class="str">'form-data'</span>;
-<span class="kw">import</span> fetch   from <span class="str">'node-fetch'</span>;
+<span class="kw">import</span> fetch    from <span class="str">'node-fetch'</span>;
 
 <span class="kw">const</span> API_KEY  = <span class="str">'dk_test_your_key_here'</span>;
 <span class="kw">const</span> ENDPOINT = <span class="url">'https://your-deployment-url.com/api/v1/clean'</span>;
 
 <span class="kw">const</span> config = {
   columns: {
-    Phone:    [<span class="str">'PHONE'</span>],
+    Phone:    [<span class="str">'PHONE_INTL:KE'</span>],
     Name:     [<span class="str">'NAME'</span>],
+    Email:    [<span class="str">'EMAIL'</span>],
     JoinDate: [<span class="str">'DATE'</span>],
-    Amount:   [<span class="str">'strip'</span>, <span class="str">'to_float'</span>],
+    Amount:   [<span class="str">'strip'</span>, <span class="str">'CURRENCY'</span>],
   },
   output_format: <span class="str">'json'</span>,
 };
@@ -524,7 +877,8 @@ form.append(<span class="str">'config'</span>, JSON.stringify(config));
 }
 
 <span class="kw">const</span> rows = <span class="kw">await</span> res.json();
-console.log(<span class="str">`Cleaned ${rows.length} rows`</span>);</pre>
+console.log(<span class="str">`Cleaned ${rows.length} rows`</span>);
+console.log(<span class="str">`Quota remaining: ${res.headers.get('x-quota-rows-remaining')}`</span>);</pre>
       </div>
     </section>
 
@@ -536,36 +890,120 @@ console.log(<span class="str">`Cleaned ${rows.length} rows`</span>);</pre>
         <pre>curl -X POST https://your-deployment-url.com/api/v1/clean \
   -H <span class="str">"Authorization: Bearer dk_test_your_key_here"</span> \
   -F <span class="str">"file=@members.csv"</span> \
-  -F <span class="str">'config={"columns":{"Phone":["PHONE"],"Name":["NAME"]}}'</span> \
+  -F <span class="str">'config={"columns":{"Phone":["PHONE_INTL:KE"],"Name":["NAME"],"Email":["EMAIL"]}}'</span> \
   -F <span class="str">"output_format=csv"</span> \
   --output cleaned_file.csv</pre>
       </div>
+
+      <h3>Dry-run validation via cURL</h3>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">shell</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>curl -X POST https://your-deployment-url.com/api/v1/clean \
+  -H <span class="str">"Authorization: Bearer dk_test_your_key_here"</span> \
+  -F <span class="str">"file=@members.csv"</span> \
+  -F <span class="str">'config={"columns":{"Phone":["PHONE"],"Name":["NAME"]}}'</span> \
+  -F <span class="str">"dry_run=true"</span></pre>
+      </div>
     </section>
 
-    <!-- WEBHOOK EXAMPLE -->
+    <!-- WEBHOOK + POLLING EXAMPLE -->
     <section id="example-webhook">
-      <h2>Webhook Delivery</h2>
-      <p>Add the <code>X-Webhook-URL</code> header to any request. The endpoint immediately returns <code>202 Accepted</code> and delivers the cleaned JSON array to your URL as a background task.</p>
-
+      <h2>Webhook + Job Polling</h2>
+      <p>Add the <code>X-Webhook-URL</code> header to receive the cleaned payload asynchronously. The endpoint returns <code>202 Accepted</code> with a <code>job_id</code> you can poll until delivery is confirmed.</p>
       <div class="code-block">
-        <div class="code-block-header"><span class="code-lang">python · webhook mode</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
-        <pre>resp = requests.post(
-    ENDPOINT,
-    headers={
-        <span class="str">"Authorization"</span>:  <span class="str">f"Bearer {API_KEY}"</span>,
-        <span class="str">"X-Webhook-URL"</span>:  <span class="str">"https://your-server.com/hook/cleaned"</span>,
-    },
-    files={<span class="str">"file"</span>: (<span class="str">"data.xlsx"</span>, f, <span class="str">"application/vnd.openxmlformats..."</span>)},
-    data={<span class="str">"config"</span>: json.dumps(config)},
-)
-assert resp.status_code == 202
-<span class="cm"># Your webhook receives POST with Content-Type: application/json
-# Body: [ { "col": "value", ... }, ... ]</span></pre>
-      </div>
+        <div class="code-block-header"><span class="code-lang">python · webhook + polling</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre><span class="kw">import</span> time, requests, json
 
+API_KEY  = <span class="str">"dk_live_your_key_here"</span>
+ENDPOINT = <span class="url">"https://your-deployment-url.com/api/v1"</span>
+HEADERS  = {<span class="str">"Authorization"</span>: <span class="str">f"Bearer {API_KEY}"</span>}
+
+<span class="cm"># 1. Submit the file for async delivery</span>
+<span class="kw">with</span> open(<span class="str">"large_export.csv"</span>, <span class="str">"rb"</span>) <span class="kw">as</span> f:
+    resp = requests.post(
+        f<span class="str">"{ENDPOINT}/clean"</span>,
+        headers={
+            **HEADERS,
+            <span class="str">"X-Webhook-URL"</span>: <span class="str">"https://your-server.com/hooks/cleaned"</span>,
+        },
+        files={<span class="str">"file"</span>: (<span class="str">"large_export.csv"</span>, f, <span class="str">"text/csv"</span>)},
+        data={<span class="str">"config"</span>: json.dumps({<span class="str">"columns"</span>: {<span class="str">"Phone"</span>: [<span class="str">"PHONE"</span>], <span class="str">"Name"</span>: [<span class="str">"NAME"</span>]}})},
+    )
+resp.raise_for_status()
+job = resp.json()
+job_id = job[<span class="str">"job_id"</span>]
+print(<span class="str">f"Queued: {job_id}"</span>)
+
+<span class="cm"># 2. Poll until terminal state</span>
+<span class="kw">while True</span>:
+    status = requests.get(f<span class="str">"{ENDPOINT}/jobs/{job_id}"</span>, headers=HEADERS).json()
+    print(<span class="str">f"Status: {status['status']}"</span>)
+    <span class="kw">if</span> status[<span class="str">"status"</span>] <span class="kw">in</span> (<span class="str">"delivered"</span>, <span class="str">"failed"</span>):
+        <span class="kw">break</span>
+    time.sleep(<span class="val">4</span>)
+
+<span class="kw">if</span> status[<span class="str">"status"</span>] == <span class="str">"failed"</span>:
+    print(<span class="str">f"Delivery failed: {status['error']}"</span>)</pre>
+      </div>
       <div class="alert alert-emerald">
         <span class="alert-icon">✓</span>
-        <p>Webhook delivery is retried once on timeout. Your endpoint should respond with a <code>2xx</code> status within 30 seconds to confirm receipt.</p>
+        <p>Your webhook endpoint must respond with a <code>2xx</code> status within <strong>30 seconds</strong>. Failed deliveries are retried up to 3 additional times (30 s, 5 min, 30 min). <code>4xx</code> responses short-circuit the retry loop immediately.</p>
+      </div>
+    </section>
+
+    <!-- PII EXAMPLE -->
+    <section id="example-pii">
+      <h2>PII Masking Example</h2>
+      <p>Mask sensitive columns before the cleaned data leaves your pipeline. Combine <code>MASK</code> for partial redaction and <code>ENCRYPT</code> for reversible-on-your-end hashing.</p>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">python · PII rules</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>config = {
+    <span class="str">"columns"</span>: {
+        <span class="str">"FullName"</span>:   [<span class="str">"NAME"</span>],
+        <span class="str">"Phone"</span>:      [<span class="str">"PHONE"</span>, <span class="str">"MASK:4"</span>],       <span class="cm"># e.g. *******5678</span>
+        <span class="str">"Email"</span>:      [<span class="str">"EMAIL_NORMALIZE"</span>, <span class="str">"MASK:7"</span>],  <span class="cm"># e.g. *******le.com</span>
+        <span class="str">"NationalID"</span>: [<span class="str">"ENCRYPT"</span>],              <span class="cm"># SHA-256 hex digest</span>
+        <span class="str">"IBAN"</span>:       [<span class="str">"MASK"</span>],                  <span class="cm"># fully redacted</span>
+    },
+    <span class="str">"output_format"</span>: <span class="str">"json"</span>,
+}
+
+resp = requests.post(
+    ENDPOINT,
+    headers={
+        <span class="str">"Authorization"</span>: <span class="str">f"Bearer {API_KEY}"</span>,
+        <span class="str">"X-Crypto-Salt"</span>: <span class="str">"your-secret-salt-never-log-this"</span>,
+    },
+    files={<span class="str">"file"</span>: (<span class="str">"customers.csv"</span>, f, <span class="str">"text/csv"</span>)},
+    data={<span class="str">"config"</span>: json.dumps(config)},
+)</pre>
+      </div>
+    </section>
+
+    <!-- LOCALE EXAMPLE -->
+    <section id="example-locale">
+      <h2>Locale Cleaning Example</h2>
+      <p>Apply region-specific rules for Kenyan and US data in the same config.</p>
+      <div class="code-block">
+        <div class="code-block-header"><span class="code-lang">python · KE + US locale rules</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <pre>config = {
+    <span class="str">"columns"</span>: {
+        <span class="cm"># Kenya</span>
+        <span class="str">"MpesaRef"</span>:  [<span class="str">"KE_MPESA_ID"</span>],   <span class="cm"># {"mpesa_id":"RK12345678","valid":true}</span>
+        <span class="str">"County"</span>:    [<span class="str">"KE_COUNTY"</span>],     <span class="cm"># "nairobi city" → "Nairobi"</span>
+        <span class="str">"Phone"</span>:     [<span class="str">"PHONE_INTL:KE"</span>], <span class="cm"># +254712345678</span>
+
+        <span class="cm"># USA</span>
+        <span class="str">"ZipCode"</span>:   [<span class="str">"US_ZIP"</span>],        <span class="cm"># {"zip":"90210","valid":true,"zip4":null}</span>
+        <span class="str">"SSN"</span>:       [<span class="str">"US_SSN"</span>],        <span class="cm"># {"ssn_masked":"***-**-6789","valid":true}</span>
+
+        <span class="cm"># Universal</span>
+        <span class="str">"Email"</span>:     [<span class="str">"EMAIL"</span>],
+        <span class="str">"Amount"</span>:    [<span class="str">"CURRENCY"</span>],      <span class="cm"># {"amount":1234.56,"currency":"KES"}</span>
+        <span class="str">"JoinDate"</span>:  [<span class="str">"DATE"</span>],
+    },
+    <span class="str">"output_format"</span>: <span class="str">"json"</span>,
+}</pre>
       </div>
     </section>
 
@@ -573,16 +1011,16 @@ assert resp.status_code == 202
 </div>
 
 <script>
-// Tab switching for response examples
 function showTab(groupId, tabName) {
-  const container = document.getElementById(`${groupId}-${tabName}`).closest('.code-block').parentElement;
+  const panel = document.getElementById(`${groupId}-${tabName}`);
+  if (!panel) return;
+  const container = panel.closest('.code-block').parentElement;
   container.querySelectorAll('.resp-panel').forEach(p => p.classList.remove('active'));
   container.querySelectorAll('.resp-tab').forEach(t => t.classList.remove('active'));
-  document.getElementById(`${groupId}-${tabName}`).classList.add('active');
+  panel.classList.add('active');
   event.target.classList.add('active');
 }
 
-// Code block copy
 function copyCode(btn) {
   const pre = btn.closest('.code-block').querySelector('pre');
   navigator.clipboard.writeText(pre.innerText).then(() => {
@@ -591,7 +1029,6 @@ function copyCode(btn) {
   });
 }
 
-// Active sidebar link on scroll
 const sections = document.querySelectorAll('section[id]');
 const navItems = document.querySelectorAll('.nav-item');
 const observer = new IntersectionObserver(entries => {
@@ -602,7 +1039,7 @@ const observer = new IntersectionObserver(entries => {
       if (active) active.classList.add('active');
     }
   });
-}, { rootMargin: '-30% 0px -65% 0px' });
+}, { rootMargin: '-20% 0px -70% 0px' });
 sections.forEach(s => observer.observe(s));
 </script>
 </body>
