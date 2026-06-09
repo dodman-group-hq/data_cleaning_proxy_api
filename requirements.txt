@@ -13,3 +13,4 @@ pydantic[email]
 limits
 bcrypt==4.0.1
 reportlab
+phonenumbers

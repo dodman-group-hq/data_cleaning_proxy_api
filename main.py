@@ -3698,18 +3698,6 @@ _CURRENCY_SYMBOLS: dict[str, str] = {
 # Sort longest-first so "KSh" is tried before "K"
 _CURRENCY_SYMBOL_LIST = sorted(_CURRENCY_SYMBOLS.keys(), key=len, reverse=True)
 
-_CURRENCY_RE = re.compile(
-    r"""^
-    \s*
-    (?P<sym>[A-Z]{2,3}|\p_sym)?   # optional leading ISO code or symbol
-    \s*
-    (?P<num>-?[\d,_\s]*\.?\d+)    # numeric part (may have commas/spaces)
-    \s*
-    (?P<trail>[A-Z]{2,3})?        # optional trailing ISO code
-    \s*$
-    """,
-    re.VERBOSE | re.IGNORECASE,
-)
 
 def clean_currency(value: Any) -> dict | None:
     """
