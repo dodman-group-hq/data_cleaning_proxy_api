@@ -2093,6 +2093,7 @@ async def billing_subscribe(
                 "user_id":    current_user["id"],
                 "plan":       plan_key,
                 "service":    "data_cleaning_proxy",
+                "product":    "data-cleaner-api",
             },
         })
     except httpx.HTTPStatusError as exc:
@@ -2293,6 +2294,18 @@ async def billing_webhook(
 
     # ── charge.success ────────────────────────────────────────────────────────
     if event_type == "charge.success":
+        # Filter by product metadata — only process payments intended for
+        # this product. Other products sharing the same Paystack credentials
+        # must embed their own product identifier in metadata at init time.
+        event_metadata = data.get("metadata") or {}
+        event_product  = event_metadata.get("product", "")
+        if event_product != "data-cleaner-api":
+            log.info(
+                "Paystack charge.success ignored — product=%r (expected 'data-cleaner-api')",
+                event_product,
+            )
+            return JSONResponse(content={"status": "ignored"})
+
         user_id = await _user_id_from_email(cust_email)
         if user_id:
             sub_code = data.get("subscription", {}) or {}
