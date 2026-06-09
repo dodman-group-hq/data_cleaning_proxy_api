@@ -38,6 +38,9 @@ import time
 import uuid
 from typing import Any, Callable
 
+from charset_normalizer import from_bytes as _detect_encoding
+import phonenumbers
+
 import asyncpg
 import httpx
 import openpyxl
@@ -127,6 +130,14 @@ _KEY_BYTES       = 32                           # 256 bits entropy
 
 _SANDBOX_MAX_HITS = 5
 _SANDBOX_RATE     = "5/day"
+
+# ---------------------------------------------------------------------------
+# File size caps (enforced before any parsing or compute)
+# ---------------------------------------------------------------------------
+# Starter: 50 MB  |  Pro: 500 MB  |  test keys: 1 MB
+_MAX_FILE_BYTES_STARTER = 50  * 1024 * 1024   # 50 MB
+_MAX_FILE_BYTES_PRO     = 500 * 1024 * 1024   # 500 MB
+_MAX_FILE_BYTES_TEST    = 1   * 1024 * 1024   # 1 MB  (sandbox / test keys)
 
 # ---------------------------------------------------------------------------
 # Password hashing
@@ -476,6 +487,22 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_user       ON subscriptions (user_id);
 CREATE INDEX        IF NOT EXISTS idx_sub_status     ON subscriptions (status);
 CREATE INDEX        IF NOT EXISTS idx_sub_paystack_id ON subscriptions (paystack_subscription_id);
+
+-- ---------------------------------------------------------------------------
+-- webhook_dead_letter  (payloads that exhausted all retry attempts)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS webhook_dead_letter (
+    id           BIGSERIAL    PRIMARY KEY,
+    api_key_id   UUID         REFERENCES api_keys(id) ON DELETE SET NULL,
+    key_prefix   VARCHAR(32)  NOT NULL DEFAULT '',
+    webhook_url  TEXT         NOT NULL,
+    payload_rows INT          NOT NULL DEFAULT 0,
+    attempts     INT          NOT NULL DEFAULT 0,
+    last_error   TEXT,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dlq_created ON webhook_dead_letter (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dlq_key     ON webhook_dead_letter (api_key_id);
 """
 
 
@@ -2670,7 +2697,6 @@ async def invoice_download(
         )
     except Exception:
         log.exception("PDF generation failed for reference=%s — falling back to HTML", reference)
-        # Graceful fallback: serve the HTML so the user isn't left with an error
         return Response(
             content=html.encode(),
             media_type="text/html",
@@ -3468,8 +3494,41 @@ async def data_cleaner_page(
 # Parsing helpers
 # ===========================================================================
 
-def _parse_csv(data: bytes) -> Sheet:
-    text   = data.decode("utf-8-sig")
+def _decode_bytes(data: bytes, filename: str = "") -> str:
+    """
+    Decode raw file bytes to a Python str, auto-detecting encoding.
+
+    Strategy:
+      1. Try UTF-8 with BOM (utf-8-sig) — covers most modern files.
+      2. Try plain UTF-8.
+      3. Fall back to charset_normalizer which handles Latin-1, UTF-16,
+         Windows-1252, Shift-JIS, CP1256 (Arabic), and hundreds more.
+      4. Last resort: decode with 'replace' so we never raise on bad bytes.
+    """
+    # Fast path — most files are UTF-8
+    for enc in ("utf-8-sig", "utf-8"):
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, ValueError):
+            pass
+
+    # charset_normalizer auto-detection
+    result = _detect_encoding(data).best()
+    if result is not None:
+        detected = result.encoding or "utf-8"
+        log.info("Encoding detected: %s for file %r", detected, filename)
+        try:
+            return data.decode(detected)
+        except (UnicodeDecodeError, LookupError):
+            pass
+
+    # Final fallback — never crash on encoding
+    log.warning("Encoding unknown for %r — decoding with replacement chars", filename)
+    return data.decode("utf-8", errors="replace")
+
+
+def _parse_csv(data: bytes, filename: str = "") -> Sheet:
+    text   = _decode_bytes(data, filename)
     reader = csv.DictReader(io.StringIO(text))
     return [dict(row) for row in reader]
 
@@ -3488,7 +3547,7 @@ def parse_file(filename: str, data: bytes) -> tuple[Sheet, str]:
     """Returns (sheet, file_type) where file_type is 'csv' or 'xlsx'."""
     lower = filename.lower()
     if lower.endswith(".csv"):
-        return _parse_csv(data), "csv"
+        return _parse_csv(data, filename), "csv"
     if lower.endswith(".xlsx"):
         return _parse_xlsx(data), "xlsx"
     raise HTTPException(
@@ -3567,13 +3626,136 @@ def clean_date(value: Any) -> str | None:
     return None
 
 
-_TYPED_RULES = {"PHONE", "NAME", "DATE"}
+_TYPED_RULES = {"PHONE", "PHONE_INTL", "NAME", "DATE", "CURRENCY"}
+
+
+def clean_phone_intl(value: Any, default_region: str = "KE") -> str | None:
+    """
+    Normalise any international phone number to E.164 format (+254...).
+    Falls back to the KE-specific cleaner for unrecognised numbers.
+    default_region is used when the number has no country code prefix.
+    """
+    if value is None:
+        return None
+    raw = str(int(value)) if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        parsed = phonenumbers.parse(raw, default_region)
+        if phonenumbers.is_valid_number(parsed):
+            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+    except phonenumbers.NumberParseException:
+        pass
+    # Fallback to KE-specific cleaner
+    return clean_phone_ke(value)
+
+
+# Currency symbol → ISO 4217 code map (extend as needed)
+_CURRENCY_SYMBOLS: dict[str, str] = {
+    "$":    "USD",
+    "US$":  "USD",
+    "€":    "EUR",
+    "£":    "GBP",
+    "¥":    "JPY",
+    "₦":    "NGN",
+    "KSh":  "KES",
+    "KES":  "KES",
+    "Ksh":  "KES",
+    "TSh":  "TZS",
+    "UGX":  "UGX",
+    "USh":  "UGX",
+    "ZAR":  "ZAR",
+    "R":    "ZAR",
+    "GHS":  "GHS",
+    "GH₵":  "GHS",
+    "ETB":  "ETB",
+    "MAD":  "MAD",
+    "EGP":  "EGP",
+    "INR":  "INR",
+    "₹":    "INR",
+    "AUD":  "AUD",
+    "A$":   "AUD",
+    "CAD":  "CAD",
+    "C$":   "CAD",
+    "CHF":  "CHF",
+    "SEK":  "SEK",
+    "NOK":  "NOK",
+    "DKK":  "DKK",
+    "AED":  "AED",
+    "SAR":  "SAR",
+    "BRL":  "BRL",
+    "R$":   "BRL",
+    "MXN":  "MXN",
+    "MX$":  "MXN",
+    "SGD":  "SGD",
+    "S$":   "SGD",
+    "HKD":  "HKD",
+    "HK$":  "HKD",
+    "CNY":  "CNY",
+    "¥":    "CNY",
+}
+# Sort longest-first so "KSh" is tried before "K"
+_CURRENCY_SYMBOL_LIST = sorted(_CURRENCY_SYMBOLS.keys(), key=len, reverse=True)
+
+_CURRENCY_RE = re.compile(
+    r"""^
+    \s*
+    (?P<sym>[A-Z]{2,3}|\p_sym)?   # optional leading ISO code or symbol
+    \s*
+    (?P<num>-?[\d,_\s]*\.?\d+)    # numeric part (may have commas/spaces)
+    \s*
+    (?P<trail>[A-Z]{2,3})?        # optional trailing ISO code
+    \s*$
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+def clean_currency(value: Any) -> dict | None:
+    """
+    Parse a currency value and return {"amount": float, "currency": "ISO"}.
+    Returns None if the value can't be parsed.
+    Examples: "$1,234.56" → {"amount": 1234.56, "currency": "USD"}
+              "KSh 5000"  → {"amount": 5000.0,  "currency": "KES"}
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    detected_iso: str = ""
+
+    # Try longest symbol first
+    for sym in _CURRENCY_SYMBOL_LIST:
+        if raw.upper().startswith(sym.upper()):
+            detected_iso = _CURRENCY_SYMBOLS[sym]
+            raw = raw[len(sym):].strip()
+            break
+        if raw.upper().endswith(sym.upper()):
+            detected_iso = _CURRENCY_SYMBOLS[sym]
+            raw = raw[:-len(sym)].strip()
+            break
+
+    # Remove formatting characters and parse the number
+    num_str = re.sub(r"[,_\s]", "", raw)
+    try:
+        amount = float(num_str)
+    except (ValueError, TypeError):
+        return None
+
+    return {"amount": amount, "currency": detected_iso or ""}
 
 
 def apply_typed_rule(rule: str, value: Any) -> Any:
-    if rule == "PHONE":  return clean_phone_ke(value)
-    if rule == "NAME":   return clean_name(value)
-    if rule == "DATE":   return clean_date(value)
+    if rule == "PHONE":       return clean_phone_ke(value)
+    if rule == "PHONE_INTL":  return clean_phone_intl(value)
+    if rule == "NAME":        return clean_name(value)
+    if rule == "DATE":        return clean_date(value)
+    if rule == "CURRENCY":    return clean_currency(value)
+    if rule.startswith("PHONE_INTL:"):
+        region = rule.split(":", 1)[1].strip().upper() or "KE"
+        return clean_phone_intl(value, default_region=region)
     return apply_rule(rule, value)
 
 
@@ -3641,16 +3823,18 @@ def apply_fill_stat(sheet: Sheet, col: str, stat: str) -> Sheet:
 
 
 def clean_sheet(sheet: Sheet, column_rules: dict[str, list[str]]) -> Sheet:
-    stat_rules = {"fill_mean", "fill_median"}
+    stat_rules  = {"fill_mean", "fill_median"}
     rules_pass1 = {
-        col: [r for r in rules if r not in stat_rules]
+        col: [r for r in rules if r not in stat_rules and r != "dedupe"]
         for col, rules in column_rules.items()
     }
     sheet = [process_row(row, rules_pass1) for row in sheet]
+
     for col, rules in column_rules.items():
         for rule in rules:
             if rule in stat_rules:
                 sheet = apply_fill_stat(sheet, col, rule)
+
     drop_cols = {col for col, rules in column_rules.items() if "drop_empty" in rules}
     if drop_cols:
         sheet = [
@@ -3660,6 +3844,19 @@ def clean_sheet(sheet: Sheet, column_rules: dict[str, list[str]]) -> Sheet:
                 for col in drop_cols
             )
         ]
+
+    # DEDUPE: remove rows that are exact duplicates on the specified column(s)
+    dedupe_cols = [col for col, rules in column_rules.items() if "dedupe" in rules]
+    if dedupe_cols:
+        seen:        set[tuple] = set()
+        deduped:     Sheet      = []
+        for row in sheet:
+            key = tuple(str(row.get(col, "")) for col in dedupe_cols)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(row)
+        sheet = deduped
+
     return sheet
 
 
@@ -3700,23 +3897,90 @@ def resolve_config(header_config: str | None, form_config: str | None) -> dict:
 
 
 # ===========================================================================
-# Webhook dispatcher
+# Webhook dispatcher — exponential backoff + dead-letter queue
 # ===========================================================================
 
-async def _dispatch_webhook(url: str, payload: list[Row]) -> None:
+# Retry schedule in seconds: 30s → 5 min → 30 min
+_WEBHOOK_RETRY_DELAYS = [30, 300, 1800]
+
+
+async def _dispatch_webhook(
+    url:         str,
+    payload:     list[Row],
+    api_key_id:  str | None = None,
+    key_prefix:  str        = "",
+) -> None:
+    """
+    POST cleaned rows to the client's webhook URL.
+
+    Retries on failure using an exponential backoff schedule
+    (30 s → 5 min → 30 min).  After all attempts are exhausted the
+    payload metadata is written to webhook_dead_letter so nothing is
+    silently lost.
+    """
+    last_error: str = ""
+    total_attempts  = 1 + len(_WEBHOOK_RETRY_DELAYS)  # initial + retries
+
+    for attempt in range(total_attempts):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                response.raise_for_status()
+                log.info(
+                    "Webhook delivered: url=%s status=%s rows=%d attempt=%d",
+                    url, response.status_code, len(payload), attempt + 1,
+                )
+                return   # ✓ success — exit early
+
+        except httpx.TimeoutException as exc:
+            last_error = f"Timeout on attempt {attempt + 1}"
+            log.warning("Webhook timeout (attempt %d/%d): url=%s",
+                        attempt + 1, total_attempts, url)
+        except httpx.HTTPStatusError as exc:
+            last_error = f"HTTP {exc.response.status_code} on attempt {attempt + 1}"
+            log.warning("Webhook rejected (attempt %d/%d): url=%s status=%s",
+                        attempt + 1, total_attempts, url, exc.response.status_code)
+            # 4xx from the client's server — retrying won't help
+            if exc.response.status_code < 500:
+                break
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc} on attempt {attempt + 1}"
+            log.exception("Webhook error (attempt %d/%d): url=%s error=%r",
+                          attempt + 1, total_attempts, url, exc)
+
+        # Wait before the next retry (skip sleep after the last attempt)
+        if attempt < len(_WEBHOOK_RETRY_DELAYS):
+            delay = _WEBHOOK_RETRY_DELAYS[attempt]
+            log.info("Webhook retry in %ds: url=%s", delay, url)
+            await asyncio.sleep(delay)
+
+    # All attempts exhausted — write to dead-letter table
+    log.error(
+        "Webhook failed after %d attempts — writing to DLQ: url=%s rows=%d",
+        total_attempts, url, len(payload),
+    )
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, json=payload,
-                                         headers={"Content-Type": "application/json"})
-            response.raise_for_status()
-            log.info("Webhook delivered: url=%s status=%s rows=%d",
-                     url, response.status_code, len(payload))
-    except httpx.TimeoutException:
-        log.error("Webhook timed out: url=%s", url)
-    except httpx.HTTPStatusError as exc:
-        log.error("Webhook rejected: url=%s status=%s", url, exc.response.status_code)
-    except Exception as exc:
-        log.exception("Webhook error: url=%s error=%r", url, exc)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO webhook_dead_letter
+                    (api_key_id, key_prefix, webhook_url, payload_rows, attempts, last_error)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                uuid.UUID(api_key_id) if api_key_id else None,
+                key_prefix,
+                url,
+                len(payload),
+                total_attempts,
+                last_error,
+            )
+    except Exception:
+        log.exception("Failed to write to DLQ for url=%s", url)
 
 
 # ===========================================================================
@@ -3730,6 +3994,7 @@ async def _dispatch_webhook(url: str, payload: list[Row]) -> None:
         200: {"description": "Cleaned file streamed directly (no webhook)"},
         202: {"description": "Processing queued; payload POSTed to X-Webhook-URL"},
         400: {"description": "Environment key mismatch"},
+        413: {"description": "File exceeds tier size limit"},
         415: {"description": "Unsupported file type"},
         422: {"description": "Validation / config error"},
         429: {"description": "Rate limit exceeded"},
@@ -3737,36 +4002,58 @@ async def _dispatch_webhook(url: str, payload: list[Row]) -> None:
 )
 @limiter.limit(RATE_LIMIT_DEFAULT, key_func=_rate_limit_identifier)
 async def clean_file(
-    request:         Request,
+    request:          Request,
     background_tasks: BackgroundTasks,
-    file:            UploadFile = File(...),
-    config:          str | None = Form(default=None),
-    output_format:   str | None = Form(default=None),
-    x_clean_config:  str | None = Header(default=None, alias="X-Clean-Config"),
-    x_webhook_url:   str | None = Header(default=None, alias="X-Webhook-URL"),
-    x_output_format: str | None = Header(default=None, alias="X-Output-Format"),
-    api_key:         APIKeyRecord = Security(verify_api_key),
+    file:             UploadFile = File(...),
+    config:           str | None = Form(default=None),
+    output_format:    str | None = Form(default=None),
+    dry_run:          bool       = Form(default=False),
+    x_clean_config:   str | None = Header(default=None, alias="X-Clean-Config"),
+    x_webhook_url:    str | None = Header(default=None, alias="X-Webhook-URL"),
+    x_output_format:  str | None = Header(default=None, alias="X-Output-Format"),
+    x_dry_run:        str | None = Header(default=None, alias="X-Dry-Run"),
+    api_key:          APIKeyRecord = Security(verify_api_key),
 ) -> Response:
 
     request.state.api_key_tier = api_key.tier
 
+    # ── Resolve dry_run flag (Form param or X-Dry-Run header) ─────────────────
+    is_dry_run = dry_run or (x_dry_run or "").strip().lower() in ("1", "true", "yes")
+
     # ── Start the perf clock ──────────────────────────────────────────────────
     t_start = time.perf_counter()
 
-    # ── Read + parse ──────────────────────────────────────────────────────────
-    raw_bytes           = await file.read()
-    sheet, file_type    = parse_file(file.filename or "", raw_bytes)
-    rows_in             = len(sheet)
+    # ── Read raw bytes ────────────────────────────────────────────────────────
+    raw_bytes = await file.read()
+    fname     = file.filename or ""
 
-    # ── Row truncation for test/sandbox keys ──────────────────────────────────
-    _SANDBOX_ROW_LIMIT = 20
-    truncated          = False
-    original_row_count = rows_in
-    if api_key.is_test and rows_in > _SANDBOX_ROW_LIMIT:
-        sheet     = sheet[:_SANDBOX_ROW_LIMIT]
-        truncated = True
-        log.info("Row truncation: original=%d capped=%d key=%s",
-                 original_row_count, _SANDBOX_ROW_LIMIT, api_key.key_prefix)
+    # ── File size cap (enforced before any parsing) ───────────────────────────
+    if api_key.is_test:
+        max_bytes = _MAX_FILE_BYTES_TEST
+        tier_label = "test"
+    elif (api_key.tier or "").lower() == "pro":
+        max_bytes = _MAX_FILE_BYTES_PRO
+        tier_label = "pro"
+    else:
+        max_bytes = _MAX_FILE_BYTES_STARTER
+        tier_label = "starter"
+
+    if len(raw_bytes) > max_bytes:
+        max_mb = max_bytes // (1024 * 1024)
+        raise HTTPException(
+            status_code=413,
+            detail=_error_envelope(
+                "PAYLOAD_TOO_LARGE",
+                f"File size {len(raw_bytes) // (1024 * 1024)} MB exceeds the "
+                f"{max_mb} MB limit for the {tier_label} tier. "
+                f"Compress the file or upgrade your plan.",
+                _get_request_id(request),
+            ),
+        )
+
+    # ── Parse ─────────────────────────────────────────────────────────────────
+    sheet, file_type = parse_file(fname, raw_bytes)
+    rows_in          = len(sheet)
 
     # ── Config ────────────────────────────────────────────────────────────────
     cfg          = resolve_config(x_clean_config, config)
@@ -3777,6 +4064,50 @@ async def clean_file(
     )
     if resolved_fmt not in {"json", "csv"}:
         resolved_fmt = "json"
+
+    # ── DRY-RUN: validate config against headers only, return immediately ─────
+    if is_dry_run:
+        if not sheet:
+            return JSONResponse(content={
+                "dry_run": True,
+                "valid": False,
+                "error": "File is empty — no headers found.",
+            })
+        actual_columns  = set(sheet[0].keys())
+        config_columns  = set(column_rules.keys())
+        missing_in_file = sorted(config_columns - actual_columns)
+        extra_in_file   = sorted(actual_columns - config_columns)
+        mapped_columns  = sorted(actual_columns & config_columns)
+        valid = len(missing_in_file) == 0
+
+        return JSONResponse(content={
+            "dry_run":          True,
+            "valid":            valid,
+            "file_type":        file_type,
+            "total_columns":    len(actual_columns),
+            "mapped_columns":   mapped_columns,
+            "unmapped_columns": extra_in_file,
+            "missing_columns":  missing_in_file,
+            "error": (
+                f"Config references {len(missing_in_file)} column(s) not found in file: "
+                f"{missing_in_file}"
+                if missing_in_file else None
+            ),
+            "rules_preview": {
+                col: column_rules[col]
+                for col in mapped_columns
+            },
+        })
+
+    # ── Row truncation for test/sandbox keys ──────────────────────────────────
+    _SANDBOX_ROW_LIMIT = 20
+    truncated          = False
+    original_row_count = rows_in
+    if api_key.is_test and rows_in > _SANDBOX_ROW_LIMIT:
+        sheet     = sheet[:_SANDBOX_ROW_LIMIT]
+        truncated = True
+        log.info("Row truncation: original=%d capped=%d key=%s",
+                 original_row_count, _SANDBOX_ROW_LIMIT, api_key.key_prefix)
 
     # ── Clean ─────────────────────────────────────────────────────────────────
     cleaned   = clean_sheet(sheet, column_rules)
@@ -3828,7 +4159,13 @@ async def clean_file(
 
     # ── Webhook mode → 202 ───────────────────────────────────────────────────
     if x_webhook_url:
-        background_tasks.add_task(_dispatch_webhook, x_webhook_url, sanitised)
+        background_tasks.add_task(
+            _dispatch_webhook,
+            x_webhook_url,
+            sanitised,
+            str(api_key.id) if api_key.id else None,
+            api_key.key_prefix,
+        )
         log.info("Job queued: rows=%d webhook=%s key=%s truncated=%s duration_ms=%d",
                  rows_out, x_webhook_url, api_key.key_prefix, truncated, duration_ms)
         return JSONResponse(
