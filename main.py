@@ -2128,12 +2128,13 @@ async def billing_subscribe(
 
 @billing_router.get("/callback", include_in_schema=False)
 async def billing_callback(
-    request:      Request,
-    trxref:       str | None = None,
-    reference:    str | None = None,
-    current_user: dict       = Depends(get_current_user),
-    pool:         asyncpg.Pool = Depends(get_pool),
+    request:   Request,
+    trxref:    str | None = None,
+    reference: str | None = None,
+    pool:      asyncpg.Pool = Depends(get_pool),
 ) -> Response:
+    # Note: no get_current_user dependency — session cookie may be absent
+    # after returning from Paystack's external hosted page.
     ref = trxref or reference
     if not ref:
         return RedirectResponse(url="/dashboard/billing?status=error&reason=missing_ref")
@@ -2152,13 +2153,30 @@ async def billing_callback(
             url=f"/dashboard/billing?status=failed&reason={stat}"
         )
 
+    # Resolve user from the verified transaction's customer email
+    # This is safe — we're trusting Paystack's verified response, not user input
+    customer    = tx.get("customer", {}) or {}
+    cust_email  = (customer.get("email") or "").lower().strip()
+
+    if not cust_email:
+        log.error("billing_callback: no customer email in verified transaction ref=%s", ref)
+        return RedirectResponse(url="/auth/login-page?reason=callback_error")
+
+    async with pool.acquire() as conn:
+        user_row = await conn.fetchrow(
+            "SELECT id FROM users WHERE email = $1", cust_email
+        )
+
+    if not user_row:
+        log.error("billing_callback: no user found for email=%s ref=%s", cust_email, ref)
+        return RedirectResponse(url="/auth/login-page?reason=callback_error")
+
+    user_id = str(user_row["id"])
+
     # Pull subscription details from the verified transaction
     sub      = tx.get("subscription", {}) or {}
-    customer = tx.get("customer",     {}) or {}
     plan     = tx.get("plan",         {}) or {}
 
-    # Paystack sometimes returns "plan" as a bare plan-code string rather than
-    # an object.  Normalise to a dict so .get() calls below are always safe.
     if isinstance(plan, str):
         plan = {"plan_code": plan}
 
@@ -2178,7 +2196,7 @@ async def billing_callback(
 
     await _upsert_subscription(
         pool,
-        current_user["id"],
+        user_id,
         customer_id=str(customer.get("id", "")),
         subscription_id=str(sub.get("id", "")),
         plan_code=plan_code,
@@ -2189,26 +2207,26 @@ async def billing_callback(
         raw_event=tx,
     )
 
-    # Upgrade the api_keys tier for all active live keys belonging to this user
+    # Upgrade live API key tier
     async with pool.acquire() as conn:
         await conn.execute(
             """
             UPDATE api_keys SET tier = $1
             WHERE  user_id = $2 AND environment = 'live' AND is_active = TRUE
             """,
-            plan_name, uuid.UUID(current_user["id"]),
+            plan_name, uuid.UUID(user_id),
         )
 
     asyncio.ensure_future(_write_audit_log(
         pool, "billing.subscribed", True,
         user_type="user", target_type="subscription",
-        target_id=current_user["id"],
+        target_id=user_id,
         ip_address=_client_ip(request),
         details={"plan": plan_name, "plan_code": plan_code, "ref": ref},
     ))
     # Send invoice for the initial payment
     asyncio.ensure_future(_send_invoice_email(
-        to=current_user["email"],
+        to=cust_email,
         invoice_ref=ref,
         plan=plan_name,
         amount_minor=tx.get("amount", 0),
@@ -2218,8 +2236,14 @@ async def billing_callback(
         period_end=period_end_str,
     ))
 
-    log.info("Subscription activated: user=%s plan=%s", current_user["id"], plan_name)
-    return RedirectResponse(url="/dashboard/?billing=success", status_code=303)
+    log.info("Subscription activated via callback: user=%s plan=%s", user_id, plan_name)
+
+    # Redirect to login page with a flag so the frontend can show a
+    # "payment successful — please log in" message rather than a plain login form
+    return RedirectResponse(
+        url="/auth/login-page?billing=success",
+        status_code=303
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2519,15 +2543,21 @@ async def billing_invoices(
 
     invoices = []
     for tx in raw:
-        # Double-check ownership: strip any row whose customer email
-        # does not exactly match the authenticated user.
+        # Filter by product — only show transactions that belong to data-cleaner-api
+        tx_metadata = tx.get("metadata") or {}
+        product     = tx_metadata.get("product", "")
+        service     = tx_metadata.get("service", "")
+        # Accept if product matches, OR if product is absent but service matches
+        # (covers transactions made before the product field was added)
+        if product and product != "data-cleaner-api":
+            continue
+        if not product and service != "data_cleaning_proxy":
+            continue
+
+        # Ownership double-check (already there)
         tx_customer = tx.get("customer", {}) or {}
         tx_email    = (tx_customer.get("email") or "").lower().strip()
         if tx_email and tx_email != user_email:
-            log.warning(
-                "billing_invoices: email mismatch — user=%s tx_email=%s ref=%s",
-                user_email, tx_email, tx.get("reference", ""),
-            )
             continue
 
         invoices.append({
@@ -2537,9 +2567,9 @@ async def billing_invoices(
             "currency":       tx.get("currency", ""),
             "paid_at":        tx.get("paid_at") or tx.get("paidAt"),
             "plan":           _plan_name_from_code(
-                                  tx.get("plan") if isinstance(tx.get("plan"), str)
-                                  else (tx.get("plan") or {}).get("plan_code", "")
-                              ),
+                                tx.get("plan") if isinstance(tx.get("plan"), str)
+                                else (tx.get("plan") or {}).get("plan_code", "")
+                            ),
             "download_url":   f"/billing/invoice/{tx.get('reference', '')}/download",
             "email_url":      f"/billing/invoice/{tx.get('reference', '')}/email",
         })
