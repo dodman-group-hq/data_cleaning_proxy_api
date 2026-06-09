@@ -503,6 +503,21 @@ CREATE TABLE IF NOT EXISTS webhook_dead_letter (
 );
 CREATE INDEX IF NOT EXISTS idx_dlq_created ON webhook_dead_letter (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dlq_key     ON webhook_dead_letter (api_key_id);
+
+-- ---------------------------------------------------------------------------
+-- password_resets  (one active token per user; expires after 1 hour)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS password_resets (
+    id         BIGSERIAL    PRIMARY KEY,
+    user_id    UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash VARCHAR(64)  NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ  NOT NULL,
+    used       BOOLEAN      NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pw_reset_token  ON password_resets (token_hash);
+CREATE INDEX IF NOT EXISTS idx_pw_reset_user   ON password_resets (user_id);
+CREATE INDEX IF NOT EXISTS idx_pw_reset_expiry ON password_resets (expires_at);
 """
 
 
@@ -1158,6 +1173,247 @@ async def login_page(request: Request):
 @auth_router.get("/signup-page", include_in_schema=False)
 async def signup_page(request: Request):
     return templates.TemplateResponse(request=request, name="signup.html", context={})
+
+
+# ---------------------------------------------------------------------------
+# Forgot password — request reset link
+# ---------------------------------------------------------------------------
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+@auth_router.post("/forgot-password", summary="Request a password reset email")
+async def forgot_password(
+    request: Request,
+    body:    ForgotPasswordRequest,
+    pool:    asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    email = body.email.lower().strip()
+
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT id FROM users WHERE email = $1", email
+        )
+
+    # Always return the same response whether the email exists or not —
+    # prevents account enumeration attacks.
+    _SAFE_RESPONSE = JSONResponse(content={
+        "message": "If an account exists for that email, a reset link has been sent."
+    })
+
+    if not user:
+        # Log the attempt but return the safe generic response
+        asyncio.ensure_future(_write_audit_log(
+            pool, "user.forgot_password", False,
+            user_type="anonymous", target_type="user",
+            target_id=email, ip_address=_client_ip(request),
+            details={"reason": "email_not_found", "request_id": _get_request_id(request)},
+        ))
+        return _SAFE_RESPONSE
+
+    user_id = str(user["id"])
+
+    # Invalidate any existing unused tokens for this user before issuing a new one
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE password_resets SET used = TRUE WHERE user_id = $1 AND used = FALSE",
+            uuid.UUID(user_id),
+        )
+
+    # Generate a secure token and store its hash (never store raw tokens)
+    raw_token  = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO password_resets (user_id, token_hash, expires_at)
+            VALUES ($1, $2, $3)
+            """,
+            uuid.UUID(user_id), token_hash, expires_at,
+        )
+
+    # Build the reset link
+    reset_url = f"{APP_BASE_URL}/auth/reset-password-page?token={raw_token}"
+
+    # Send the email via Resend
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/></head>
+<body style="font-family:'IBM Plex Mono',monospace;background:#07070a;color:#d0d0e0;margin:0;padding:40px;">
+  <div style="max-width:520px;margin:0 auto;background:#0f0f12;border:1px solid #232329;border-radius:12px;overflow:hidden;">
+    <div style="background:#16161a;padding:24px 28px;border-bottom:1px solid #232329;">
+      <p style="font-size:10px;letter-spacing:.3em;text-transform:uppercase;color:#f59e0b;margin:0 0 4px;">Dodman Group</p>
+      <p style="font-size:18px;font-weight:700;color:#fff;margin:0;">Reset Your Password</p>
+    </div>
+    <div style="padding:24px 28px;font-size:13px;line-height:1.7;color:#9a9aaa;">
+      <p>We received a request to reset the password for <strong style="color:#d0d0e0;">{email}</strong>.</p>
+      <p>Click the button below to set a new password. This link expires in <strong style="color:#d0d0e0;">1 hour</strong>.</p>
+      <div style="text-align:center;margin:28px 0;">
+        <a href="{reset_url}"
+           style="background:#10b981;color:#07070a;font-weight:700;font-size:12px;
+                  letter-spacing:.08em;text-transform:uppercase;padding:12px 32px;
+                  border-radius:6px;text-decoration:none;display:inline-block;">
+          Reset Password
+        </a>
+      </div>
+      <p style="font-size:11px;color:#6b6b7a;">
+        If you did not request this, you can safely ignore this email —
+        your password will not be changed.
+      </p>
+      <p style="font-size:11px;color:#6b6b7a;word-break:break-all;">
+        Or copy this link: {reset_url}
+      </p>
+    </div>
+    <div style="padding:16px 28px;border-top:1px solid #232329;font-size:10px;color:#3a3a44;text-align:center;">
+      Dodman Group &middot; Data Cleaning Proxy API &middot; {RESEND_FROM}
+    </div>
+  </div>
+</body>
+</html>"""
+
+    asyncio.ensure_future(_send_email(
+        to=email,
+        subject="Reset your Dodman password",
+        html=html,
+    ))
+
+    asyncio.ensure_future(_write_audit_log(
+        pool, "user.forgot_password", True,
+        user_type="anonymous", target_type="user",
+        target_id=user_id, ip_address=_client_ip(request),
+        details={"email": email, "request_id": _get_request_id(request)},
+    ))
+
+    return _SAFE_RESPONSE
+
+
+@auth_router.get("/forgot-password-page", include_in_schema=False)
+async def forgot_password_page(request: Request):
+    return templates.TemplateResponse(request=request, name="forgot_password.html", context={})
+
+# ---------------------------------------------------------------------------
+# Forgot password — serve the reset password page
+# ---------------------------------------------------------------------------
+
+@auth_router.get("/reset-password-page", include_in_schema=False)
+async def reset_password_page(
+    request: Request,
+    token:   str | None = None,
+    pool:    asyncpg.Pool = Depends(get_pool),
+) -> Response:
+    # Validate the token before serving the page so the user gets a clear
+    # error immediately rather than filling out the form and then failing.
+    error: str | None = None
+
+    if not token:
+        error = "Missing reset token. Please request a new password reset link."
+    else:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT expires_at, used
+                FROM   password_resets
+                WHERE  token_hash = $1
+                """,
+                token_hash,
+            )
+        if not row:
+            error = "Invalid reset link. Please request a new one."
+        elif row["used"]:
+            error = "This reset link has already been used. Please request a new one."
+        elif row["expires_at"] < datetime.datetime.now(datetime.timezone.utc):
+            error = "This reset link has expired. Please request a new one."
+
+    return templates.TemplateResponse(
+        request=request,
+        name="reset_password.html",
+        context={"token": token, "error": error},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Forgot password — submit new password
+# ---------------------------------------------------------------------------
+
+class ResetPasswordRequest(BaseModel):
+    token:    str
+    password: str
+
+
+@auth_router.post("/reset-password", summary="Set a new password using a reset token")
+async def reset_password(
+    request: Request,
+    body:    ResetPasswordRequest,
+    pool:    asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    if len(body.password) < 8:
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                "Password must be at least 8 characters.",
+                _get_request_id(request),
+            ),
+        )
+
+    token_hash = hashlib.sha256(body.token.encode()).hexdigest()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, expires_at, used
+            FROM   password_resets
+            WHERE  token_hash = $1
+            """,
+            token_hash,
+        )
+
+    _INVALID = HTTPException(
+        status_code=400,
+        detail=_error_envelope(
+            "INVALID_TOKEN",
+            "This reset link is invalid, expired, or has already been used.",
+            _get_request_id(request),
+        ),
+    )
+
+    if not row:
+        raise _INVALID
+    if row["used"]:
+        raise _INVALID
+    if row["expires_at"] < datetime.datetime.now(datetime.timezone.utc):
+        raise _INVALID
+
+    user_id   = str(row["user_id"])
+    new_hash  = _hash_password(body.password)
+
+    # Update password and mark token as used atomically
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE users SET password_hash = $1 WHERE id = $2",
+                new_hash, uuid.UUID(user_id),
+            )
+            await conn.execute(
+                "UPDATE password_resets SET used = TRUE WHERE id = $1",
+                row["id"],
+            )
+
+    asyncio.ensure_future(_write_audit_log(
+        pool, "user.reset_password", True,
+        user_type="anonymous", target_type="user",
+        target_id=user_id, ip_address=_client_ip(request),
+        details={"request_id": _get_request_id(request)},
+    ))
+
+    log.info("Password reset successful: user_id=%s", user_id)
+    return JSONResponse(content={
+        "message": "Password updated successfully. You can now log in."
+    })
 
 
 # Convenience redirect from root

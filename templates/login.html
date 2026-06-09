@@ -94,8 +94,18 @@
       font-size: 12px;
       color: #fb7185;
     }
+    .success-box {
+      background: rgba(16,185,129,.08);
+      border: 1px solid rgba(16,185,129,.3);
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 12px;
+      color: #34d399;
+    }
     a { color: #f59e0b; text-decoration: none; }
     a:hover { color: #fcd34d; }
+    .forgot-link { font-size: 11px; color: #6b6b7a; }
+    .forgot-link:hover { color: #f59e0b; }
     @keyframes fadein { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
     .card { animation: fadein .3s ease; }
   </style>
@@ -109,6 +119,13 @@
     <p class="text-xs text-gray-500 font-mono mt-1">Data Cleaning Proxy · Admin Dashboard</p>
   </div>
 
+  <!-- Billing success banner (shown after payment callback) -->
+  {% if request.query_params.get('billing') == 'success' %}
+  <div class="success-box mb-5">
+    🎉 Payment successful — your subscription is active. Sign in to access your dashboard.
+  </div>
+  {% endif %}
+
   <!-- Flash error -->
   {% if error %}
   <div class="error-box mb-5">{{ error }}</div>
@@ -121,7 +138,10 @@
         placeholder="you@company.com" class="field-input" />
     </div>
     <div>
-      <label for="password">Password</label>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <label for="password" style="margin-bottom:0;">Password</label>
+        <a href="/auth/forgot-password-page" class="forgot-link">Forgot password?</a>
+      </div>
       <input id="password" name="password" type="password" required autocomplete="current-password"
         placeholder="••••••••" class="field-input" />
     </div>
@@ -137,6 +157,18 @@
 </div>
 
 <script>
+  // Show billing success banner from query param (fallback for non-Jinja contexts)
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('billing') === 'success') {
+    const existing = document.querySelector('.success-box');
+    if (!existing) {
+      const banner = document.createElement('div');
+      banner.className = 'success-box mb-5';
+      banner.textContent = '🎉 Payment successful — your subscription is active. Sign in to access your dashboard.';
+      document.querySelector('.card').insertBefore(banner, document.getElementById('login-form'));
+    }
+  }
+
 async function handleLogin(e) {
   e.preventDefault();
   const btn      = document.getElementById('submit-btn');
