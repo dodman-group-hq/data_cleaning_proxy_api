@@ -231,6 +231,17 @@
           <div class="w-10 h-5 bg-muted peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-amber-500"></div>
         </label>
       </div>
+      <!-- Dedupe-all toggle -->
+      <div class="sm:col-span-2 flex items-center justify-between px-4 py-3 bg-void border border-border rounded-lg">
+        <div>
+          <p class="text-xs text-ghost font-mono font-500">Deduplicate All Rows</p>
+          <p class="text-xs text-dim font-mono mt-0.5">Remove rows where every column is identical. Applied globally across all columns. You can also dedupe on specific columns using the per-column rule below.</p>
+        </div>
+        <label class="relative inline-flex items-center cursor-pointer ml-4 shrink-0">
+          <input type="checkbox" id="dedupe-all-toggle" class="sr-only peer" onchange="updatePreview()">
+          <div class="w-10 h-5 bg-muted peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500"></div>
+        </label>
+      </div>
     </div>
   </section>
 
@@ -383,8 +394,6 @@ let currentFile  = null;
 let parsedHeaders = [];
 
 // ─── Rule definitions ──────────────────────────────────────────────────────────
-// Each rule maps to a backend rule string.
-// Groups rendered as <optgroup> in the dropdown.
 const RULE_GROUPS = [
   {
     label: '— No Rule —',
@@ -401,7 +410,7 @@ const RULE_GROUPS = [
       { value: 'PHONE_INTL:US',    label: 'Phone — USA E.164 (+1…)' },
       { value: 'PHONE_INTL:GB',    label: 'Phone — UK E.164 (+44…)' },
       { value: 'PHONE_INTL:ZA',    label: 'Phone — South Africa E.164 (+27…)' },
-      { value: 'EMAIL',            label: 'Email — Validate & normalise (returns object)' },
+      { value: 'EMAIL',            label: 'Email — Validate & normalise → {email, valid, reason}' },
       { value: 'EMAIL_NORMALIZE',  label: 'Email — Normalise only (lowercase + trim)' },
     ],
   },
@@ -421,23 +430,45 @@ const RULE_GROUPS = [
       { value: 'DATE',       label: 'Date — Normalise → ISO 8601 (YYYY-MM-DD)' },
       { value: 'to_int',     label: 'To Integer' },
       { value: 'to_float',   label: 'To Float' },
-      { value: 'CURRENCY',   label: 'Currency — Extract amount + ISO code (returns object)' },
+      { value: 'CURRENCY',   label: 'Currency — Extract amount + ISO code → {amount, currency}' },
+    ],
+  },
+  {
+    label: 'Kenya (KE) Locale',
+    rules: [
+      { value: 'KE_MPESA_ID', label: 'M-Pesa ID — Validate & normalise → {mpesa_id, valid}' },
+      { value: 'KE_COUNTY',   label: 'County — Normalise to official county name' },
+    ],
+  },
+  {
+    label: 'USA (US) Locale',
+    rules: [
+      { value: 'US_ZIP', label: 'ZIP Code — Validate & normalise → {zip, valid, zip4}' },
+      { value: 'US_SSN', label: 'SSN — Validate & mask → {ssn_masked, valid}' },
+    ],
+  },
+  {
+    label: 'PII & Security',
+    rules: [
+      { value: 'MASK',          label: 'Mask — Replace all chars with * (e.g. ********)' },
+      { value: 'MASK:4',        label: 'Mask — Keep last 4 chars visible (e.g. ****5678)' },
+      { value: 'ENCRYPT',       label: 'Encrypt — SHA-256 hash (uses X-Crypto-Salt header)' },
     ],
   },
   {
     label: 'Missing Values',
     rules: [
-      { value: 'drop_empty',   label: 'Drop Empty — Remove rows with blank value' },
-      { value: 'fill_mean',    label: 'Fill Mean — Replace blanks with column mean' },
-      { value: 'fill_median',  label: 'Fill Median — Replace blanks with column median' },
-      { value: 'fill_value:0', label: 'Fill Value — Replace blanks with 0' },
+      { value: 'drop_empty',     label: 'Drop Empty — Remove rows with blank value' },
+      { value: 'fill_mean',      label: 'Fill Mean — Replace blanks with column mean' },
+      { value: 'fill_median',    label: 'Fill Median — Replace blanks with column median' },
+      { value: 'fill_value:0',   label: 'Fill Value — Replace blanks with 0' },
       { value: 'fill_value:N/A', label: 'Fill Value — Replace blanks with N/A' },
     ],
   },
   {
-    label: 'Deduplication',
+    label: 'Deduplication (per-column)',
     rules: [
-      { value: 'dedupe', label: 'Dedupe — Remove duplicate rows on this column' },
+      { value: 'dedupe', label: 'Dedupe — Remove duplicate rows on this specific column' },
     ],
   },
 ];
@@ -594,10 +625,14 @@ function buildConfig() {
       columns[header] = [rule];
     }
   });
-  return {
+  const cfg = {
     columns,
     output_format: document.getElementById('output-format').value,
   };
+  if (document.getElementById('dedupe-all-toggle')?.checked) {
+    cfg.dedupe_all = true;
+  }
+  return cfg;
 }
 
 function updatePreview() {
@@ -627,7 +662,8 @@ async function submitJob() {
   formData.append('file', currentFile);
   formData.append('config', JSON.stringify(cfg));
   formData.append('output_format', outputFmt);
-  if (isDryRun) formData.append('dry_run', 'true');
+  if (isDryRun)   formData.append('dry_run',   'true');
+  if (cfg.dedupe_all) formData.append('dedupe_all', 'true');
 
   const headers = {};
   if (webhookUrl) headers['X-Webhook-URL'] = webhookUrl;
@@ -666,8 +702,18 @@ async function submitJob() {
       const dropped = body.rows_dropped != null
         ? ` · ${body.rows_dropped} rows dropped by sandbox limit`
         : '';
-      document.getElementById('success-detail').textContent =
-        `${body.rows_processed ?? '?'} rows queued → routed to webhook destination${dropped}`;
+      let detail = `${body.rows_processed ?? '?'} rows queued → routed to webhook destination${dropped}`;
+      if (body.job_id) detail += ` · job_id: ${body.job_id}`;
+      document.getElementById('success-detail').textContent = detail;
+
+      // Show poll button if we have a job_id
+      if (body.job_id && document.getElementById('api-key').value.trim()) {
+        const pollBtn = document.createElement('button');
+        pollBtn.className = 'mt-2 text-xs font-mono px-3 py-1.5 rounded border border-emerald-500/40 text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 cursor-pointer';
+        pollBtn.textContent = '↻ Poll job status';
+        pollBtn.onclick = () => pollJobStatus(body.job_id, document.getElementById('api-key').value.trim(), pollBtn);
+        document.getElementById('success-alert').appendChild(pollBtn);
+      }
       setStatus('QUEUED');
 
     // ── 200 Dry-run path ─────────────────────────────────────────────────────────────────
@@ -837,6 +883,41 @@ function setBtnLoading(loading, isDryRun = false) {
 function flashError(msg) {
   // Brief console note — no modal needed, field errors handle UX
   console.warn('[sandbox]', msg);
+}
+
+async function pollJobStatus(jobId, apiKey, btn) {
+  if (!jobId || !apiKey) return;
+  const origText = btn.textContent;
+  btn.textContent = '↻ Polling…';
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/v1/jobs/${jobId}`, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+    const body = await res.json().catch(() => ({}));
+    document.getElementById('response-json').innerHTML =
+      syntaxHighlight(JSON.stringify(body, null, 2));
+
+    const status = body.status || 'unknown';
+    const statusColors = {
+      delivered:  'text-emerald-400',
+      processing: 'text-amber-400',
+      queued:     'text-amber-400',
+      failed:     'text-rose-400',
+    };
+    btn.textContent = `Status: ${status.toUpperCase()}`;
+    btn.className   = btn.className.replace(/text-\w+-\d+/, '')
+                      + ' ' + (statusColors[status] || 'text-dim');
+    btn.disabled    = status === 'delivered' || status === 'failed';
+    // Keep polling if still in-flight
+    if (status === 'queued' || status === 'processing') {
+      setTimeout(() => pollJobStatus(jobId, apiKey, btn), 4000);
+    }
+  } catch (e) {
+    btn.textContent = origText;
+    btn.disabled = false;
+    console.error('Poll error:', e);
+  }
 }
 
 function escHtml(s) {

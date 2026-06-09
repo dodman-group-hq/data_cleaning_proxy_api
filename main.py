@@ -518,6 +518,28 @@ CREATE TABLE IF NOT EXISTS password_resets (
 CREATE INDEX IF NOT EXISTS idx_pw_reset_token  ON password_resets (token_hash);
 CREATE INDEX IF NOT EXISTS idx_pw_reset_user   ON password_resets (user_id);
 CREATE INDEX IF NOT EXISTS idx_pw_reset_expiry ON password_resets (expires_at);
+
+-- ---------------------------------------------------------------------------
+-- clean_jobs  (async job tracking — one row per webhook-mode POST /clean)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS clean_jobs (
+    id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    api_key_id    UUID         REFERENCES api_keys(id) ON DELETE SET NULL,
+    key_prefix    VARCHAR(32)  NOT NULL DEFAULT '',
+    status        VARCHAR(16)  NOT NULL DEFAULT 'queued'
+                               CHECK (status IN ('queued','processing','delivered','failed')),
+    webhook_url   TEXT         NOT NULL DEFAULT '',
+    rows_in       INT          NOT NULL DEFAULT 0,
+    rows_out      INT          NOT NULL DEFAULT 0,
+    file_type     VARCHAR(8)   NOT NULL DEFAULT '',
+    duration_ms   INT          NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_api_key ON clean_jobs (api_key_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_status  ON clean_jobs (status);
+CREATE INDEX IF NOT EXISTS idx_jobs_created ON clean_jobs (created_at DESC);
 """
 
 
@@ -3925,7 +3947,136 @@ def clean_date(value: Any) -> str | None:
     return None
 
 
-_TYPED_RULES = {"PHONE", "PHONE_INTL", "NAME", "DATE", "CURRENCY", "EMAIL", "EMAIL_NORMALIZE"}
+_TYPED_RULES = {
+    "PHONE", "PHONE_INTL", "NAME", "DATE", "CURRENCY",
+    "EMAIL", "EMAIL_NORMALIZE",
+    "MASK", "ENCRYPT",
+    "KE_MPESA_ID", "KE_COUNTY",
+    "US_ZIP", "US_SSN",
+}
+
+# ---------------------------------------------------------------------------
+# KE locale
+# ---------------------------------------------------------------------------
+_KE_COUNTIES: set[str] = {
+    "mombasa","kwale","kilifi","tana river","lamu","taita taveta","garissa",
+    "wajir","mandera","marsabit","isiolo","meru","tharaka-nithi","embu",
+    "kitui","machakos","makueni","nyandarua","nyeri","kirinyaga",
+    "murang'a","kiambu","turkana","west pokot","samburu","trans nzoia",
+    "uasin gishu","elgeyo-marakwet","nandi","baringo","laikipia","nakuru",
+    "narok","kajiado","kericho","bomet","kakamega","vihiga","bungoma",
+    "busia","siaya","kisumu","homa bay","migori","kisii","nyamira","nairobi",
+}
+_KE_COUNTY_CANONICAL: dict[str, str] = {c: c.title() for c in _KE_COUNTIES}
+_KE_COUNTY_ALIASES: dict[str, str] = {
+    "nairobi city": "Nairobi", "nairobi county": "Nairobi",
+    "muranga": "Murang'a",     "murang a": "Murang'a",
+    "tharaka nithi": "Tharaka-Nithi",
+    "elgeyo marakwet": "Elgeyo-Marakwet",
+    "taita/taveta": "Taita Taveta",
+}
+_KE_MPESA_RE = re.compile(r"^[A-Z0-9]{10}$")
+
+
+def clean_ke_mpesa_id(value: Any) -> dict:
+    """Validate/normalise M-Pesa transaction ID (10-char alphanumeric, e.g. RK12345678)."""
+    if value is None:
+        return {"mpesa_id": None, "valid": False, "reason": "empty"}
+    raw = re.sub(r"\s+", "", str(value).upper())
+    if not raw:
+        return {"mpesa_id": None, "valid": False, "reason": "empty"}
+    if _KE_MPESA_RE.match(raw):
+        return {"mpesa_id": raw, "valid": True, "reason": None}
+    return {"mpesa_id": raw, "valid": False,
+            "reason": f"expected 10 alphanumeric chars, got {len(raw)}"}
+
+
+def clean_ke_county(value: Any) -> str | None:
+    """Normalise a Kenyan county name to its official title-case form."""
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    if raw in _KE_COUNTY_CANONICAL:
+        return _KE_COUNTY_CANONICAL[raw]
+    if raw in _KE_COUNTY_ALIASES:
+        return _KE_COUNTY_ALIASES[raw]
+    stripped = re.sub(r"\s+county$", "", raw)
+    if stripped in _KE_COUNTY_CANONICAL:
+        return _KE_COUNTY_CANONICAL[stripped]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# US locale
+# ---------------------------------------------------------------------------
+_US_ZIP_RE = re.compile(r"^\d{5}(?:-\d{4})?$")
+
+
+def clean_us_zip(value: Any) -> dict:
+    """Validate and normalise a US ZIP code. Returns {zip, valid, zip4}."""
+    if value is None:
+        return {"zip": None, "valid": False, "zip4": None}
+    raw = str(value).strip()
+    if re.match(r"^\d{9}$", raw):           # 9-digit run → ZIP+4
+        raw = f"{raw[:5]}-{raw[5:]}"
+    if _US_ZIP_RE.match(raw):
+        parts = raw.split("-")
+        return {"zip": parts[0], "valid": True,
+                "zip4": parts[1] if len(parts) > 1 else None}
+    return {"zip": raw, "valid": False, "zip4": None}
+
+
+def clean_us_ssn(value: Any) -> dict:
+    """Validate and mask a US SSN. Never returns the full value — only {ssn_masked, valid}."""
+    if value is None:
+        return {"ssn_masked": None, "valid": False}
+    raw = re.sub(r"[^0-9]", "", str(value).strip())
+    if len(raw) != 9:
+        return {"ssn_masked": None, "valid": False}
+    area = raw[:3]
+    if area in ("000", "666") or area.startswith("9"):
+        return {"ssn_masked": None, "valid": False}
+    if raw[3:5] == "00" or raw[5:] == "0000":
+        return {"ssn_masked": None, "valid": False}
+    return {"ssn_masked": f"***-**-{raw[5:]}", "valid": True}
+
+
+# ---------------------------------------------------------------------------
+# PII — MASK and ENCRYPT
+# ---------------------------------------------------------------------------
+def clean_mask(value: Any, rule_str: str = "MASK") -> str | None:
+    """
+    MASK       → replace all characters with *
+    MASK:4     → keep last 4 characters visible  (e.g. ****5678)
+    MASK:4:X   → keep last 4 visible, use X as mask char (e.g. XXXX5678)
+    """
+    if value is None:
+        return None
+    s = str(value)
+    if not s:
+        return s
+    parts   = rule_str.split(":")
+    visible = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    char    = parts[2][:1] if len(parts) > 2 and parts[2] else "*"
+    keep    = min(max(0, visible), len(s))
+    return char * (len(s) - keep) + s[-keep:] if keep else char * len(s)
+
+
+def clean_encrypt(value: Any, salt: str = "") -> str | None:
+    """
+    One-way SHA-256 hash, optionally salted via X-Crypto-Salt header or ENCRYPT:<salt>.
+    Returns hex digest. Zero-knowledge — irreversible by design.
+    """
+    if value is None:
+        return None
+    s = str(value)
+    if not s:
+        return None
+    return hashlib.sha256((salt + s).encode()).hexdigest()
+
+
 
 
 def clean_phone_intl(value: Any, default_region: str = "KE") -> str | None:
@@ -4097,14 +4248,24 @@ def clean_email_normalize(value: Any) -> str | None:
     return raw if raw else None
 
 
-def apply_typed_rule(rule: str, value: Any) -> Any:
-    if rule == "PHONE":            return clean_phone_ke(value)
-    if rule == "PHONE_INTL":       return clean_phone_intl(value)
-    if rule == "NAME":             return clean_name(value)
-    if rule == "DATE":             return clean_date(value)
-    if rule == "CURRENCY":         return clean_currency(value)
-    if rule == "EMAIL":            return clean_email(value)
-    if rule == "EMAIL_NORMALIZE":  return clean_email_normalize(value)
+def apply_typed_rule(rule: str, value: Any, crypto_salt: str = "") -> Any:
+    if rule == "PHONE":           return clean_phone_ke(value)
+    if rule == "PHONE_INTL":      return clean_phone_intl(value)
+    if rule == "NAME":            return clean_name(value)
+    if rule == "DATE":            return clean_date(value)
+    if rule == "CURRENCY":        return clean_currency(value)
+    if rule == "EMAIL":           return clean_email(value)
+    if rule == "EMAIL_NORMALIZE": return clean_email_normalize(value)
+    if rule == "KE_MPESA_ID":     return clean_ke_mpesa_id(value)
+    if rule == "KE_COUNTY":       return clean_ke_county(value)
+    if rule == "US_ZIP":          return clean_us_zip(value)
+    if rule == "US_SSN":          return clean_us_ssn(value)
+    if rule == "MASK" or rule.startswith("MASK:"):
+        return clean_mask(value, rule_str=rule)
+    if rule == "ENCRYPT" or rule.startswith("ENCRYPT:"):
+        parts = rule.split(":", 1)
+        salt  = parts[1] if len(parts) > 1 else crypto_salt
+        return clean_encrypt(value, salt=salt)
     if rule.startswith("PHONE_INTL:"):
         region = rule.split(":", 1)[1].strip().upper() or "KE"
         return clean_phone_intl(value, default_region=region)
@@ -4139,7 +4300,7 @@ def apply_rule(rule: str, value: Any) -> Any:
     return value
 
 
-def process_row(row: Row, column_rules: dict[str, list[str]]) -> Row:
+def process_row(row: Row, column_rules: dict[str, list[str]], crypto_salt: str = "") -> Row:
     out: Row = {}
     for col, value in row.items():
         rules = column_rules.get(col)
@@ -4148,8 +4309,8 @@ def process_row(row: Row, column_rules: dict[str, list[str]]) -> Row:
         else:
             current = value
             for rule in rules:
-                if rule in _TYPED_RULES:
-                    current = apply_typed_rule(rule, current)
+                if rule in _TYPED_RULES or rule.startswith(("MASK:", "ENCRYPT:", "PHONE_INTL:")):
+                    current = apply_typed_rule(rule, current, crypto_salt=crypto_salt)
                 else:
                     current = apply_rule(rule, current)
             out[col] = current
@@ -4175,13 +4336,18 @@ def apply_fill_stat(sheet: Sheet, col: str, stat: str) -> Sheet:
     return sheet
 
 
-def clean_sheet(sheet: Sheet, column_rules: dict[str, list[str]]) -> Sheet:
+def clean_sheet(
+    sheet:        Sheet,
+    column_rules: dict[str, list[str]],
+    dedupe_all:   bool = False,
+    crypto_salt:  str  = "",
+) -> Sheet:
     stat_rules  = {"fill_mean", "fill_median"}
     rules_pass1 = {
         col: [r for r in rules if r not in stat_rules and r != "dedupe"]
         for col, rules in column_rules.items()
     }
-    sheet = [process_row(row, rules_pass1) for row in sheet]
+    sheet = [process_row(row, rules_pass1, crypto_salt=crypto_salt) for row in sheet]
 
     for col, rules in column_rules.items():
         for rule in rules:
@@ -4198,17 +4364,29 @@ def clean_sheet(sheet: Sheet, column_rules: dict[str, list[str]]) -> Sheet:
             )
         ]
 
-    # DEDUPE: remove rows that are exact duplicates on the specified column(s)
-    dedupe_cols = [col for col, rules in column_rules.items() if "dedupe" in rules]
-    if dedupe_cols:
-        seen:        set[tuple] = set()
-        deduped:     Sheet      = []
+    # ── Deduplication ────────────────────────────────────────────────────────
+    # dedupe_all=True  → deduplicate on every column (whole-row match)
+    # "dedupe" rule    → deduplicate on that specific column only
+    if dedupe_all:
+        seen:    set[tuple] = set()
+        deduped: Sheet      = []
         for row in sheet:
-            key = tuple(str(row.get(col, "")) for col in dedupe_cols)
+            key = tuple(str(v) for v in row.values())
             if key not in seen:
                 seen.add(key)
                 deduped.append(row)
         sheet = deduped
+    else:
+        dedupe_cols = [col for col, rules in column_rules.items() if "dedupe" in rules]
+        if dedupe_cols:
+            seen    = set()
+            deduped = []
+            for row in sheet:
+                key = tuple(str(row.get(col, "")) for col in dedupe_cols)
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(row)
+            sheet = deduped
 
     return sheet
 
@@ -4262,17 +4440,32 @@ async def _dispatch_webhook(
     payload:     list[Row],
     api_key_id:  str | None = None,
     key_prefix:  str        = "",
+    job_id:      str | None = None,
 ) -> None:
     """
     POST cleaned rows to the client's webhook URL.
-
-    Retries on failure using an exponential backoff schedule
-    (30 s → 5 min → 30 min).  After all attempts are exhausted the
-    payload metadata is written to webhook_dead_letter so nothing is
-    silently lost.
+    Retries: 30 s → 5 min → 30 min. After all attempts, writes to dead-letter
+    table and marks the job as failed.
     """
+
+    async def _set_job_status(status: str, error: str | None = None) -> None:
+        if not job_id:
+            return
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE clean_jobs
+                       SET status=$1, error_message=$2, updated_at=NOW()
+                       WHERE id=$3""",
+                    status, error, uuid.UUID(job_id),
+                )
+        except Exception:
+            log.exception("Failed to update job status job_id=%s", job_id)
+
+    await _set_job_status("processing")
     last_error: str = ""
-    total_attempts  = 1 + len(_WEBHOOK_RETRY_DELAYS)  # initial + retries
+    total_attempts  = 1 + len(_WEBHOOK_RETRY_DELAYS)
 
     for attempt in range(total_attempts):
         try:
@@ -4283,27 +4476,23 @@ async def _dispatch_webhook(
                     headers={"Content-Type": "application/json"},
                 )
                 response.raise_for_status()
-                log.info(
-                    "Webhook delivered: url=%s status=%s rows=%d attempt=%d",
-                    url, response.status_code, len(payload), attempt + 1,
-                )
-                return   # ✓ success — exit early
+                log.info("Webhook delivered: url=%s status=%s rows=%d attempt=%d job_id=%s",
+                         url, response.status_code, len(payload), attempt + 1, job_id)
+                await _set_job_status("delivered")
+                return
 
-        except httpx.TimeoutException as exc:
+        except httpx.TimeoutException:
             last_error = f"Timeout on attempt {attempt + 1}"
-            log.warning("Webhook timeout (attempt %d/%d): url=%s",
-                        attempt + 1, total_attempts, url)
+            log.warning("Webhook timeout (attempt %d/%d): url=%s", attempt + 1, total_attempts, url)
         except httpx.HTTPStatusError as exc:
             last_error = f"HTTP {exc.response.status_code} on attempt {attempt + 1}"
             log.warning("Webhook rejected (attempt %d/%d): url=%s status=%s",
                         attempt + 1, total_attempts, url, exc.response.status_code)
-            # 4xx from the client's server — retrying won't help
             if exc.response.status_code < 500:
                 break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc} on attempt {attempt + 1}"
-            log.exception("Webhook error (attempt %d/%d): url=%s error=%r",
-                          attempt + 1, total_attempts, url, exc)
+            log.exception("Webhook error (attempt %d/%d): url=%s", attempt + 1, total_attempts, url)
 
         # Wait before the next retry (skip sleep after the last attempt)
         if attempt < len(_WEBHOOK_RETRY_DELAYS):
@@ -4311,26 +4500,18 @@ async def _dispatch_webhook(
             log.info("Webhook retry in %ds: url=%s", delay, url)
             await asyncio.sleep(delay)
 
-    # All attempts exhausted — write to dead-letter table
-    log.error(
-        "Webhook failed after %d attempts — writing to DLQ: url=%s rows=%d",
-        total_attempts, url, len(payload),
-    )
+    log.error("Webhook failed after %d attempts — writing to DLQ: url=%s rows=%d",
+              total_attempts, url, len(payload))
+    await _set_job_status("failed", error=last_error)
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
-                """
-                INSERT INTO webhook_dead_letter
-                    (api_key_id, key_prefix, webhook_url, payload_rows, attempts, last_error)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                """,
+                """INSERT INTO webhook_dead_letter
+                       (api_key_id, key_prefix, webhook_url, payload_rows, attempts, last_error)
+                   VALUES ($1,$2,$3,$4,$5,$6)""",
                 uuid.UUID(api_key_id) if api_key_id else None,
-                key_prefix,
-                url,
-                len(payload),
-                total_attempts,
-                last_error,
+                key_prefix, url, len(payload), total_attempts, last_error,
             )
     except Exception:
         log.exception("Failed to write to DLQ for url=%s", url)
@@ -4361,17 +4542,22 @@ async def clean_file(
     config:           str | None = Form(default=None),
     output_format:    str | None = Form(default=None),
     dry_run:          bool       = Form(default=False),
+    dedupe_all:       bool       = Form(default=False),
     x_clean_config:   str | None = Header(default=None, alias="X-Clean-Config"),
     x_webhook_url:    str | None = Header(default=None, alias="X-Webhook-URL"),
     x_output_format:  str | None = Header(default=None, alias="X-Output-Format"),
     x_dry_run:        str | None = Header(default=None, alias="X-Dry-Run"),
+    x_dedupe_all:     str | None = Header(default=None, alias="X-Dedupe-All"),
+    x_crypto_salt:    str | None = Header(default=None, alias="X-Crypto-Salt"),
     api_key:          APIKeyRecord = Security(verify_api_key),
 ) -> Response:
 
     request.state.api_key_tier = api_key.tier
 
-    # ── Resolve dry_run flag (Form param or X-Dry-Run header) ─────────────────
-    is_dry_run = dry_run or (x_dry_run or "").strip().lower() in ("1", "true", "yes")
+    # ── Resolve flags ─────────────────────────────────────────────────────────
+    is_dry_run    = dry_run    or (x_dry_run    or "").strip().lower() in ("1", "true", "yes")
+    is_dedupe_all = dedupe_all or (x_dedupe_all or "").strip().lower() in ("1", "true", "yes")
+    crypto_salt   = (x_crypto_salt or "").strip()
 
     # ── Start the perf clock ──────────────────────────────────────────────────
     t_start = time.perf_counter()
@@ -4462,8 +4648,31 @@ async def clean_file(
         log.info("Row truncation: original=%d capped=%d key=%s",
                  original_row_count, _SANDBOX_ROW_LIMIT, api_key.key_prefix)
 
-    # ── Clean ─────────────────────────────────────────────────────────────────
-    cleaned   = clean_sheet(sheet, column_rules)
+    # ── Clean — chunk-stream for Pro, single-pass for Starter/Test ───────────
+    _CHUNK_SIZE = 10_000
+    is_pro = (api_key.tier or "").lower() == "pro" and not api_key.is_test
+
+    if is_pro and rows_in > _CHUNK_SIZE:
+        cleaned: Sheet = []
+        for i in range(0, len(sheet), _CHUNK_SIZE):
+            chunk = sheet[i: i + _CHUNK_SIZE]
+            cleaned.extend(clean_sheet(chunk, column_rules,
+                                       dedupe_all=is_dedupe_all,
+                                       crypto_salt=crypto_salt))
+        # Re-run dedupe_all across chunk boundaries
+        if is_dedupe_all:
+            seen_g: set[tuple] = set()
+            deduped_g: Sheet   = []
+            for row in cleaned:
+                key = tuple(str(v) for v in row.values())
+                if key not in seen_g:
+                    seen_g.add(key)
+                    deduped_g.append(row)
+            cleaned = deduped_g
+    else:
+        cleaned = clean_sheet(sheet, column_rules,
+                              dedupe_all=is_dedupe_all,
+                              crypto_salt=crypto_salt)
     sanitised = _sanitise_for_json(cleaned)
     rows_out  = len(sanitised)
 
@@ -4512,24 +4721,47 @@ async def clean_file(
 
     # ── Webhook mode → 202 ───────────────────────────────────────────────────
     if x_webhook_url:
+        # Create job record for status polling
+        job_id: str | None = None
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                job_row = await conn.fetchrow(
+                    """INSERT INTO clean_jobs
+                           (api_key_id, key_prefix, status, webhook_url,
+                            rows_in, rows_out, file_type, duration_ms)
+                       VALUES ($1,$2,'queued',$3,$4,$5,$6,$7)
+                       RETURNING id""",
+                    uuid.UUID(str(api_key.id)) if api_key.id else None,
+                    api_key.key_prefix,
+                    x_webhook_url,
+                    rows_in, rows_out, file_type, duration_ms,
+                )
+                job_id = str(job_row["id"])
+        except Exception:
+            log.exception("Failed to create job record — continuing without job_id")
+
         background_tasks.add_task(
             _dispatch_webhook,
             x_webhook_url,
             sanitised,
             str(api_key.id) if api_key.id else None,
             api_key.key_prefix,
+            job_id,
         )
-        log.info("Job queued: rows=%d webhook=%s key=%s truncated=%s duration_ms=%d",
-                 rows_out, x_webhook_url, api_key.key_prefix, truncated, duration_ms)
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status":         "queued",
-                "rows_processed": rows_out,
-                "duration_ms":    duration_ms,
-                **({"rows_dropped": original_row_count - _SANDBOX_ROW_LIMIT} if truncated else {}),
-            },
-        )
+        log.info("Job queued: job_id=%s rows=%d webhook=%s key=%s duration_ms=%d",
+                 job_id, rows_out, x_webhook_url, api_key.key_prefix, duration_ms)
+        resp: dict = {
+            "status":         "queued",
+            "rows_processed": rows_out,
+            "duration_ms":    duration_ms,
+        }
+        if job_id:
+            resp["job_id"]   = job_id
+            resp["poll_url"] = f"/api/v1/jobs/{job_id}"
+        if truncated:
+            resp["rows_dropped"] = original_row_count - _SANDBOX_ROW_LIMIT
+        return JSONResponse(status_code=202, content=resp)
 
     # ── Direct streaming mode → 200 ───────────────────────────────────────────
     if resolved_fmt == "csv":
@@ -4554,6 +4786,95 @@ async def clean_file(
         media_type=media_type,
         headers={"Content-Disposition": disposition, **extra_headers},
     )
+
+
+# ===========================================================================
+# Job status endpoint
+# ===========================================================================
+
+@router.get(
+    "/jobs/{job_id}",
+    summary="Poll async job status",
+    responses={
+        200: {"description": "Job found — returns status and metadata"},
+        400: {"description": "Invalid job ID format"},
+        403: {"description": "Job belongs to a different API key"},
+        404: {"description": "Job not found"},
+        503: {"description": "Database unavailable"},
+    },
+)
+async def get_job_status(
+    job_id:  str,
+    request: Request,
+    api_key: APIKeyRecord = Security(verify_api_key),
+) -> JSONResponse:
+    """
+    Poll the status of a webhook cleaning job returned by POST /clean.
+
+    Status lifecycle:  **queued → processing → delivered | failed**
+
+    - `queued`      — job created, webhook dispatch not yet started
+    - `processing`  — first delivery attempt in progress
+    - `delivered`   — webhook accepted the payload (2xx response)
+    - `failed`      — all retry attempts exhausted; check `error` field
+    """
+    try:
+        uid = uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=_error_envelope("INVALID_JOB_ID",
+                                   "job_id must be a valid UUID.",
+                                   _get_request_id(request)),
+        )
+
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT id, api_key_id, key_prefix, status, webhook_url,
+                          rows_in, rows_out, file_type, duration_ms,
+                          error_message, created_at, updated_at
+                   FROM clean_jobs WHERE id = $1""",
+                uid,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=_error_envelope("DB_ERROR",
+                                   "Could not query job status.",
+                                   _get_request_id(request)),
+        ) from exc
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=_error_envelope("JOB_NOT_FOUND",
+                                   f"No job found with id {job_id}.",
+                                   _get_request_id(request)),
+        )
+
+    # Ownership check — job must belong to the requesting API key
+    if str(row["api_key_id"]) != str(api_key.id):
+        raise HTTPException(
+            status_code=403,
+            detail=_error_envelope("FORBIDDEN",
+                                   "This job does not belong to your API key.",
+                                   _get_request_id(request)),
+        )
+
+    return JSONResponse(content={
+        "job_id":      str(row["id"]),
+        "status":      row["status"],
+        "webhook_url": row["webhook_url"],
+        "rows_in":     row["rows_in"],
+        "rows_out":    row["rows_out"],
+        "file_type":   row["file_type"],
+        "duration_ms": row["duration_ms"],
+        "error":       row["error_message"],
+        "created_at":  row["created_at"].isoformat(),
+        "updated_at":  row["updated_at"].isoformat(),
+    })
 
 
 # ===========================================================================
