@@ -140,6 +140,29 @@ _MAX_FILE_BYTES_PRO     = 500 * 1024 * 1024   # 500 MB
 _MAX_FILE_BYTES_TEST    = 1   * 1024 * 1024   # 1 MB  (sandbox / test keys)
 
 # ---------------------------------------------------------------------------
+# Monthly row quotas — enforced at the start of every /clean request.
+# Sandbox / test keys share the FREE_MONTHLY_ROWS cap but are also
+# hard-truncated to 20 rows per request so they rarely hit it.
+# ---------------------------------------------------------------------------
+_MONTHLY_ROWS_FREE    = int(os.getenv("MONTHLY_ROWS_FREE",    "10000"))     # sandbox / free
+_MONTHLY_ROWS_STARTER = int(os.getenv("MONTHLY_ROWS_STARTER", "500000"))    # starter paid
+_MONTHLY_ROWS_PRO     = int(os.getenv("MONTHLY_ROWS_PRO",     "5000000"))   # pro paid
+
+# Maximum live API keys allowed per user per tier
+_MAX_LIVE_KEYS_STARTER = 1
+_MAX_LIVE_KEYS_PRO     = 5
+
+# Feature gates — which tiers can use which capabilities
+_TIERS_WEBHOOK         = {"starter", "pro"}   # async webhook delivery
+_TIERS_ENCRYPT         = {"pro"}               # ENCRYPT / X-Crypto-Salt rule
+_TIERS_DEDUPE_ALL_FULL = {"pro"}               # dedupe_all on files > threshold
+_DEDUPE_ALL_ROW_LIMIT  = 10_000               # Starter can dedupe_all up to this many rows
+
+# Concurrent webhook background tasks — prevents asyncio task pool exhaustion
+# when many clients have flaky webhook endpoints.
+_WEBHOOK_SEMAPHORE = asyncio.Semaphore(20)
+
+# ---------------------------------------------------------------------------
 # Password hashing
 # ---------------------------------------------------------------------------
 
@@ -224,9 +247,16 @@ app.state.limiter = limiter
 # Templates — rendered for the dashboard route
 templates = Jinja2Templates(directory="templates")
 
+# CORS_ALLOWED_ORIGINS: comma-separated list of allowed origins.
+# Defaults to localhost only so that credentials (session cookies) are never
+# sent cross-origin in production without an explicit opt-in.
+# Example env value: "https://app.dodman.group,https://dodman.group"
+_CORS_ORIGINS_RAW = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000")
+_CORS_ORIGINS = [o.strip().rstrip("/") for o in _CORS_ORIGINS_RAW.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["POST", "GET", "OPTIONS", "PATCH", "DELETE"],
     allow_headers=["*"],
     allow_credentials=True,
@@ -540,6 +570,39 @@ CREATE TABLE IF NOT EXISTS clean_jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_api_key ON clean_jobs (api_key_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status  ON clean_jobs (status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON clean_jobs (created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Monthly usage summary view — used by /clean quota check
+-- Materialized as a plain query (no MAT VIEW needed — covered by index below).
+-- ---------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_ledger_key_month
+    ON billing_ledger (api_key_id, date_trunc('month', timestamp));
+
+-- ---------------------------------------------------------------------------
+-- TTL cleanup function — call periodically to prune old telemetry rows.
+-- Retains 13 months for billing disputes; older rows are discarded.
+-- Schedule via pg_cron or an external cron job:
+--   SELECT prune_old_telemetry();
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION prune_old_telemetry() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM billing_ledger
+    WHERE  timestamp < NOW() - INTERVAL '13 months';
+
+    DELETE FROM audit_logs
+    WHERE  timestamp < NOW() - INTERVAL '13 months';
+
+    DELETE FROM clean_jobs
+    WHERE  created_at < NOW() - INTERVAL '90 days'
+    AND    status IN ('delivered', 'failed');
+
+    DELETE FROM webhook_dead_letter
+    WHERE  created_at < NOW() - INTERVAL '30 days';
+
+    DELETE FROM password_resets
+    WHERE  expires_at < NOW() - INTERVAL '7 days';
+END;
+$$;
 """
 
 
@@ -618,9 +681,35 @@ async def _write_billing_ledger(
         log.exception("billing_ledger insert failed — non-fatal")
 
 
-# ===========================================================================
-# Audit log writer
-# ===========================================================================
+async def _get_monthly_rows_used(pool: asyncpg.Pool, api_key_id: str) -> int:
+    """
+    Return the total rows_out already billed for this api_key_id in the
+    current calendar month.  Returns 0 for sandbox keys (no DB row).
+    """
+    if not api_key_id:
+        return 0
+    try:
+        key_uuid = uuid.UUID(str(api_key_id))
+    except ValueError:
+        return 0
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT COALESCE(SUM(rows_out), 0)::BIGINT AS total
+                FROM   billing_ledger
+                WHERE  api_key_id = $1
+                AND    timestamp  >= date_trunc('month', NOW())
+                """,
+                key_uuid,
+            )
+        return int(row["total"]) if row else 0
+    except Exception:
+        log.exception("monthly_rows_used query failed — defaulting to 0 (non-fatal)")
+        return 0
+
+
+
 # Writes to the shared audit_logs table used across all Dodman services.
 # Every row carries  details->>'service' = 'data_cleaning_proxy'  so you can
 # filter this service out of the shared table with a single WHERE clause:
@@ -1206,6 +1295,7 @@ class ForgotPasswordRequest(BaseModel):
 
 
 @auth_router.post("/forgot-password", summary="Request a password reset email")
+@limiter.limit("5/hour", key_func=get_remote_address)
 async def forgot_password(
     request: Request,
     body:    ForgotPasswordRequest,
@@ -1685,6 +1775,31 @@ async def create_user_api_key(
     hashed = _hash_key(raw)
     prefix = raw[:16]
     label  = (body.label or current_user["email"]).strip()
+
+    # ── Enforce per-tier live key limit ───────────────────────────────────────
+    if env == "live":
+        sub_plan = current_user.get("sub_plan", "free")
+        max_live = _MAX_LIVE_KEYS_PRO if sub_plan == "pro" else _MAX_LIVE_KEYS_STARTER
+        async with pool.acquire() as conn:
+            live_count_row = await conn.fetchrow(
+                """
+                SELECT COUNT(*) AS cnt FROM api_keys
+                WHERE  user_id = $1 AND environment = 'live' AND is_active = TRUE
+                """,
+                uuid.UUID(current_user["id"]),
+            )
+        live_count = int(live_count_row["cnt"]) if live_count_row else 0
+        if live_count >= max_live:
+            raise HTTPException(
+                status_code=409,
+                detail=_error_envelope(
+                    "KEY_LIMIT_REACHED",
+                    f"Your {sub_plan} plan allows a maximum of {max_live} active live "
+                    f"API key(s). Deactivate an existing key before issuing a new one, "
+                    f"or upgrade to Pro for more keys.",
+                    _get_request_id(request),
+                ),
+            )
 
     async with pool.acquire() as conn:
         # Deactivate ALL existing keys for this user+environment before issuing
@@ -3877,6 +3992,45 @@ def parse_file(filename: str, data: bytes) -> tuple[Sheet, str]:
     )
 
 
+def _parse_xlsx_with_type(data: bytes) -> tuple[Sheet, str]:
+    """
+    Synchronous XLSX parser that returns (sheet, 'xlsx').
+    Designed to be called via run_in_executor so the heavy openpyxl work
+    runs in a thread pool and never blocks the asyncio event loop.
+    """
+    return _parse_xlsx(data), "xlsx"
+
+
+def _clean_in_chunks(
+    sheet:        Sheet,
+    column_rules: dict,
+    dedupe_all:   bool,
+    crypto_salt:  str,
+    chunk_size:   int,
+) -> Sheet:
+    """
+    Pure-Python chunked cleaning, safe to run in a thread pool executor.
+    Processes sheet in chunk_size batches then applies a global dedupe pass
+    if dedupe_all is True.
+    """
+    cleaned: Sheet = []
+    for i in range(0, len(sheet), chunk_size):
+        chunk = sheet[i: i + chunk_size]
+        cleaned.extend(clean_sheet(chunk, column_rules,
+                                   dedupe_all=dedupe_all,
+                                   crypto_salt=crypto_salt))
+    if dedupe_all:
+        seen_g: set[tuple] = set()
+        deduped_g: Sheet   = []
+        for row in cleaned:
+            key = tuple(str(v) for v in row.values())
+            if key not in seen_g:
+                seen_g.add(key)
+                deduped_g.append(row)
+        cleaned = deduped_g
+    return cleaned
+
+
 # ===========================================================================
 # Rule engine  (unchanged from v1)
 # ===========================================================================
@@ -4559,6 +4713,34 @@ async def clean_file(
     is_dedupe_all = dedupe_all or (x_dedupe_all or "").strip().lower() in ("1", "true", "yes")
     crypto_salt   = (x_crypto_salt or "").strip()
 
+    tier = (api_key.tier or "free").lower()
+
+    # ── Feature gate: ENCRYPT rule ────────────────────────────────────────────
+    # ENCRYPT and X-Crypto-Salt are Pro-only. Reject early so the user gets a
+    # clear error rather than the salt being silently ignored.
+    if crypto_salt and tier not in _TIERS_ENCRYPT:
+        raise HTTPException(
+            status_code=403,
+            detail=_error_envelope(
+                "FEATURE_NOT_AVAILABLE",
+                "The ENCRYPT rule and X-Crypto-Salt header require a Pro subscription. "
+                "Visit /dashboard/billing to upgrade.",
+                _get_request_id(request),
+            ),
+        )
+
+    # ── Feature gate: webhook mode ────────────────────────────────────────────
+    if x_webhook_url and tier not in _TIERS_WEBHOOK:
+        raise HTTPException(
+            status_code=403,
+            detail=_error_envelope(
+                "FEATURE_NOT_AVAILABLE",
+                "Async webhook delivery (X-Webhook-URL) requires a Starter or Pro "
+                "subscription. Visit /dashboard/billing to upgrade.",
+                _get_request_id(request),
+            ),
+        )
+
     # ── Start the perf clock ──────────────────────────────────────────────────
     t_start = time.perf_counter()
 
@@ -4570,7 +4752,7 @@ async def clean_file(
     if api_key.is_test:
         max_bytes = _MAX_FILE_BYTES_TEST
         tier_label = "test"
-    elif (api_key.tier or "").lower() == "pro":
+    elif tier == "pro":
         max_bytes = _MAX_FILE_BYTES_PRO
         tier_label = "pro"
     else:
@@ -4590,9 +4772,56 @@ async def clean_file(
             ),
         )
 
-    # ── Parse ─────────────────────────────────────────────────────────────────
-    sheet, file_type = parse_file(fname, raw_bytes)
-    rows_in          = len(sheet)
+    # ── Parse — XLSX is CPU-heavy; run off the event loop to avoid blocking ───
+    lower_fname = fname.lower()
+    if lower_fname.endswith(".xlsx"):
+        loop  = asyncio.get_event_loop()
+        sheet, file_type = await loop.run_in_executor(
+            None, lambda: _parse_xlsx_with_type(raw_bytes)
+        )
+    else:
+        sheet, file_type = parse_file(fname, raw_bytes)
+    rows_in = len(sheet)
+
+    # ── Monthly row quota check ───────────────────────────────────────────────
+    # Sandbox / test keys use the free cap but are also hard-truncated to 20
+    # rows per request, so they never realistically hit this limit.
+    if not api_key.is_sandbox and api_key.id:
+        try:
+            pool_obj = await get_pool()
+            rows_used = await _get_monthly_rows_used(pool_obj, api_key.id)
+        except HTTPException:
+            rows_used = 0   # DB unavailable — allow the request, log the miss
+
+        if tier == "pro":
+            monthly_cap = _MONTHLY_ROWS_PRO
+        elif tier == "starter":
+            monthly_cap = _MONTHLY_ROWS_STARTER
+        else:
+            monthly_cap = _MONTHLY_ROWS_FREE
+
+        rows_remaining = monthly_cap - rows_used
+        if rows_remaining <= 0:
+            raise HTTPException(
+                status_code=429,
+                detail=_error_envelope(
+                    "MONTHLY_QUOTA_EXCEEDED",
+                    f"You have used all {monthly_cap:,} rows in your monthly allowance. "
+                    f"Your quota resets at the start of next month. "
+                    f"Visit /dashboard/billing to upgrade for a higher limit.",
+                    _get_request_id(request),
+                    {"rows_used": rows_used, "monthly_cap": monthly_cap},
+                ),
+            )
+        # If the file would push the user over their cap, trim it rather than
+        # reject entirely — they still get value and a clear warning header.
+        if rows_in > rows_remaining:
+            sheet    = sheet[:rows_remaining]
+            rows_in  = rows_remaining
+            log.info(
+                "Quota trim: key=%s rows_requested=%d rows_remaining=%d",
+                api_key.key_prefix, len(sheet) + (rows_in - rows_remaining), rows_remaining,
+            )
 
     # ── Config ────────────────────────────────────────────────────────────────
     cfg          = resolve_config(x_clean_config, config)
@@ -4603,6 +4832,22 @@ async def clean_file(
     )
     if resolved_fmt not in {"json", "csv"}:
         resolved_fmt = "json"
+
+    # ── Feature gate: ENCRYPT rule in column_rules ────────────────────────────
+    # Even if X-Crypto-Salt is absent, someone could pass ENCRYPT in column_rules.
+    if tier not in _TIERS_ENCRYPT:
+        for col, rules in column_rules.items():
+            for r in rules:
+                if r == "ENCRYPT" or r.startswith("ENCRYPT:"):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=_error_envelope(
+                            "FEATURE_NOT_AVAILABLE",
+                            "The ENCRYPT rule requires a Pro subscription. "
+                            "Visit /dashboard/billing to upgrade.",
+                            _get_request_id(request),
+                        ),
+                    )
 
     # ── DRY-RUN: validate config against headers only, return immediately ─────
     if is_dry_run:
@@ -4648,27 +4893,32 @@ async def clean_file(
         log.info("Row truncation: original=%d capped=%d key=%s",
                  original_row_count, _SANDBOX_ROW_LIMIT, api_key.key_prefix)
 
+    # ── Feature gate: dedupe_all ──────────────────────────────────────────────
+    # Starter can run dedupe_all on files up to _DEDUPE_ALL_ROW_LIMIT rows.
+    # Pro has no row-count restriction.
+    if is_dedupe_all and tier not in _TIERS_DEDUPE_ALL_FULL:
+        if rows_in > _DEDUPE_ALL_ROW_LIMIT:
+            raise HTTPException(
+                status_code=403,
+                detail=_error_envelope(
+                    "FEATURE_NOT_AVAILABLE",
+                    f"dedupe_all on files larger than {_DEDUPE_ALL_ROW_LIMIT:,} rows "
+                    f"requires a Pro subscription. Your file has {rows_in:,} rows. "
+                    "Visit /dashboard/billing to upgrade.",
+                    _get_request_id(request),
+                ),
+            )
+
     # ── Clean — chunk-stream for Pro, single-pass for Starter/Test ───────────
     _CHUNK_SIZE = 10_000
-    is_pro = (api_key.tier or "").lower() == "pro" and not api_key.is_test
+    is_pro_live = tier == "pro" and not api_key.is_test
 
-    if is_pro and rows_in > _CHUNK_SIZE:
-        cleaned: Sheet = []
-        for i in range(0, len(sheet), _CHUNK_SIZE):
-            chunk = sheet[i: i + _CHUNK_SIZE]
-            cleaned.extend(clean_sheet(chunk, column_rules,
-                                       dedupe_all=is_dedupe_all,
-                                       crypto_salt=crypto_salt))
-        # Re-run dedupe_all across chunk boundaries
-        if is_dedupe_all:
-            seen_g: set[tuple] = set()
-            deduped_g: Sheet   = []
-            for row in cleaned:
-                key = tuple(str(v) for v in row.values())
-                if key not in seen_g:
-                    seen_g.add(key)
-                    deduped_g.append(row)
-            cleaned = deduped_g
+    if is_pro_live and rows_in > _CHUNK_SIZE:
+        loop = asyncio.get_event_loop()
+        cleaned: Sheet = await loop.run_in_executor(
+            None,
+            lambda: _clean_in_chunks(sheet, column_rules, is_dedupe_all, crypto_salt, _CHUNK_SIZE),
+        )
     else:
         cleaned = clean_sheet(sheet, column_rules,
                               dedupe_all=is_dedupe_all,
@@ -4741,27 +4991,30 @@ async def clean_file(
         except Exception:
             log.exception("Failed to create job record — continuing without job_id")
 
-        background_tasks.add_task(
-            _dispatch_webhook,
-            x_webhook_url,
-            sanitised,
-            str(api_key.id) if api_key.id else None,
-            api_key.key_prefix,
-            job_id,
-        )
+        async def _semaphored_dispatch() -> None:
+            async with _WEBHOOK_SEMAPHORE:
+                await _dispatch_webhook(
+                    x_webhook_url,
+                    sanitised,
+                    str(api_key.id) if api_key.id else None,
+                    api_key.key_prefix,
+                    job_id,
+                )
+
+        background_tasks.add_task(_semaphored_dispatch)
         log.info("Job queued: job_id=%s rows=%d webhook=%s key=%s duration_ms=%d",
                  job_id, rows_out, x_webhook_url, api_key.key_prefix, duration_ms)
-        resp: dict = {
+        resp_data: dict = {
             "status":         "queued",
             "rows_processed": rows_out,
             "duration_ms":    duration_ms,
         }
         if job_id:
-            resp["job_id"]   = job_id
-            resp["poll_url"] = f"/api/v1/jobs/{job_id}"
+            resp_data["job_id"]   = job_id
+            resp_data["poll_url"] = f"/api/v1/jobs/{job_id}"
         if truncated:
-            resp["rows_dropped"] = original_row_count - _SANDBOX_ROW_LIMIT
-        return JSONResponse(status_code=202, content=resp)
+            resp_data["rows_dropped"] = original_row_count - _SANDBOX_ROW_LIMIT
+        return JSONResponse(status_code=202, content=resp_data)
 
     # ── Direct streaming mode → 200 ───────────────────────────────────────────
     if resolved_fmt == "csv":
@@ -4776,6 +5029,22 @@ async def clean_file(
     extra_headers: dict[str, str] = {"X-Duration-Ms": str(duration_ms)}
     if truncated:
         extra_headers["X-Rows-Truncated"] = str(original_row_count - _SANDBOX_ROW_LIMIT)
+    # Expose quota consumption so clients can track usage without a separate API call
+    if not api_key.is_sandbox and api_key.id:
+        try:
+            pool_obj = await get_pool()
+            _used_after = await _get_monthly_rows_used(pool_obj, api_key.id)
+            if tier == "pro":
+                _cap = _MONTHLY_ROWS_PRO
+            elif tier == "starter":
+                _cap = _MONTHLY_ROWS_STARTER
+            else:
+                _cap = _MONTHLY_ROWS_FREE
+            extra_headers["X-Quota-Rows-Used"]      = str(_used_after + rows_out)
+            extra_headers["X-Quota-Rows-Limit"]     = str(_cap)
+            extra_headers["X-Quota-Rows-Remaining"]  = str(max(0, _cap - _used_after - rows_out))
+        except Exception:
+            pass  # Non-critical — never block the response over a header
 
     log.info("Streaming: format=%s rows=%d size=%d key=%s duration_ms=%d",
              resolved_fmt, rows_out, len(payload), api_key.key_prefix, duration_ms)
