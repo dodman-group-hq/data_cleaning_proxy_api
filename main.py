@@ -3626,7 +3626,7 @@ def clean_date(value: Any) -> str | None:
     return None
 
 
-_TYPED_RULES = {"PHONE", "PHONE_INTL", "NAME", "DATE", "CURRENCY"}
+_TYPED_RULES = {"PHONE", "PHONE_INTL", "NAME", "DATE", "CURRENCY", "EMAIL", "EMAIL_NORMALIZE"}
 
 
 def clean_phone_intl(value: Any, default_region: str = "KE") -> str | None:
@@ -3735,16 +3735,82 @@ def clean_currency(value: Any) -> dict | None:
     return {"amount": amount, "currency": detected_iso or ""}
 
 
+# RFC 5322-compatible simplified email regex
+_EMAIL_RE = re.compile(
+    r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+)
+
+
+def clean_email(value: Any) -> dict:
+    """
+    Validate and normalise an email address.
+    Returns {"email": str, "valid": bool, "reason": str|None}.
+
+    Checks performed:
+      1. Basic RFC 5322 structure (local@domain.tld)
+      2. No consecutive dots in local part or domain
+      3. Domain has at least one dot (rejects 'user@localhost')
+      4. Local part ≤ 64 chars, full address ≤ 254 chars (RFC 5321)
+      5. Normalises to lowercase
+
+    Note: This is a structural check. For deliverability verification
+    (MX record lookup) set rule to EMAIL_VERIFY instead.
+    """
+    if value is None:
+        return {"email": None, "valid": False, "reason": "empty"}
+
+    raw = str(value).strip().lower()
+    if not raw:
+        return {"email": None, "valid": False, "reason": "empty"}
+
+    if len(raw) > 254:
+        return {"email": raw, "valid": False, "reason": "address too long (>254 chars)"}
+
+    if not _EMAIL_RE.match(raw):
+        return {"email": raw, "valid": False, "reason": "invalid format"}
+
+    local, domain = raw.rsplit("@", 1)
+
+    if len(local) > 64:
+        return {"email": raw, "valid": False, "reason": "local part too long (>64 chars)"}
+
+    if ".." in local:
+        return {"email": raw, "valid": False, "reason": "consecutive dots in local part"}
+
+    if ".." in domain:
+        return {"email": raw, "valid": False, "reason": "consecutive dots in domain"}
+
+    if "." not in domain:
+        return {"email": raw, "valid": False, "reason": "domain has no TLD"}
+
+    return {"email": raw, "valid": True, "reason": None}
+
+
+def clean_email_normalize(value: Any) -> str | None:
+    """
+    Lightweight version: just normalise casing and strip whitespace.
+    Returns the cleaned email string, or None if value is empty.
+    No validation — use EMAIL for full validation.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    return raw if raw else None
+
+
 def apply_typed_rule(rule: str, value: Any) -> Any:
-    if rule == "PHONE":       return clean_phone_ke(value)
-    if rule == "PHONE_INTL":  return clean_phone_intl(value)
-    if rule == "NAME":        return clean_name(value)
-    if rule == "DATE":        return clean_date(value)
-    if rule == "CURRENCY":    return clean_currency(value)
+    if rule == "PHONE":            return clean_phone_ke(value)
+    if rule == "PHONE_INTL":       return clean_phone_intl(value)
+    if rule == "NAME":             return clean_name(value)
+    if rule == "DATE":             return clean_date(value)
+    if rule == "CURRENCY":         return clean_currency(value)
+    if rule == "EMAIL":            return clean_email(value)
+    if rule == "EMAIL_NORMALIZE":  return clean_email_normalize(value)
     if rule.startswith("PHONE_INTL:"):
         region = rule.split(":", 1)[1].strip().upper() or "KE"
         return clean_phone_intl(value, default_region=region)
     return apply_rule(rule, value)
+
 
 
 def apply_rule(rule: str, value: Any) -> Any:
