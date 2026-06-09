@@ -575,8 +575,8 @@ CREATE INDEX IF NOT EXISTS idx_jobs_created ON clean_jobs (created_at DESC);
 -- Monthly usage summary view — used by /clean quota check
 -- Materialized as a plain query (no MAT VIEW needed — covered by index below).
 -- ---------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_ledger_key_month
-    ON billing_ledger (api_key_id, date_trunc('month', timestamp));
+CREATE INDEX IF NOT EXISTS idx_ledger_key_ts
+    ON billing_ledger (api_key_id, timestamp DESC);
 
 -- ---------------------------------------------------------------------------
 -- TTL cleanup function — call periodically to prune old telemetry rows.
