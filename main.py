@@ -233,12 +233,25 @@ def _decode_session_token(token: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _rate_limit_identifier(request: StarletteRequest) -> str:
+    """
+    Build the rate-limit bucket key.  For API calls we use the Bearer token
+    so each key gets its own counter bucket.  For unauthenticated calls we
+    fall back to IP.
+
+    Risk 6: we prefix "tier:<tier>|" onto the key so _burst_limit_by_key()
+    can recover the tier from the key string without a DB lookup.
+    request.state.api_key_tier is set by the verify_api_key dependency before
+    the limiter runs (FastAPI resolves Security() deps before the handler body,
+    but the limiter decorator fires from the routing layer — to be safe we also
+    check state and default to "free" if not yet set).
+    """
+    tier = getattr(request.state, "api_key_tier", "free") or "free"
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
         if token:
-            return token
-    return get_remote_address(request)
+            return f"tier:{tier}|{token}"
+    return f"tier:{tier}|{get_remote_address(request)}"
 
 
 limiter = Limiter(key_func=_rate_limit_identifier, default_limits=[])
@@ -1197,17 +1210,29 @@ def _resolve_tier_limit(request: StarletteRequest) -> str:
     }.get(tier, RATE_LIMIT_DEFAULT)
 
 
-def _resolve_tier_burst_limit(request: StarletteRequest) -> str:
+
+def _burst_limit_by_key(key: str) -> str:
     """
-    Risk 6 mitigation: secondary per-minute burst ceiling.
-    Only meaningfully restrictive for Pro — Free/Starter have low hourly caps
-    that already preclude burst abuse without a separate minute-level guard.
+    Risk 6 mitigation: per-minute burst ceiling.
+
+    slowapi's LimitGroup.__iter__ only supports two callable signatures for
+    dynamic limit providers:
+      • fn()      — zero-arg
+      • fn(key)   — called with key_func(request) result
+
+    It never passes the request object directly, so we encode the tier into
+    the key string inside _rate_limit_identifier (prefixed "tier:<tier>|")
+    and decode it here — no extra DB round-trip needed.
     """
-    tier = getattr(request.state, "api_key_tier", "free")
+    # key format: "tier:pro|<token>"  /  "tier:starter|<token>"  /  plain IP
+    if key.startswith("tier:"):
+        tier = key.split("|", 1)[0][5:]
+    else:
+        tier = "free"
     return {
         "free":    "5/minute",
         "starter": "50/minute",
-        "pro":     RATE_LIMIT_PRO_BURST,   # default 500/minute
+        "pro":     RATE_LIMIT_PRO_BURST,
     }.get(tier, "10/minute")
 
 
@@ -4891,7 +4916,7 @@ async def _dispatch_webhook(
     },
 )
 @limiter.limit(RATE_LIMIT_DEFAULT, key_func=_rate_limit_identifier)
-@limiter.limit(_resolve_tier_burst_limit, key_func=_rate_limit_identifier)  # Risk 6: per-minute burst cap
+@limiter.limit(_burst_limit_by_key, key_func=_rate_limit_identifier)  # Risk 6: per-minute burst cap
 async def clean_file(
     request:          Request,
     background_tasks: BackgroundTasks,
