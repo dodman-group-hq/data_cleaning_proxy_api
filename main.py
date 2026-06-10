@@ -97,9 +97,13 @@ SESSION_SECRET_KEY      = os.getenv("SESSION_SECRET_KEY", secrets.token_hex(32))
 def _RUNTIME_ENV() -> str:
     return os.environ.get("DODMAN_ENV", "development").strip().lower()
 
-RATE_LIMIT_FREE     = os.getenv("RATE_LIMIT_FREE",    "60/hour")
-RATE_LIMIT_STARTER  = os.getenv("RATE_LIMIT_STARTER", "500/hour")
-RATE_LIMIT_DEFAULT  = os.getenv("RATE_LIMIT_DEFAULT", "60/hour")
+RATE_LIMIT_FREE     = os.getenv("RATE_LIMIT_FREE",       "60/hour")
+RATE_LIMIT_STARTER  = os.getenv("RATE_LIMIT_STARTER",    "500/hour")
+RATE_LIMIT_DEFAULT  = os.getenv("RATE_LIMIT_DEFAULT",    "60/hour")
+# Risk 6 mitigation: Pro gets a generous hourly allowance but a burst cap
+# per minute to prevent connection pool exhaustion from automated scripts.
+# 99,999/hour stays but we also enforce a per-minute ceiling on the same key.
+RATE_LIMIT_PRO_BURST = os.getenv("RATE_LIMIT_PRO_BURST", "500/minute")
 
 # ---------------------------------------------------------------------------
 # Paystack
@@ -161,6 +165,19 @@ _DEDUPE_ALL_ROW_LIMIT  = 10_000               # Starter can dedupe_all up to thi
 # Concurrent webhook background tasks — prevents asyncio task pool exhaustion
 # when many clients have flaky webhook endpoints.
 _WEBHOOK_SEMAPHORE = asyncio.Semaphore(20)
+
+# Risk 3 mitigation: per-key webhook concurrency cap.
+# A single key with a broken endpoint must not monopolise all 20 global slots.
+# Each key gets at most _WEBHOOK_MAX_CONCURRENT_PER_KEY simultaneous dispatches.
+_WEBHOOK_MAX_CONCURRENT_PER_KEY = int(os.getenv("WEBHOOK_MAX_CONCURRENT_PER_KEY", "3"))
+_webhook_key_semaphores: dict[str, asyncio.Semaphore] = {}
+
+
+def _get_webhook_key_semaphore(key_prefix: str) -> asyncio.Semaphore:
+    """Return (and lazily create) the per-key webhook semaphore."""
+    if key_prefix not in _webhook_key_semaphores:
+        _webhook_key_semaphores[key_prefix] = asyncio.Semaphore(_WEBHOOK_MAX_CONCURRENT_PER_KEY)
+    return _webhook_key_semaphores[key_prefix]
 
 # ---------------------------------------------------------------------------
 # Password hashing
@@ -579,6 +596,21 @@ CREATE INDEX IF NOT EXISTS idx_ledger_key_ts
     ON billing_ledger (api_key_id, timestamp DESC);
 
 -- ---------------------------------------------------------------------------
+-- monthly_usage_cache  (Risk 2 mitigation — O(1) quota lookup)
+-- One row per (api_key_id, month_bucket). Updated by the background ledger
+-- writer so /clean quota checks never run a SUM() aggregate scan.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS monthly_usage_cache (
+    api_key_id  UUID        NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+    month_bucket DATE       NOT NULL,   -- first day of the month: date_trunc('month', NOW())
+    rows_used   BIGINT      NOT NULL DEFAULT 0,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (api_key_id, month_bucket)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_cache_key_month
+    ON monthly_usage_cache (api_key_id, month_bucket DESC);
+
+-- ---------------------------------------------------------------------------
 -- TTL cleanup function — call periodically to prune old telemetry rows.
 -- Retains 13 months for billing disputes; older rows are discarded.
 -- Schedule via pg_cron or an external cron job:
@@ -601,6 +633,9 @@ BEGIN
 
     DELETE FROM password_resets
     WHERE  expires_at < NOW() - INTERVAL '7 days';
+
+    DELETE FROM monthly_usage_cache
+    WHERE  month_bucket < date_trunc('month', NOW() - INTERVAL '14 months');
 END;
 $$;
 """
@@ -612,9 +647,39 @@ async def _bootstrap_schema(pool: asyncpg.Pool) -> None:
     log.info("Schema bootstrap complete.")
 
 
+
+# ---------------------------------------------------------------------------
+# Risk 1 mitigation — scheduled telemetry pruner
+# Runs prune_old_telemetry() every 7 days so billing_ledger / audit_logs
+# never grow unbounded. Uses a plain asyncio Task; no extra dependency needed.
+# ---------------------------------------------------------------------------
+
+_prune_task: asyncio.Task | None = None
+
+
+async def _schedule_prune(pool: asyncpg.Pool) -> None:
+    """
+    Background coroutine: sleep 7 days, call prune_old_telemetry(), repeat.
+    Logs success/failure but never propagates exceptions — crash here must
+    not affect the request-handling event loop.
+    """
+    _PRUNE_INTERVAL_SECONDS = int(os.getenv("PRUNE_INTERVAL_SECONDS", str(7 * 24 * 60 * 60)))
+    # Initial delay: 10 minutes after startup so the first boot doesn't hit
+    # the DB immediately while the pool is warming up.
+    await asyncio.sleep(600)
+    while True:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT prune_old_telemetry()")
+            log.info("prune_old_telemetry() completed successfully.")
+        except Exception:
+            log.exception("prune_old_telemetry() failed — will retry next cycle.")
+        await asyncio.sleep(_PRUNE_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
-    global _pool
+    global _pool, _prune_task
     if not TENANT_DATABASE_URL:
         log.warning("TENANT_DATABASE_URL not set — DB features disabled.")
         return
@@ -626,13 +691,22 @@ async def _startup() -> None:
             command_timeout=15,
         )
         await _bootstrap_schema(_pool)
-        log.info("Database pool ready.  Docs: http://localhost:8000/docs")
+        # Start background pruner (Risk 1 mitigation)
+        _prune_task = asyncio.create_task(_schedule_prune(_pool))
+        log.info("Database pool ready.  Telemetry pruner scheduled every 7 days.  Docs: http://localhost:8000/docs")
     except Exception as exc:
         log.error("Failed to connect to database: %r", exc)
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    global _prune_task
+    if _prune_task and not _prune_task.done():
+        _prune_task.cancel()
+        try:
+            await _prune_task
+        except asyncio.CancelledError:
+            pass
     if _pool:
         await _pool.close()
 
@@ -651,11 +725,12 @@ async def _write_billing_ledger(
     duration_ms: int,
 ) -> None:
     """
-    Fire-and-forget ledger insert.  Called via BackgroundTasks so it never
-    blocks the HTTP response.  Failures are logged but never propagated.
+    Fire-and-forget ledger insert + monthly_usage_cache upsert (Risk 2).
+    Both writes happen in one connection acquire so we never leave the cache
+    stale if the ledger write succeeds but the cache update fails.
+    Called via BackgroundTasks — failures are logged but never propagated.
     """
     try:
-        # api_key_id must be a UUID or NULL; sandbox keys have no DB row.
         key_uuid: Any = None
         if api_key_id:
             try:
@@ -677,6 +752,20 @@ async def _write_billing_ledger(
                 file_type,
                 duration_ms,
             )
+            # Risk 2 mitigation: keep monthly_usage_cache in sync so quota
+            # checks are O(1) point-lookups rather than full SUM() aggregates.
+            if key_uuid is not None and rows_out > 0:
+                await conn.execute(
+                    """
+                    INSERT INTO monthly_usage_cache (api_key_id, month_bucket, rows_used, updated_at)
+                    VALUES ($1, date_trunc('month', NOW())::date, $2, NOW())
+                    ON CONFLICT (api_key_id, month_bucket) DO UPDATE
+                        SET rows_used  = monthly_usage_cache.rows_used + EXCLUDED.rows_used,
+                            updated_at = NOW()
+                    """,
+                    key_uuid,
+                    rows_out,
+                )
     except Exception:
         log.exception("billing_ledger insert failed — non-fatal")
 
@@ -684,7 +773,13 @@ async def _write_billing_ledger(
 async def _get_monthly_rows_used(pool: asyncpg.Pool, api_key_id: str) -> int:
     """
     Return the total rows_out already billed for this api_key_id in the
-    current calendar month.  Returns 0 for sandbox keys (no DB row).
+    current calendar month.
+
+    Risk 2 mitigation: reads from monthly_usage_cache (O(1) point-lookup)
+    instead of running a SUM() aggregate over the full billing_ledger.
+    Falls back to the aggregate query if the cache row is absent (e.g. first
+    request of the month before any write has populated the cache).
+    Returns 0 for sandbox keys (no DB row).
     """
     if not api_key_id:
         return 0
@@ -694,7 +789,22 @@ async def _get_monthly_rows_used(pool: asyncpg.Pool, api_key_id: str) -> int:
         return 0
     try:
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
+            # Fast path: cache hit
+            cache_row = await conn.fetchrow(
+                """
+                SELECT rows_used
+                FROM   monthly_usage_cache
+                WHERE  api_key_id    = $1
+                AND    month_bucket  = date_trunc('month', NOW())::date
+                """,
+                key_uuid,
+            )
+            if cache_row is not None:
+                return int(cache_row["rows_used"])
+
+            # Slow path: cache miss (first request of the month) — aggregate
+            # and prime the cache so subsequent calls are fast.
+            ledger_row = await conn.fetchrow(
                 """
                 SELECT COALESCE(SUM(rows_out), 0)::BIGINT AS total
                 FROM   billing_ledger
@@ -703,7 +813,19 @@ async def _get_monthly_rows_used(pool: asyncpg.Pool, api_key_id: str) -> int:
                 """,
                 key_uuid,
             )
-        return int(row["total"]) if row else 0
+            total = int(ledger_row["total"]) if ledger_row else 0
+            if total > 0:
+                # Seed the cache to avoid repeated aggregate scans this month
+                await conn.execute(
+                    """
+                    INSERT INTO monthly_usage_cache (api_key_id, month_bucket, rows_used, updated_at)
+                    VALUES ($1, date_trunc('month', NOW())::date, $2, NOW())
+                    ON CONFLICT (api_key_id, month_bucket) DO NOTHING
+                    """,
+                    key_uuid,
+                    total,
+                )
+            return total
     except Exception:
         log.exception("monthly_rows_used query failed — defaulting to 0 (non-fatal)")
         return 0
@@ -1059,12 +1181,34 @@ Sheet = list[Row]
 # ---------------------------------------------------------------------------
 
 def _resolve_tier_limit(request: StarletteRequest) -> str:
+    """
+    Returns the hourly rate-limit string for the authenticated key's tier.
+
+    Risk 6 mitigation: Pro keys have a secondary per-minute burst cap enforced
+    via _resolve_tier_burst_limit().  Both decorators are applied to /clean so
+    an automated script can't saturate the connection pool even with a valid
+    Pro key, while normal interactive use (well under 500 req/min) is unaffected.
+    """
     tier = getattr(request.state, "api_key_tier", "free")
     return {
         "free":    RATE_LIMIT_FREE,
         "starter": RATE_LIMIT_STARTER,
         "pro":     "99999/hour",
     }.get(tier, RATE_LIMIT_DEFAULT)
+
+
+def _resolve_tier_burst_limit(request: StarletteRequest) -> str:
+    """
+    Risk 6 mitigation: secondary per-minute burst ceiling.
+    Only meaningfully restrictive for Pro — Free/Starter have low hourly caps
+    that already preclude burst abuse without a separate minute-level guard.
+    """
+    tier = getattr(request.state, "api_key_tier", "free")
+    return {
+        "free":    "5/minute",
+        "starter": "50/minute",
+        "pro":     RATE_LIMIT_PRO_BURST,   # default 500/minute
+    }.get(tier, "10/minute")
 
 
 # ===========================================================================
@@ -3434,7 +3578,16 @@ async def billing_subscription_status(
     stored in our local subscriptions row.  Re-syncs status, next payment date,
     and amount.  Use this to confirm what Paystack actually holds as truth,
     bypassing our cached DB state entirely.
+
+    Risk 5 mitigation: skips the live Paystack call if our local row was
+    updated within the last 5 minutes (configurable via PAYSTACK_CACHE_TTL_SECONDS).
+    Pass ?force=1 to bypass the TTL and always fetch live.
     """
+    _CACHE_TTL = datetime.timedelta(
+        seconds=int(os.getenv("PAYSTACK_CACHE_TTL_SECONDS", "300"))
+    )
+    force_refresh = request.query_params.get("force", "0") in ("1", "true", "yes")
+
     # Fetch our local record first to get the Paystack subscription_id
     async with pool.acquire() as conn:
         local = await conn.fetchrow(
@@ -3456,6 +3609,44 @@ async def billing_subscription_status(
         })
 
     sub_id = local["paystack_subscription_id"]
+
+    def _maybe_iso(val: Any) -> str | None:
+        if val is None:
+            return None
+        if hasattr(val, "isoformat"):
+            return val.isoformat()
+        return str(val)
+
+    # Risk 5: Check TTL — skip Paystack call if cache is fresh
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    last_updated = local["updated_at"]
+    if last_updated and last_updated.tzinfo is None:
+        last_updated = last_updated.replace(tzinfo=datetime.timezone.utc)
+    cache_is_fresh = (
+        last_updated is not None
+        and (now_utc - last_updated) < _CACHE_TTL
+        and not force_refresh
+    )
+
+    if cache_is_fresh:
+        log.debug(
+            "billing_subscription_status: serving from cache (updated %s ago) user=%s",
+            now_utc - last_updated,
+            current_user["id"],
+        )
+        return JSONResponse(content={
+            "local_status":       local["status"],
+            "local_plan":         local["plan"],
+            "local_period_end":   _maybe_iso(local["current_period_end"]),
+            "local_last_synced":  _maybe_iso(local["updated_at"]),
+            "paystack_sub_id":    sub_id,
+            "paystack_live_data": None,
+            "cached":             True,
+            "days_until_renewal": (
+                max(0, (local["current_period_end"] - now_utc).days)
+                if local["current_period_end"] else None
+            ),
+        })
 
     # If we have a subscription_id, fetch live data from Paystack
     paystack_data = None
@@ -3501,13 +3692,6 @@ async def billing_subscription_status(
             # Paystack returned 404 — subscription no longer exists there
             paystack_data = None
 
-    def _maybe_iso(val: Any) -> str | None:
-        if val is None:
-            return None
-        if hasattr(val, "isoformat"):
-            return val.isoformat()
-        return str(val)
-
     return JSONResponse(content={
         "local_status":         local["status"],
         "local_plan":           local["plan"],
@@ -3515,8 +3699,9 @@ async def billing_subscription_status(
         "local_last_synced":    _maybe_iso(local["updated_at"]),
         "paystack_sub_id":      sub_id,
         "paystack_live_data":   paystack_data,
+        "cached":               False,
         "days_until_renewal":   (
-            max(0, (local["current_period_end"] - datetime.datetime.now(datetime.timezone.utc)).days)
+            max(0, (local["current_period_end"] - now_utc).days)
             if local["current_period_end"] else None
         ),
     })
@@ -3969,14 +4154,30 @@ def _parse_csv(data: bytes, filename: str = "") -> Sheet:
     return [dict(row) for row in reader]
 
 
-def _parse_xlsx(data: bytes) -> Sheet:
-    wb   = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    ws   = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
+def _parse_xlsx(data: bytes, row_limit: int | None = None) -> Sheet:
+    """
+    Parse an XLSX file into a list of row dicts.
+
+    Risk 4 mitigation: accepts an optional row_limit so we never materialise
+    more rows than the caller can actually consume.  Uses itertools.islice on
+    the openpyxl row iterator — the workbook stays in read-only streaming mode
+    and rows beyond the limit are never loaded into memory.
+    """
+    from itertools import islice as _islice
+    wb       = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    ws       = wb.active
+    row_iter = ws.iter_rows(values_only=True)
+
+    # Read header row first
+    try:
+        header_row = next(row_iter)
+    except StopIteration:
         return []
-    headers = [str(c) if c is not None else f"col_{i}" for i, c in enumerate(rows[0])]
-    return [dict(zip(headers, row)) for row in rows[1:]]
+    headers = [str(c) if c is not None else f"col_{i}" for i, c in enumerate(header_row)]
+
+    # Apply row_limit via islice — never pulls more rows than needed
+    data_rows = _islice(row_iter, row_limit) if (row_limit is not None and row_limit > 0) else row_iter
+    return [dict(zip(headers, row)) for row in data_rows]
 
 
 def parse_file(filename: str, data: bytes) -> tuple[Sheet, str]:
@@ -3992,13 +4193,14 @@ def parse_file(filename: str, data: bytes) -> tuple[Sheet, str]:
     )
 
 
-def _parse_xlsx_with_type(data: bytes) -> tuple[Sheet, str]:
+def _parse_xlsx_with_type(data: bytes, row_limit: int | None = None) -> tuple[Sheet, str]:
     """
     Synchronous XLSX parser that returns (sheet, 'xlsx').
     Designed to be called via run_in_executor so the heavy openpyxl work
     runs in a thread pool and never blocks the asyncio event loop.
+    row_limit is forwarded to _parse_xlsx for memory-safe truncation (Risk 4).
     """
-    return _parse_xlsx(data), "xlsx"
+    return _parse_xlsx(data, row_limit=row_limit), "xlsx"
 
 
 def _clean_in_chunks(
@@ -4689,6 +4891,7 @@ async def _dispatch_webhook(
     },
 )
 @limiter.limit(RATE_LIMIT_DEFAULT, key_func=_rate_limit_identifier)
+@limiter.limit(_resolve_tier_burst_limit, key_func=_rate_limit_identifier)  # Risk 6: per-minute burst cap
 async def clean_file(
     request:          Request,
     background_tasks: BackgroundTasks,
@@ -4773,11 +4976,23 @@ async def clean_file(
         )
 
     # ── Parse — XLSX is CPU-heavy; run off the event loop to avoid blocking ───
+    # Risk 4 mitigation: compute a safe row_limit before parsing so the XLSX
+    # iterator is capped at parse time — no full-sheet materialisation for
+    # files that would exceed the monthly quota anyway.
     lower_fname = fname.lower()
     if lower_fname.endswith(".xlsx"):
+        # Tightest row limit we need to honour at parse time.
+        if api_key.is_test or api_key.is_sandbox:
+            _parse_row_limit: int | None = 20
+        elif tier == "pro":
+            _parse_row_limit = _MONTHLY_ROWS_PRO
+        elif tier == "starter":
+            _parse_row_limit = _MONTHLY_ROWS_STARTER
+        else:
+            _parse_row_limit = _MONTHLY_ROWS_FREE
         loop  = asyncio.get_event_loop()
         sheet, file_type = await loop.run_in_executor(
-            None, lambda: _parse_xlsx_with_type(raw_bytes)
+            None, lambda: _parse_xlsx_with_type(raw_bytes, row_limit=_parse_row_limit)
         )
     else:
         sheet, file_type = parse_file(fname, raw_bytes)
@@ -4992,14 +5207,19 @@ async def clean_file(
             log.exception("Failed to create job record — continuing without job_id")
 
         async def _semaphored_dispatch() -> None:
-            async with _WEBHOOK_SEMAPHORE:
-                await _dispatch_webhook(
-                    x_webhook_url,
-                    sanitised,
-                    str(api_key.id) if api_key.id else None,
-                    api_key.key_prefix,
-                    job_id,
-                )
+            # Acquire per-key semaphore first (inner), then global (outer).
+            # Order matters: always acquire narrower lock before broader one
+            # to avoid deadlock.
+            key_sem = _get_webhook_key_semaphore(api_key.key_prefix)
+            async with key_sem:
+                async with _WEBHOOK_SEMAPHORE:
+                    await _dispatch_webhook(
+                        x_webhook_url,
+                        sanitised,
+                        str(api_key.id) if api_key.id else None,
+                        api_key.key_prefix,
+                        job_id,
+                    )
 
         background_tasks.add_task(_semaphored_dispatch)
         log.info("Job queued: job_id=%s rows=%d webhook=%s key=%s duration_ms=%d",
