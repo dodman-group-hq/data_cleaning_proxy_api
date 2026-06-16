@@ -71,6 +71,8 @@ from starlette.requests import Request as StarletteRequest
 load_dotenv()
 log = logging.getLogger(__name__)
 
+log.warning("STARTUP ENV CHECK: DODMAN_ENV=%r", os.environ.get("DODMAN_ENV", "<NOT SET>"))
+
 # ---------------------------------------------------------------------------
 # Sentinel — raised when a browser-facing route needs a login redirect.
 # Caught by _login_redirect_handler below and converted to a 303 response.
