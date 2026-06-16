@@ -9,7 +9,7 @@
 # ---------------------------------------------------------------------------
 
 # ── Stage 1: dependency builder ──────────────────────────────────────────────
-FROM python:3.12.17-slim AS builder
+FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
@@ -25,7 +25,7 @@ RUN pip install --upgrade pip \
 
 
 # ── Stage 2: runtime image ───────────────────────────────────────────────────
-FROM python:3.12.17-slim AS runtime
+FROM python:3.12-slim AS runtime
 
 # Ensure the runtime base image is up to date for critical OS security patches
 RUN apt-get update \
@@ -42,6 +42,7 @@ COPY --from=builder /install /usr/local
 
 # Copy application source
 COPY main.py .
+COPY templates/ templates/
 
 # Render injects PORT at runtime; default to 8000 for local runs
 ENV PORT=8000
