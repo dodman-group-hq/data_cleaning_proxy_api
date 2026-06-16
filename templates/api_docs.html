@@ -254,12 +254,12 @@
 
       <h3>Request Rate Limits</h3>
       <table class="param-table">
-        <thead><tr><th>Tier</th><th>Rate Limit</th><th>Scope</th></tr></thead>
+        <thead><tr><th>Tier</th><th>Rate Limit</th><th>Burst Cap</th><th>Scope</th></tr></thead>
         <tbody>
-          <tr><td>free</td><td>60 requests / hour</td><td>Per API key</td></tr>
-          <tr><td>starter</td><td>500 requests / hour</td><td>Per API key</td></tr>
-          <tr><td>pro</td><td>Unlimited</td><td>Per API key</td></tr>
-          <tr><td>sandbox</td><td>5 requests / day</td><td>Per client IP</td></tr>
+          <tr><td>free</td><td>60 requests / hour</td><td>5 / minute</td><td>Per API key</td></tr>
+          <tr><td>starter</td><td>500 requests / hour</td><td>50 / minute</td><td>Per API key</td></tr>
+          <tr><td>pro</td><td>99,999 requests / hour</td><td>500 / minute</td><td>Per API key</td></tr>
+          <tr><td>sandbox</td><td>5 requests / day</td><td>—</td><td>Per client IP</td></tr>
         </tbody>
       </table>
       <p>Rate-limited requests return <code>429 Too Many Requests</code> with a <code>Retry-After: 60</code> header.</p>
