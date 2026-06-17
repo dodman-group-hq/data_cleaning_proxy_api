@@ -5,7 +5,9 @@ Stateless, single-file FastAPI service — cleaned rows returned directly or
 routed to a webhook.  Now includes:
 
   • Unified asyncpg schema (users / api_keys / billing_ledger)
-  • dk_test_ / dk_live_ prefix enforcement with environment mismatch guard
+  • dk_test_ / dk_live_ prefix enforcement with environment mismatch guard,
+    overridable per-user via the allow_cross_env_keys dashboard toggle
+  • Per-request cleaning summary (rows_in / rows_out / dupes_removed / status)
   • Per-request billing telemetry (perf_counter → billing_ledger via BackgroundTasks)
   • request_id middleware + global error envelope on every response
   • Cookie-based auth (signup / login / logout) with passlib bcrypt
@@ -18,6 +20,13 @@ Env vars (set in .env or hosting dashboard):
   DODMAN_ENV                "production" enables sk_live_ keys  (default: development)
   RATE_LIMIT_FREE           default 60/hour
   RATE_LIMIT_STARTER        default 500/hour
+
+Per-user setting (stored on `users.allow_cross_env_keys`, default FALSE):
+  Toggled via PATCH /auth/me/cross-env-keys. When FALSE (default), dk_test_
+  keys are rejected while DODMAN_ENV=production and dk_live_ keys are
+  rejected everywhere else — this is what protects rate limits, usage
+  counters, and billing from accidental cross-environment calls. A user can
+  flip it TRUE from their dashboard to disable both checks for their own keys.
 """
 
 from __future__ import annotations
@@ -476,6 +485,13 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash VARCHAR(255) NOT NULL,
     last_env      VARCHAR(8)   NOT NULL DEFAULT 'test'
                                CHECK (last_env IN ('test', 'live')),
+    -- Risk mitigation: by default (FALSE) a dk_test_ key is rejected while
+    -- DODMAN_ENV=production, and a dk_live_ key is rejected anywhere else.
+    -- Set TRUE via the dashboard toggle to let this user mix environments
+    -- (e.g. staging-against-prod debugging). Off by default because the
+    -- whole point is protecting rate limits / usage / billing from
+    -- accidental cross-environment calls.
+    allow_cross_env_keys BOOLEAN NOT NULL DEFAULT FALSE,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
@@ -483,6 +499,9 @@ CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
 DO $$ BEGIN
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_env VARCHAR(8) NOT NULL DEFAULT 'test'
         CHECK (last_env IN ('test', 'live'));
+EXCEPTION WHEN others THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_cross_env_keys BOOLEAN NOT NULL DEFAULT FALSE;
 EXCEPTION WHEN others THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -1027,10 +1046,21 @@ async def verify_api_key(
     """
     Dependency: authenticates the Bearer token and enforces prefix/environment rules.
 
-    dk_live_*          Live key.  Requires DODMAN_ENV=production; raises 400
-                       INVALID_ENVIRONMENT_KEY if the runtime env is not live.
-    dk_test_*          Test key.  Truncates upload to 20 rows; accepted everywhere.
+    dk_live_*          Live key. Requires DODMAN_ENV=production unless the
+                       owning user has flipped allow_cross_env_keys on from
+                       their dashboard; otherwise raises 400 INVALID_ENVIRONMENT_KEY.
+    dk_test_*          Test key. Truncates upload to 20 rows. Rejected while
+                       DODMAN_ENV=production unless allow_cross_env_keys is on
+                       for the owning user — see the toggle note below.
     dk_sandbox_test_99 Universal open-sandbox key.  5 req/day per IP; 20-row cap.
+
+    allow_cross_env_keys (per-user, dashboard-toggleable, default FALSE):
+    Both checks above exist to keep rate limits, usage counters, and billing
+    accurate — a test key slipping into production would consume live quota
+    under "test" accounting, and a live key used for testing would burn paid
+    quota/rate-limit headroom. The toggle is read from the `users` table
+    (joined in below) and defaults to FALSE — i.e. strict separation — for
+    every user, and for any key with no owning user (no dashboard to toggle).
     """
     _UNAUTH = HTTPException(
         status_code=401,
@@ -1056,42 +1086,25 @@ async def verify_api_key(
             raw_key=raw, is_sandbox=True, is_test=True,
         )
 
-    # ── Prefix / environment mismatch enforcement ─────────────────────────────
-    if raw.startswith(_PREFIX_LIVE):
-        if _RUNTIME_ENV() != "production":
-            asyncio.ensure_future(_log_auth_failure(
-                request, "auth.env_mismatch",
-                f"dk_live_ key used in {_RUNTIME_ENV()} environment",
-                raw[:16],
-            ))
-            raise HTTPException(
-                status_code=400,
-                detail=_error_envelope(
-                    "INVALID_ENVIRONMENT_KEY",
-                    "Mismatched environment key layout. "
-                    "A dk_live_ key cannot be used outside a production environment.",
-                    _get_request_id(request),
-                ),
-            )
-    elif raw.startswith(_PREFIX_TEST):
-        # Test keys are always accepted regardless of runtime env
-        pass
-    else:
-        # Legacy dk_live_ keys or unknown prefixes go straight to DB validation
-        pass
-
+    is_live_key = raw.startswith(_PREFIX_LIVE)
     is_test_key = raw.startswith(_PREFIX_TEST)
 
     # ── DB validation ─────────────────────────────────────────────────────────
+    # The runtime-environment guard below needs to know the owning user's
+    # allow_cross_env_keys preference, so it's joined in here rather than
+    # checked before this lookup (as in the previous prefix-only version).
     hashed = _hash_key(raw)
     pool   = await get_pool()
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, user_id, label, tier, key_prefix, environment, is_active
-            FROM   api_keys
-            WHERE  key_hash = $1
+            SELECT k.id, k.user_id, k.label, k.tier, k.key_prefix,
+                   k.environment, k.is_active,
+                   COALESCE(u.allow_cross_env_keys, FALSE) AS allow_cross_env_keys
+            FROM   api_keys k
+            LEFT JOIN users u ON u.id = k.user_id
+            WHERE  k.key_hash = $1
             LIMIT  1
             """,
             hashed,
@@ -1107,7 +1120,9 @@ async def verify_api_key(
 
     # ── Secondary environment guard: key's stored environment vs request key ──
     # A key stored as environment='test' that physically has a dk_live_ prefix
-    # is a data anomaly — reject it explicitly.
+    # is a data anomaly — reject it explicitly. Unlike the runtime guard below,
+    # this is a key-registration integrity check, not a policy choice, so it
+    # is NOT gated by allow_cross_env_keys.
     stored_env = row["environment"]
     if raw.startswith(_PREFIX_LIVE) and stored_env != "live":
         asyncio.ensure_future(_log_auth_failure(
@@ -1139,6 +1154,46 @@ async def verify_api_key(
                 _get_request_id(request),
             ),
         )
+
+    # ── Runtime-environment cross-use guard (toggle-gated) ────────────────────
+    # Default (allow_cross_env_keys=FALSE): dk_live_ keys only work when
+    # DODMAN_ENV=production, and dk_test_ keys are rejected when
+    # DODMAN_ENV=production. A user can disable both checks for their own
+    # keys via PATCH /auth/me/cross-env-keys.
+    allow_cross_env = bool(row["allow_cross_env_keys"])
+    if not allow_cross_env:
+        if is_live_key and _RUNTIME_ENV() != "production":
+            asyncio.ensure_future(_log_auth_failure(
+                request, "auth.env_mismatch",
+                f"dk_live_ key used in {_RUNTIME_ENV()} environment",
+                raw[:16],
+            ))
+            raise HTTPException(
+                status_code=400,
+                detail=_error_envelope(
+                    "INVALID_ENVIRONMENT_KEY",
+                    "A dk_live_ key cannot be used outside a production environment. "
+                    "Enable 'Allow cross-environment keys' on your dashboard if this "
+                    "is intentional.",
+                    _get_request_id(request),
+                ),
+            )
+        if is_test_key and _RUNTIME_ENV() == "production":
+            asyncio.ensure_future(_log_auth_failure(
+                request, "auth.env_mismatch",
+                "dk_test_ key used in production environment",
+                raw[:16],
+            ))
+            raise HTTPException(
+                status_code=400,
+                detail=_error_envelope(
+                    "INVALID_ENVIRONMENT_KEY",
+                    "A dk_test_ key cannot be used in a production environment. "
+                    "Enable 'Allow cross-environment keys' on your dashboard if this "
+                    "is intentional.",
+                    _get_request_id(request),
+                ),
+            )
 
     # Fire-and-forget last_used_at update
     async def _touch() -> None:
@@ -1740,7 +1795,7 @@ async def get_current_user(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT u.id, u.email, u.last_env, u.created_at,
+            SELECT u.id, u.email, u.last_env, u.allow_cross_env_keys, u.created_at,
                    s.status   AS sub_status,
                    s.plan     AS sub_plan,
                    s.current_period_end AS sub_period_end
@@ -1754,13 +1809,14 @@ async def get_current_user(
         raise _unauth()
 
     return {
-        "id":             str(row["id"]),
-        "email":          row["email"],
-        "last_env":       row["last_env"],
-        "created_at":     row["created_at"],
-        "sub_status":     row["sub_status"] or "none",
-        "sub_plan":       row["sub_plan"]   or "free",
-        "sub_period_end": row["sub_period_end"].isoformat() if row["sub_period_end"] else None,
+        "id":                   str(row["id"]),
+        "email":                row["email"],
+        "last_env":             row["last_env"],
+        "allow_cross_env_keys": row["allow_cross_env_keys"],
+        "created_at":           row["created_at"],
+        "sub_status":           row["sub_status"] or "none",
+        "sub_plan":             row["sub_plan"]   or "free",
+        "sub_period_end":       row["sub_period_end"].isoformat() if row["sub_period_end"] else None,
     }
 
 
@@ -1792,6 +1848,50 @@ async def update_last_env(
             env, uuid.UUID(current_user["id"]),
         )
     return JSONResponse(content={"last_env": env})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /auth/me/cross-env-keys — dashboard toggle for the test/live runtime
+# guard enforced in verify_api_key(). Defaults to FALSE (strict separation):
+#   • dk_test_ keys rejected while DODMAN_ENV=production
+#   • dk_live_ keys rejected everywhere DODMAN_ENV is not production
+# Setting this TRUE disables both checks for this user's keys only.
+# ---------------------------------------------------------------------------
+
+@auth_router.patch("/me/cross-env-keys", summary="Toggle test/live key environment enforcement")
+async def update_cross_env_keys(
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    body  = await request.json()
+    allow = body.get("allow")
+    if not isinstance(allow, bool):
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                "'allow' must be a boolean.",
+                _get_request_id(request),
+            ),
+        )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET allow_cross_env_keys = $1 WHERE id = $2",
+            allow, uuid.UUID(current_user["id"]),
+        )
+    log.info("Cross-env key toggle changed: user=%s allow=%s", current_user["id"], allow)
+    asyncio.ensure_future(_write_audit_log(
+        pool,
+        action="user.cross_env_keys_toggle",
+        success=True,
+        user_type="user",
+        target_type="user",
+        target_id=current_user["id"],
+        ip_address=_client_ip(request),
+        details={"allow_cross_env_keys": allow, "request_id": _get_request_id(request)},
+    ))
+    return JSONResponse(content={"allow_cross_env_keys": allow})
 
 
 # ===========================================================================
@@ -4236,19 +4336,23 @@ def _clean_in_chunks(
     dedupe_all:   bool,
     crypto_salt:  str,
     chunk_size:   int,
+    stats:        dict | None = None,
 ) -> Sheet:
     """
     Pure-Python chunked cleaning, safe to run in a thread pool executor.
     Processes sheet in chunk_size batches then applies a global dedupe pass
-    if dedupe_all is True.
+    if dedupe_all is True. `stats["dupes_removed"]` accumulates duplicates
+    caught both within each chunk and in the final cross-chunk pass.
     """
     cleaned: Sheet = []
     for i in range(0, len(sheet), chunk_size):
         chunk = sheet[i: i + chunk_size]
         cleaned.extend(clean_sheet(chunk, column_rules,
                                    dedupe_all=dedupe_all,
-                                   crypto_salt=crypto_salt))
+                                   crypto_salt=crypto_salt,
+                                   stats=stats))
     if dedupe_all:
+        rows_before_global = len(cleaned)
         seen_g: set[tuple] = set()
         deduped_g: Sheet   = []
         for row in cleaned:
@@ -4257,6 +4361,8 @@ def _clean_in_chunks(
                 seen_g.add(key)
                 deduped_g.append(row)
         cleaned = deduped_g
+        if stats is not None:
+            stats["dupes_removed"] = stats.get("dupes_removed", 0) + (rows_before_global - len(cleaned))
     return cleaned
 
 
@@ -4724,6 +4830,7 @@ def clean_sheet(
     column_rules: dict[str, list[str]],
     dedupe_all:   bool = False,
     crypto_salt:  str  = "",
+    stats:        dict | None = None,
 ) -> Sheet:
     stat_rules  = {"fill_mean", "fill_median"}
     rules_pass1 = {
@@ -4750,6 +4857,7 @@ def clean_sheet(
     # ── Deduplication ────────────────────────────────────────────────────────
     # dedupe_all=True  → deduplicate on every column (whole-row match)
     # "dedupe" rule    → deduplicate on that specific column only
+    rows_before_dedupe = len(sheet)
     if dedupe_all:
         seen:    set[tuple] = set()
         deduped: Sheet      = []
@@ -4770,6 +4878,9 @@ def clean_sheet(
                     seen.add(key)
                     deduped.append(row)
             sheet = deduped
+
+    if stats is not None:
+        stats["dupes_removed"] = stats.get("dupes_removed", 0) + (rows_before_dedupe - len(sheet))
 
     return sheet
 
@@ -4908,8 +5019,12 @@ async def _dispatch_webhook(
     "/clean",
     summary="Upload and clean a CSV or XLSX file",
     responses={
-        200: {"description": "Cleaned file streamed directly (no webhook)"},
-        202: {"description": "Processing queued; payload POSTed to X-Webhook-URL"},
+        200: {"description": "Cleaned file streamed directly (no webhook). Summary stats "
+                              "(rows_in/rows_out/dupes_removed/status) are in the X-Rows-In, "
+                              "X-Rows-Out, X-Dupes-Removed, X-Clean-Status headers, and also in "
+                              "the JSON body under \"summary\" if X-Include-Summary: true was sent."},
+        202: {"description": "Processing queued; payload POSTed to X-Webhook-URL. Response body "
+                              "includes a \"summary\" object."},
         400: {"description": "Environment key mismatch"},
         413: {"description": "File exceeds tier size limit"},
         415: {"description": "Unsupported file type"},
@@ -4933,6 +5048,7 @@ async def clean_file(
     x_dry_run:        str | None = Header(default=None, alias="X-Dry-Run"),
     x_dedupe_all:     str | None = Header(default=None, alias="X-Dedupe-All"),
     x_crypto_salt:    str | None = Header(default=None, alias="X-Crypto-Salt"),
+    x_include_summary: str | None = Header(default=None, alias="X-Include-Summary"),
     api_key:          APIKeyRecord = Security(verify_api_key),
 ) -> Response:
 
@@ -5024,6 +5140,7 @@ async def clean_file(
     else:
         sheet, file_type = parse_file(fname, raw_bytes)
     rows_in = len(sheet)
+    quota_trimmed = False
 
     # ── Monthly row quota check ───────────────────────────────────────────────
     # Sandbox / test keys use the free cap but are also hard-truncated to 20
@@ -5058,8 +5175,9 @@ async def clean_file(
         # If the file would push the user over their cap, trim it rather than
         # reject entirely — they still get value and a clear warning header.
         if rows_in > rows_remaining:
-            sheet    = sheet[:rows_remaining]
-            rows_in  = rows_remaining
+            sheet         = sheet[:rows_remaining]
+            rows_in       = rows_remaining
+            quota_trimmed = True
             log.info(
                 "Quota trim: key=%s rows_requested=%d rows_remaining=%d",
                 api_key.key_prefix, len(sheet) + (rows_in - rows_remaining), rows_remaining,
@@ -5154,22 +5272,37 @@ async def clean_file(
     # ── Clean — chunk-stream for Pro, single-pass for Starter/Test ───────────
     _CHUNK_SIZE = 10_000
     is_pro_live = tier == "pro" and not api_key.is_test
+    clean_stats: dict[str, int] = {}
 
     if is_pro_live and rows_in > _CHUNK_SIZE:
         loop = asyncio.get_event_loop()
         cleaned: Sheet = await loop.run_in_executor(
             None,
-            lambda: _clean_in_chunks(sheet, column_rules, is_dedupe_all, crypto_salt, _CHUNK_SIZE),
+            lambda: _clean_in_chunks(sheet, column_rules, is_dedupe_all, crypto_salt,
+                                      _CHUNK_SIZE, stats=clean_stats),
         )
     else:
         cleaned = clean_sheet(sheet, column_rules,
                               dedupe_all=is_dedupe_all,
-                              crypto_salt=crypto_salt)
+                              crypto_salt=crypto_salt,
+                              stats=clean_stats)
     sanitised = _sanitise_for_json(cleaned)
     rows_out  = len(sanitised)
+    dupes_removed = clean_stats.get("dupes_removed", 0)
 
     # ── Stop the clock ────────────────────────────────────────────────────────
     duration_ms = int((time.perf_counter() - t_start) * 1000)
+
+    # ── Per-request summary — included in every response below ───────────────
+    # "partial" means the input was capped before cleaning even started
+    # (sandbox/test 20-row cap, or a monthly-quota trim), so rows_in here is
+    # already the post-cap count rather than the original upload size.
+    summary = {
+        "rows_in":       rows_in,
+        "rows_out":      rows_out,
+        "dupes_removed": dupes_removed,
+        "status":        "partial" if (truncated or quota_trimmed) else "clean",
+    }
 
     # ── Schedule billing ledger + audit log writes (non-blocking) ───────────
     try:
@@ -5201,8 +5334,10 @@ async def clean_file(
                 "file_type":   file_type,
                 "rows_in":     rows_in,
                 "rows_out":    rows_out,
+                "dupes_removed": dupes_removed,
                 "duration_ms": duration_ms,
                 "truncated":   truncated,
+                "quota_trimmed": quota_trimmed,
                 "webhook":     bool(x_webhook_url),
                 "output_format": resolved_fmt,
                 "request_id":  _get_request_id(request),
@@ -5255,6 +5390,7 @@ async def clean_file(
             "status":         "queued",
             "rows_processed": rows_out,
             "duration_ms":    duration_ms,
+            "summary":        summary,
         }
         if job_id:
             resp_data["job_id"]   = job_id
@@ -5264,16 +5400,28 @@ async def clean_file(
         return JSONResponse(status_code=202, content=resp_data)
 
     # ── Direct streaming mode → 200 ───────────────────────────────────────────
+    # The body here is the cleaned file itself (CSV bytes or a bare JSON array)
+    # so existing integrations keep working unchanged. The summary block is
+    # always exposed via headers; pass X-Include-Summary: true to additionally
+    # get it wrapped into the JSON body as {"summary": ..., "data": [...]}.
+    include_summary = (x_include_summary or "").strip().lower() in ("1", "true", "yes")
     if resolved_fmt == "csv":
         payload     = _to_csv_bytes(cleaned)
         media_type  = "text/csv"
         disposition = "attachment; filename=cleaned_file.csv"
     else:
-        payload     = json.dumps(sanitised, ensure_ascii=False, indent=2).encode()
+        body_obj    = {"summary": summary, "data": sanitised} if include_summary else sanitised
+        payload     = json.dumps(body_obj, ensure_ascii=False, indent=2).encode()
         media_type  = "application/json"
         disposition = "attachment; filename=cleaned_file.json"
 
-    extra_headers: dict[str, str] = {"X-Duration-Ms": str(duration_ms)}
+    extra_headers: dict[str, str] = {
+        "X-Duration-Ms":     str(duration_ms),
+        "X-Rows-In":         str(summary["rows_in"]),
+        "X-Rows-Out":        str(summary["rows_out"]),
+        "X-Dupes-Removed":   str(summary["dupes_removed"]),
+        "X-Clean-Status":    summary["status"],
+    }
     if truncated:
         extra_headers["X-Rows-Truncated"] = str(original_row_count - _SANDBOX_ROW_LIMIT)
     # Expose quota consumption so clients can track usage without a separate API call
