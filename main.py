@@ -5,8 +5,10 @@ Stateless, single-file FastAPI service — cleaned rows returned directly or
 routed to a webhook.  Now includes:
 
   • Unified asyncpg schema (users / api_keys / billing_ledger)
-  • dk_test_ / dk_live_ prefix enforcement with environment mismatch guard,
-    overridable per-user via the allow_cross_env_keys dashboard toggle
+  • dk_test_ / dk_live_ prefix enforcement with environment mismatch guard.
+    dk_live_ requires DODMAN_ENV=production with NO override. dk_test_ in
+    production is blocked by default but overridable per-user via the
+    allow_test_in_production dashboard toggle.
   • Per-request cleaning summary (rows_in / rows_out / dupes_removed / status)
   • Per-request billing telemetry (perf_counter → billing_ledger via BackgroundTasks)
   • request_id middleware + global error envelope on every response
@@ -21,12 +23,12 @@ Env vars (set in .env or hosting dashboard):
   RATE_LIMIT_FREE           default 60/hour
   RATE_LIMIT_STARTER        default 500/hour
 
-Per-user setting (stored on `users.allow_cross_env_keys`, default FALSE):
-  Toggled via PATCH /auth/me/cross-env-keys. When FALSE (default), dk_test_
-  keys are rejected while DODMAN_ENV=production and dk_live_ keys are
-  rejected everywhere else — this is what protects rate limits, usage
-  counters, and billing from accidental cross-environment calls. A user can
-  flip it TRUE from their dashboard to disable both checks for their own keys.
+Per-user setting (stored on `users.allow_test_in_production`, default FALSE):
+  Toggled via PATCH /auth/me/allow-test-in-production. When FALSE (default),
+  dk_test_ keys are rejected while DODMAN_ENV=production. A user can flip it
+  TRUE from their dashboard to let their own test keys run against the
+  production deployment. This is one-directional: dk_live_ keys requiring
+  DODMAN_ENV=production has no toggle anywhere in this file — it is always on.
 """
 
 from __future__ import annotations
@@ -486,12 +488,12 @@ CREATE TABLE IF NOT EXISTS users (
     last_env      VARCHAR(8)   NOT NULL DEFAULT 'test'
                                CHECK (last_env IN ('test', 'live')),
     -- Risk mitigation: by default (FALSE) a dk_test_ key is rejected while
-    -- DODMAN_ENV=production, and a dk_live_ key is rejected anywhere else.
-    -- Set TRUE via the dashboard toggle to let this user mix environments
-    -- (e.g. staging-against-prod debugging). Off by default because the
-    -- whole point is protecting rate limits / usage / billing from
-    -- accidental cross-environment calls.
-    allow_cross_env_keys BOOLEAN NOT NULL DEFAULT FALSE,
+    -- DODMAN_ENV=production. Set TRUE via the dashboard toggle to let this
+    -- user's test keys work against the production deployment (e.g. to debug
+    -- against the one real environment). This is deliberately one-directional:
+    -- dk_live_ keys ALWAYS require DODMAN_ENV=production with no override,
+    -- since a live key has no legitimate reason to run outside production.
+    allow_test_in_production BOOLEAN NOT NULL DEFAULT FALSE,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
@@ -501,7 +503,7 @@ DO $$ BEGIN
         CHECK (last_env IN ('test', 'live'));
 EXCEPTION WHEN others THEN NULL; END $$;
 DO $$ BEGIN
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_cross_env_keys BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_test_in_production BOOLEAN NOT NULL DEFAULT FALSE;
 EXCEPTION WHEN others THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -1046,21 +1048,23 @@ async def verify_api_key(
     """
     Dependency: authenticates the Bearer token and enforces prefix/environment rules.
 
-    dk_live_*          Live key. Requires DODMAN_ENV=production unless the
-                       owning user has flipped allow_cross_env_keys on from
-                       their dashboard; otherwise raises 400 INVALID_ENVIRONMENT_KEY.
+    dk_live_*          Live key. ALWAYS requires DODMAN_ENV=production — this is
+                       a hard rule with no override, because a live key carries
+                       real billing/customer data and has no legitimate reason
+                       to ever run outside the actual production deployment.
+                       Raises 400 INVALID_ENVIRONMENT_KEY otherwise.
     dk_test_*          Test key. Truncates upload to 20 rows. Rejected while
-                       DODMAN_ENV=production unless allow_cross_env_keys is on
-                       for the owning user — see the toggle note below.
+                       DODMAN_ENV=production UNLESS the owning user has set
+                       allow_test_in_production — see below. This direction is
+                       toggleable because "use my test key against the one
+                       production deployment" is a normal, legitimate workflow.
     dk_sandbox_test_99 Universal open-sandbox key.  5 req/day per IP; 20-row cap.
 
-    allow_cross_env_keys (per-user, dashboard-toggleable, default FALSE):
-    Both checks above exist to keep rate limits, usage counters, and billing
-    accurate — a test key slipping into production would consume live quota
-    under "test" accounting, and a live key used for testing would burn paid
-    quota/rate-limit headroom. The toggle is read from the `users` table
-    (joined in below) and defaults to FALSE — i.e. strict separation — for
-    every user, and for any key with no owning user (no dashboard to toggle).
+    allow_test_in_production (per-user, dashboard-toggleable, default FALSE):
+    Read from the `users` table (joined in below). Defaults to FALSE for every
+    user, and for any key with no owning user (no dashboard to toggle), so
+    rate limits / usage / billing stay protected from test traffic landing in
+    production accounting unless a user explicitly opts in.
     """
     _UNAUTH = HTTPException(
         status_code=401,
@@ -1089,10 +1093,28 @@ async def verify_api_key(
     is_live_key = raw.startswith(_PREFIX_LIVE)
     is_test_key = raw.startswith(_PREFIX_TEST)
 
+    # ── Live key environment guard — ALWAYS enforced, never toggleable ───────
+    # No per-user setting can relax this, so it's checked before the DB hit
+    # (fast fail) exactly like the original prefix-only version did.
+    if is_live_key and _RUNTIME_ENV() != "production":
+        asyncio.ensure_future(_log_auth_failure(
+            request, "auth.env_mismatch",
+            f"dk_live_ key used in {_RUNTIME_ENV()} environment",
+            raw[:16],
+        ))
+        raise HTTPException(
+            status_code=400,
+            detail=_error_envelope(
+                "INVALID_ENVIRONMENT_KEY",
+                "A dk_live_ key cannot be used outside a production environment. "
+                "This rule has no override.",
+                _get_request_id(request),
+            ),
+        )
+
     # ── DB validation ─────────────────────────────────────────────────────────
-    # The runtime-environment guard below needs to know the owning user's
-    # allow_cross_env_keys preference, so it's joined in here rather than
-    # checked before this lookup (as in the previous prefix-only version).
+    # The test-key runtime guard below needs the owning user's
+    # allow_test_in_production preference, so it's joined in here.
     hashed = _hash_key(raw)
     pool   = await get_pool()
 
@@ -1101,7 +1123,7 @@ async def verify_api_key(
             """
             SELECT k.id, k.user_id, k.label, k.tier, k.key_prefix,
                    k.environment, k.is_active,
-                   COALESCE(u.allow_cross_env_keys, FALSE) AS allow_cross_env_keys
+                   COALESCE(u.allow_test_in_production, FALSE) AS allow_test_in_production
             FROM   api_keys k
             LEFT JOIN users u ON u.id = k.user_id
             WHERE  k.key_hash = $1
@@ -1120,9 +1142,8 @@ async def verify_api_key(
 
     # ── Secondary environment guard: key's stored environment vs request key ──
     # A key stored as environment='test' that physically has a dk_live_ prefix
-    # is a data anomaly — reject it explicitly. Unlike the runtime guard below,
-    # this is a key-registration integrity check, not a policy choice, so it
-    # is NOT gated by allow_cross_env_keys.
+    # is a data anomaly — reject it explicitly. This is a key-registration
+    # integrity check, not a policy choice, so it has no toggle either.
     stored_env = row["environment"]
     if raw.startswith(_PREFIX_LIVE) and stored_env != "live":
         asyncio.ensure_future(_log_auth_failure(
@@ -1155,45 +1176,23 @@ async def verify_api_key(
             ),
         )
 
-    # ── Runtime-environment cross-use guard (toggle-gated) ────────────────────
-    # Default (allow_cross_env_keys=FALSE): dk_live_ keys only work when
-    # DODMAN_ENV=production, and dk_test_ keys are rejected when
-    # DODMAN_ENV=production. A user can disable both checks for their own
-    # keys via PATCH /auth/me/cross-env-keys.
-    allow_cross_env = bool(row["allow_cross_env_keys"])
-    if not allow_cross_env:
-        if is_live_key and _RUNTIME_ENV() != "production":
-            asyncio.ensure_future(_log_auth_failure(
-                request, "auth.env_mismatch",
-                f"dk_live_ key used in {_RUNTIME_ENV()} environment",
-                raw[:16],
-            ))
-            raise HTTPException(
-                status_code=400,
-                detail=_error_envelope(
-                    "INVALID_ENVIRONMENT_KEY",
-                    "A dk_live_ key cannot be used outside a production environment. "
-                    "Enable 'Allow cross-environment keys' on your dashboard if this "
-                    "is intentional.",
-                    _get_request_id(request),
-                ),
-            )
-        if is_test_key and _RUNTIME_ENV() == "production":
-            asyncio.ensure_future(_log_auth_failure(
-                request, "auth.env_mismatch",
-                "dk_test_ key used in production environment",
-                raw[:16],
-            ))
-            raise HTTPException(
-                status_code=400,
-                detail=_error_envelope(
-                    "INVALID_ENVIRONMENT_KEY",
-                    "A dk_test_ key cannot be used in a production environment. "
-                    "Enable 'Allow cross-environment keys' on your dashboard if this "
-                    "is intentional.",
-                    _get_request_id(request),
-                ),
-            )
+    # ── Test key in production — the ONLY toggleable direction ───────────────
+    if is_test_key and _RUNTIME_ENV() == "production" and not row["allow_test_in_production"]:
+        asyncio.ensure_future(_log_auth_failure(
+            request, "auth.env_mismatch",
+            "dk_test_ key used in production environment",
+            raw[:16],
+        ))
+        raise HTTPException(
+            status_code=400,
+            detail=_error_envelope(
+                "INVALID_ENVIRONMENT_KEY",
+                "A dk_test_ key cannot be used in a production environment. "
+                "Enable 'Allow test key in production' on your dashboard if this "
+                "is intentional.",
+                _get_request_id(request),
+            ),
+        )
 
     # Fire-and-forget last_used_at update
     async def _touch() -> None:
@@ -1795,7 +1794,7 @@ async def get_current_user(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT u.id, u.email, u.last_env, u.allow_cross_env_keys, u.created_at,
+            SELECT u.id, u.email, u.last_env, u.allow_test_in_production, u.created_at,
                    s.status   AS sub_status,
                    s.plan     AS sub_plan,
                    s.current_period_end AS sub_period_end
@@ -1809,14 +1808,14 @@ async def get_current_user(
         raise _unauth()
 
     return {
-        "id":                   str(row["id"]),
-        "email":                row["email"],
-        "last_env":             row["last_env"],
-        "allow_cross_env_keys": row["allow_cross_env_keys"],
-        "created_at":           row["created_at"],
-        "sub_status":           row["sub_status"] or "none",
-        "sub_plan":             row["sub_plan"]   or "free",
-        "sub_period_end":       row["sub_period_end"].isoformat() if row["sub_period_end"] else None,
+        "id":                       str(row["id"]),
+        "email":                    row["email"],
+        "last_env":                 row["last_env"],
+        "allow_test_in_production": row["allow_test_in_production"],
+        "created_at":               row["created_at"],
+        "sub_status":               row["sub_status"] or "none",
+        "sub_plan":                 row["sub_plan"]   or "free",
+        "sub_period_end":           row["sub_period_end"].isoformat() if row["sub_period_end"] else None,
     }
 
 
@@ -1851,15 +1850,16 @@ async def update_last_env(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /auth/me/cross-env-keys — dashboard toggle for the test/live runtime
-# guard enforced in verify_api_key(). Defaults to FALSE (strict separation):
-#   • dk_test_ keys rejected while DODMAN_ENV=production
-#   • dk_live_ keys rejected everywhere DODMAN_ENV is not production
-# Setting this TRUE disables both checks for this user's keys only.
+# PATCH /auth/me/allow-test-in-production — dashboard toggle for the one
+# direction of the test/live runtime guard in verify_api_key() that's allowed
+# to be relaxed. Defaults to FALSE: dk_test_ keys are rejected while
+# DODMAN_ENV=production. dk_live_ keys requiring DODMAN_ENV=production is a
+# separate, permanent rule with no toggle anywhere — it is not affected by
+# this setting.
 # ---------------------------------------------------------------------------
 
-@auth_router.patch("/me/cross-env-keys", summary="Toggle test/live key environment enforcement")
-async def update_cross_env_keys(
+@auth_router.patch("/me/allow-test-in-production", summary="Toggle whether this user's test keys work in production")
+async def update_allow_test_in_production(
     request:      Request,
     current_user: dict         = Depends(get_current_user),
     pool:         asyncpg.Pool = Depends(get_pool),
@@ -1877,21 +1877,21 @@ async def update_cross_env_keys(
         )
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE users SET allow_cross_env_keys = $1 WHERE id = $2",
+            "UPDATE users SET allow_test_in_production = $1 WHERE id = $2",
             allow, uuid.UUID(current_user["id"]),
         )
-    log.info("Cross-env key toggle changed: user=%s allow=%s", current_user["id"], allow)
+    log.info("allow_test_in_production changed: user=%s allow=%s", current_user["id"], allow)
     asyncio.ensure_future(_write_audit_log(
         pool,
-        action="user.cross_env_keys_toggle",
+        action="user.allow_test_in_production_toggle",
         success=True,
         user_type="user",
         target_type="user",
         target_id=current_user["id"],
         ip_address=_client_ip(request),
-        details={"allow_cross_env_keys": allow, "request_id": _get_request_id(request)},
+        details={"allow_test_in_production": allow, "request_id": _get_request_id(request)},
     ))
-    return JSONResponse(content={"allow_cross_env_keys": allow})
+    return JSONResponse(content={"allow_test_in_production": allow})
 
 
 # ===========================================================================

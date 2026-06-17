@@ -108,6 +108,15 @@
     .ledger-tab-bar { display: flex; border-bottom: 1px solid #232329; background: #0f0f12; }
     .ledger-tab { padding: 9px 18px; font-size: 10px; font-family: 'IBM Plex Mono', monospace; letter-spacing: .1em; text-transform: uppercase; border: none; background: none; cursor: pointer; border-bottom: 2px solid transparent; color: #6b6b7a; transition: color .12s, border-color .12s; }
 
+    /* ── Toggle switch ── */
+    .switch { position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .switch .slider { position: absolute; inset: 0; cursor: pointer; background: #232329; border-radius: 999px; transition: background .15s; }
+    .switch .slider::before { content: ''; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: #6b6b7a; border-radius: 50%; transition: transform .15s, background .15s; }
+    .switch input:checked + .slider { background: #f59e0b33; }
+    .switch input:checked + .slider::before { transform: translateX(16px); background: #f59e0b; }
+    .switch input:disabled + .slider { opacity: .5; cursor: default; }
+
     ::-webkit-scrollbar { width: 4px; height: 4px; }
     ::-webkit-scrollbar-thumb { background: #3a3a44; border-radius: 2px; }
   </style>
@@ -185,6 +194,23 @@
             <p style="font-size:11px;color:rgba(245,158,11,.55);margin:4px 0 0;">Keys prefixed <code>dk_test_</code>. No billing charges apply.</p>
           </div>
         </div>
+
+        <div style="margin:14px 20px 0;padding:12px 14px;background:#0f0f12;border:1px solid #232329;border-radius:8px;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;">
+          <div style="flex:1;min-width:0;">
+            <p style="font-size:11px;font-weight:600;color:#d0d0e0;margin:0;">Allow test key in production</p>
+            <p style="font-size:11px;color:#6b6b7a;margin:4px 0 0;line-height:1.5;">
+              By default, <code>dk_test_</code> requests are rejected while the platform is running in production mode, so a test key can't quietly consume production rate limits or skew usage accounting. Turn this on if you intentionally want your test key to work against the live deployment — e.g. debugging against real infrastructure before issuing a live key.
+            </p>
+            <p style="font-size:10px;color:#3a3a44;margin:6px 0 0;">This only affects <code>dk_test_</code> keys. <code>dk_live_</code> keys always require production — that rule has no toggle.</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="allow-test-in-prod-toggle"
+                   {% if user.allow_test_in_production %}checked{% endif %}
+                   onchange="toggleAllowTestInProduction(this.checked)">
+            <span class="slider"></span>
+          </label>
+        </div>
+
         <div style="padding:16px 20px;">
           {% set test_key = api_keys | selectattr("environment","equalto","test") | selectattr("is_active","equalto",true) | first | default(none) %}
           {% if test_key %}
@@ -526,6 +552,34 @@ function switchLedgerTab(env, updateMain = false) {
   tLive.style.borderBottomColor  = !isTest ? '#10b981' : 'transparent';
   tLive.style.color               = !isTest ? '#10b981' : '#6b6b7a';
   if (updateMain) switchEnv(env);
+}
+
+// ════════════════════════════════════════════════════════
+// Allow test key in production — toggle
+// ════════════════════════════════════════════════════════
+async function toggleAllowTestInProduction(allow) {
+  const toggle = document.getElementById('allow-test-in-prod-toggle');
+  toggle.disabled = true;
+  try {
+    const res  = await fetch('/auth/me/allow-test-in-production', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ allow }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      toggle.checked = !allow;
+      showToast('Failed: ' + (data?.error?.message ?? res.status));
+      return;
+    }
+    showToast(allow
+      ? 'Test keys can now be used while the platform is in production mode.'
+      : 'Test keys are blocked in production mode again.');
+  } catch (err) {
+    toggle.checked = !allow;
+    showToast('Network error: ' + err.message);
+  } finally {
+    toggle.disabled = false;
+  }
 }
 
 // ════════════════════════════════════════════════════════
