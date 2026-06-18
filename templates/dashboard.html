@@ -316,7 +316,14 @@
             <p style="font-size:11px;color:#6b6b7a;">Renews {{ sub_period_end[:10] }}</p>
             {% endif %}
           </div>
-          <button class="btn btn-rose" onclick="cancelSubscription()" style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">Cancel Subscription</button>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            {% if sub_plan == 'starter' %}
+            <button class="btn btn-emerald" onclick="changePlan('pro')" style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">↑ Upgrade to Pro</button>
+            {% elif sub_plan == 'pro' %}
+            <button class="btn-ghost" onclick="changePlan('starter')" style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">↓ Switch to Starter</button>
+            {% endif %}
+            <button class="btn btn-rose" onclick="cancelSubscription()" style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">Cancel Subscription</button>
+          </div>
         </div>
 
         {% elif sub_status == 'non-renewing' %}
@@ -325,7 +332,12 @@
             <span class="badge badge-nonrenewing">Non-Renewing</span>
             <span style="font-family:Syne,sans-serif;font-weight:700;font-size:16px;color:#fff;">{{ sub_plan | title }}</span>
           </div>
+          {% if pending_plan %}
+          <p style="font-size:11px;color:rgba(245,158,11,.7);">Switching to <strong>{{ pending_plan | title }}</strong> on {{ pending_change_at[:10] if pending_change_at else 'your renewal date' }}.</p>
+          <button class="btn-ghost" onclick="cancelPlanSwitch('{{ sub_plan }}')" style="margin-top:8px;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">Cancel Switch — Stay on {{ sub_plan | title }}</button>
+          {% else %}
           <p style="font-size:11px;color:rgba(245,158,11,.7);">Auto-renewal is off. Access expires {{ sub_period_end[:10] if sub_period_end else 'soon' }}. Re-subscribe below to continue.</p>
+          {% endif %}
         </div>
 
         {% elif sub_status == 'attention' %}
@@ -680,6 +692,47 @@ async function cancelSubscription() {
   } catch (err) {
     showToast('Network error: ' + err.message);
   }
+}
+
+// ════════════════════════════════════════════════════════
+// Billing — upgrade / downgrade / cancel a scheduled switch
+// ════════════════════════════════════════════════════════
+async function _submitChangePlan(plan, effective) {
+  try {
+    const res  = await fetch('/billing/change-plan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(effective ? { plan, effective } : { plan }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      showToast('Plan change failed: ' + (data?.error?.message ?? res.status));
+      return;
+    }
+
+    if (data.status === 'checkout_required') {
+      showToast('Redirecting to Paystack to confirm payment…');
+      window.location.href = data.authorization_url;
+      return;
+    }
+
+    showToast(data.message || 'Plan updated.');
+    setTimeout(() => location.reload(), 2000);
+  } catch (err) {
+    showToast('Network error: ' + err.message);
+  }
+}
+
+async function changePlan(plan, effective) {
+  const label = plan.charAt(0).toUpperCase() + plan.slice(1);
+  if (!confirm(`Switch to the ${label} plan?`)) return;
+  await _submitChangePlan(plan, effective);
+}
+
+async function cancelPlanSwitch(currentPlan) {
+  if (!confirm(`Cancel the scheduled plan switch and stay on ${currentPlan.charAt(0).toUpperCase() + currentPlan.slice(1)}?`)) return;
+  await _submitChangePlan(currentPlan);
 }
 
 // ════════════════════════════════════════════════════════
