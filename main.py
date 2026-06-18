@@ -589,7 +589,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_user       ON subscriptions (user_id);
 CREATE INDEX        IF NOT EXISTS idx_sub_status     ON subscriptions (status);
 CREATE INDEX        IF NOT EXISTS idx_sub_paystack_id ON subscriptions (paystack_subscription_id);
-CREATE INDEX        IF NOT EXISTS idx_sub_pending     ON subscriptions (pending_change_at) WHERE pending_plan != '';
+-- NOTE: idx_sub_pending references pending_plan/pending_change_at which may not
+-- exist yet on older deployments — it is created AFTER the migration blocks below.
 -- Idempotent column adds for existing deployments
 DO $$ BEGIN
     ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS paystack_email_token VARCHAR(128) NOT NULL DEFAULT '';
@@ -611,6 +612,10 @@ DO $$ BEGIN
 EXCEPTION WHEN others THEN NULL; END $$;
 DO $$ BEGIN
     ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_change_at TIMESTAMPTZ;
+EXCEPTION WHEN others THEN NULL; END $$;
+-- Create the partial index now that the columns are guaranteed to exist.
+DO $$ BEGIN
+    CREATE INDEX IF NOT EXISTS idx_sub_pending ON subscriptions (pending_change_at) WHERE pending_plan != '';
 EXCEPTION WHEN others THEN NULL; END $$;
 
 -- ---------------------------------------------------------------------------
