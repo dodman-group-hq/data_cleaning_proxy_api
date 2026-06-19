@@ -5,7 +5,11 @@ Stateless, single-file FastAPI service — cleaned rows returned directly or
 routed to a webhook.  Now includes:
 
   • Unified asyncpg schema (users / api_keys / billing_ledger)
-  • dk_test_ / dk_live_ prefix enforcement with environment mismatch guard
+  • dk_test_ / dk_live_ prefix enforcement with environment mismatch guard.
+    dk_live_ requires DODMAN_ENV=production with NO override. dk_test_ in
+    production is blocked by default but overridable per-user via the
+    allow_test_in_production dashboard toggle.
+  • Per-request cleaning summary (rows_in / rows_out / dupes_removed / status)
   • Per-request billing telemetry (perf_counter → billing_ledger via BackgroundTasks)
   • request_id middleware + global error envelope on every response
   • Cookie-based auth (signup / login / logout) with passlib bcrypt
@@ -18,6 +22,13 @@ Env vars (set in .env or hosting dashboard):
   DODMAN_ENV                "production" enables sk_live_ keys  (default: development)
   RATE_LIMIT_FREE           default 60/hour
   RATE_LIMIT_STARTER        default 500/hour
+
+Per-user setting (stored on `users.allow_test_in_production`, default FALSE):
+  Toggled via PATCH /auth/me/allow-test-in-production. When FALSE (default),
+  dk_test_ keys are rejected while DODMAN_ENV=production. A user can flip it
+  TRUE from their dashboard to let their own test keys run against the
+  production deployment. This is one-directional: dk_live_ keys requiring
+  DODMAN_ENV=production has no toggle anywhere in this file — it is always on.
 """
 
 from __future__ import annotations
@@ -476,6 +487,13 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash VARCHAR(255) NOT NULL,
     last_env      VARCHAR(8)   NOT NULL DEFAULT 'test'
                                CHECK (last_env IN ('test', 'live')),
+    -- Risk mitigation: by default (FALSE) a dk_test_ key is rejected while
+    -- DODMAN_ENV=production. Set TRUE via the dashboard toggle to let this
+    -- user's test keys work against the production deployment (e.g. to debug
+    -- against the one real environment). This is deliberately one-directional:
+    -- dk_live_ keys ALWAYS require DODMAN_ENV=production with no override,
+    -- since a live key has no legitimate reason to run outside production.
+    allow_test_in_production BOOLEAN NOT NULL DEFAULT FALSE,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
@@ -483,6 +501,9 @@ CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
 DO $$ BEGIN
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_env VARCHAR(8) NOT NULL DEFAULT 'test'
         CHECK (last_env IN ('test', 'live'));
+EXCEPTION WHEN others THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS allow_test_in_production BOOLEAN NOT NULL DEFAULT FALSE;
 EXCEPTION WHEN others THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -529,6 +550,15 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     paystack_customer_id    VARCHAR(64)  NOT NULL DEFAULT '',
     paystack_subscription_id VARCHAR(64) NOT NULL DEFAULT '',
     paystack_plan_code      VARCHAR(64)  NOT NULL DEFAULT '',
+    -- email_token is required (alongside subscription_code) by Paystack's
+    -- /subscription/disable and /subscription/enable endpoints. It is NOT
+    -- the customer id/code -- it's a per-subscription token only present on
+    -- the subscription.create webhook payload / GET /subscription response.
+    paystack_email_token     VARCHAR(128) NOT NULL DEFAULT '',
+    -- Reusable card authorization captured from a successful charge, used to
+    -- charge upgrades/scheduled downgrades without a new checkout redirect.
+    paystack_authorization_code VARCHAR(128) NOT NULL DEFAULT '',
+    paystack_auth_reusable   BOOLEAN      NOT NULL DEFAULT FALSE,
 
     -- Mirrored from Paystack: active | cancelled | non-renewing | attention | pending
     status              VARCHAR(20)  NOT NULL DEFAULT 'pending',
@@ -540,6 +570,16 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     current_period_start TIMESTAMPTZ,
     current_period_end   TIMESTAMPTZ,
 
+    -- Set when invoice.payment_failed fires; cleared on the next successful
+    -- charge. Used to enforce a grace period before access is revoked.
+    payment_failed_at   TIMESTAMPTZ,
+
+    -- A scheduled plan change (downgrade) to apply at pending_change_at
+    -- (normally current_period_end). Empty string = no pending change.
+    pending_plan         VARCHAR(16)  NOT NULL DEFAULT '',
+    pending_plan_code    VARCHAR(64)  NOT NULL DEFAULT '',
+    pending_change_at    TIMESTAMPTZ,
+
     -- Full Paystack event payload for debugging/auditing
     last_event_data     JSONB,
 
@@ -549,6 +589,34 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_user       ON subscriptions (user_id);
 CREATE INDEX        IF NOT EXISTS idx_sub_status     ON subscriptions (status);
 CREATE INDEX        IF NOT EXISTS idx_sub_paystack_id ON subscriptions (paystack_subscription_id);
+-- NOTE: idx_sub_pending references pending_plan/pending_change_at which may not
+-- exist yet on older deployments — it is created AFTER the migration blocks below.
+-- Idempotent column adds for existing deployments
+DO $$ BEGIN
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS paystack_email_token VARCHAR(128) NOT NULL DEFAULT '';
+EXCEPTION WHEN others THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS paystack_authorization_code VARCHAR(128) NOT NULL DEFAULT '';
+EXCEPTION WHEN others THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS paystack_auth_reusable BOOLEAN NOT NULL DEFAULT FALSE;
+EXCEPTION WHEN others THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS payment_failed_at TIMESTAMPTZ;
+EXCEPTION WHEN others THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_plan VARCHAR(16) NOT NULL DEFAULT '';
+EXCEPTION WHEN others THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_plan_code VARCHAR(64) NOT NULL DEFAULT '';
+EXCEPTION WHEN others THEN NULL; END $$;
+DO $$ BEGIN
+    ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS pending_change_at TIMESTAMPTZ;
+EXCEPTION WHEN others THEN NULL; END $$;
+-- Create the partial index now that the columns are guaranteed to exist.
+DO $$ BEGIN
+    CREATE INDEX IF NOT EXISTS idx_sub_pending ON subscriptions (pending_change_at) WHERE pending_plan != '';
+EXCEPTION WHEN others THEN NULL; END $$;
 
 -- ---------------------------------------------------------------------------
 -- webhook_dead_letter  (payloads that exhausted all retry attempts)
@@ -692,9 +760,40 @@ async def _schedule_prune(pool: asyncpg.Pool) -> None:
         await asyncio.sleep(_PRUNE_INTERVAL_SECONDS)
 
 
+_sub_reconcile_task: asyncio.Task | None = None
+
+
+async def _schedule_subscription_reconcile(pool: asyncpg.Pool) -> None:
+    """
+    Background coroutine: every SUB_RECONCILE_INTERVAL_SECONDS (default 1h),
+    1) apply scheduled downgrades whose billing period has ended, and
+    2) sweep for subscriptions stuck past their payment-failure grace period
+       or whose period_end has long passed with no renewal/cancel webhook
+       ever arriving (a dropped-webhook safety net).
+
+    Both halves are defined further down the file (_process_due_plan_changes /
+    _enforce_payment_grace_periods) since they depend on Paystack helpers
+    defined in the billing section. Forward reference is fine — Python only
+    resolves the names when this coroutine actually runs, by which time the
+    whole module has finished importing.
+    """
+    interval = int(os.getenv("SUB_RECONCILE_INTERVAL_SECONDS", str(60 * 60)))
+    await asyncio.sleep(300)  # let the pool/app finish warming up first
+    while True:
+        try:
+            await _process_due_plan_changes(pool)
+        except Exception:
+            log.exception("_process_due_plan_changes failed — will retry next cycle.")
+        try:
+            await _enforce_payment_grace_periods(pool)
+        except Exception:
+            log.exception("_enforce_payment_grace_periods failed — will retry next cycle.")
+        await asyncio.sleep(interval)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
-    global _pool, _prune_task
+    global _pool, _prune_task, _sub_reconcile_task
     if not TENANT_DATABASE_URL:
         log.warning("TENANT_DATABASE_URL not set — DB features disabled.")
         return
@@ -708,20 +807,26 @@ async def _startup() -> None:
         await _bootstrap_schema(_pool)
         # Start background pruner (Risk 1 mitigation)
         _prune_task = asyncio.create_task(_schedule_prune(_pool))
-        log.info("Database pool ready.  Telemetry pruner scheduled every 7 days.  Docs: http://localhost:8000/docs")
+        # Start subscription lifecycle enforcement (scheduled plan changes +
+        # payment-failure / missed-webhook grace period sweep)
+        _sub_reconcile_task = asyncio.create_task(_schedule_subscription_reconcile(_pool))
+        log.info("Database pool ready.  Telemetry pruner scheduled every 7 days.  "
+                 "Subscription reconciliation scheduled every %ds.  Docs: http://localhost:8000/docs",
+                 int(os.getenv("SUB_RECONCILE_INTERVAL_SECONDS", str(60 * 60))))
     except Exception as exc:
         log.error("Failed to connect to database: %r", exc)
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    global _prune_task
-    if _prune_task and not _prune_task.done():
-        _prune_task.cancel()
-        try:
-            await _prune_task
-        except asyncio.CancelledError:
-            pass
+    global _prune_task, _sub_reconcile_task
+    for task in (_prune_task, _sub_reconcile_task):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     if _pool:
         await _pool.close()
 
@@ -1027,10 +1132,23 @@ async def verify_api_key(
     """
     Dependency: authenticates the Bearer token and enforces prefix/environment rules.
 
-    dk_live_*          Live key.  Requires DODMAN_ENV=production; raises 400
-                       INVALID_ENVIRONMENT_KEY if the runtime env is not live.
-    dk_test_*          Test key.  Truncates upload to 20 rows; accepted everywhere.
+    dk_live_*          Live key. ALWAYS requires DODMAN_ENV=production — this is
+                       a hard rule with no override, because a live key carries
+                       real billing/customer data and has no legitimate reason
+                       to ever run outside the actual production deployment.
+                       Raises 400 INVALID_ENVIRONMENT_KEY otherwise.
+    dk_test_*          Test key. Truncates upload to 20 rows. Rejected while
+                       DODMAN_ENV=production UNLESS the owning user has set
+                       allow_test_in_production — see below. This direction is
+                       toggleable because "use my test key against the one
+                       production deployment" is a normal, legitimate workflow.
     dk_sandbox_test_99 Universal open-sandbox key.  5 req/day per IP; 20-row cap.
+
+    allow_test_in_production (per-user, dashboard-toggleable, default FALSE):
+    Read from the `users` table (joined in below). Defaults to FALSE for every
+    user, and for any key with no owning user (no dashboard to toggle), so
+    rate limits / usage / billing stay protected from test traffic landing in
+    production accounting unless a user explicitly opts in.
     """
     _UNAUTH = HTTPException(
         status_code=401,
@@ -1056,42 +1174,43 @@ async def verify_api_key(
             raw_key=raw, is_sandbox=True, is_test=True,
         )
 
-    # ── Prefix / environment mismatch enforcement ─────────────────────────────
-    if raw.startswith(_PREFIX_LIVE):
-        if _RUNTIME_ENV() != "production":
-            asyncio.ensure_future(_log_auth_failure(
-                request, "auth.env_mismatch",
-                f"dk_live_ key used in {_RUNTIME_ENV()} environment",
-                raw[:16],
-            ))
-            raise HTTPException(
-                status_code=400,
-                detail=_error_envelope(
-                    "INVALID_ENVIRONMENT_KEY",
-                    "Mismatched environment key layout. "
-                    "A dk_live_ key cannot be used outside a production environment.",
-                    _get_request_id(request),
-                ),
-            )
-    elif raw.startswith(_PREFIX_TEST):
-        # Test keys are always accepted regardless of runtime env
-        pass
-    else:
-        # Legacy dk_live_ keys or unknown prefixes go straight to DB validation
-        pass
-
+    is_live_key = raw.startswith(_PREFIX_LIVE)
     is_test_key = raw.startswith(_PREFIX_TEST)
 
+    # ── Live key environment guard — ALWAYS enforced, never toggleable ───────
+    # No per-user setting can relax this, so it's checked before the DB hit
+    # (fast fail) exactly like the original prefix-only version did.
+    if is_live_key and _RUNTIME_ENV() != "production":
+        asyncio.ensure_future(_log_auth_failure(
+            request, "auth.env_mismatch",
+            f"dk_live_ key used in {_RUNTIME_ENV()} environment",
+            raw[:16],
+        ))
+        raise HTTPException(
+            status_code=400,
+            detail=_error_envelope(
+                "INVALID_ENVIRONMENT_KEY",
+                "A dk_live_ key cannot be used outside a production environment. "
+                "This rule has no override.",
+                _get_request_id(request),
+            ),
+        )
+
     # ── DB validation ─────────────────────────────────────────────────────────
+    # The test-key runtime guard below needs the owning user's
+    # allow_test_in_production preference, so it's joined in here.
     hashed = _hash_key(raw)
     pool   = await get_pool()
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, user_id, label, tier, key_prefix, environment, is_active
-            FROM   api_keys
-            WHERE  key_hash = $1
+            SELECT k.id, k.user_id, k.label, k.tier, k.key_prefix,
+                   k.environment, k.is_active,
+                   COALESCE(u.allow_test_in_production, FALSE) AS allow_test_in_production
+            FROM   api_keys k
+            LEFT JOIN users u ON u.id = k.user_id
+            WHERE  k.key_hash = $1
             LIMIT  1
             """,
             hashed,
@@ -1107,7 +1226,8 @@ async def verify_api_key(
 
     # ── Secondary environment guard: key's stored environment vs request key ──
     # A key stored as environment='test' that physically has a dk_live_ prefix
-    # is a data anomaly — reject it explicitly.
+    # is a data anomaly — reject it explicitly. This is a key-registration
+    # integrity check, not a policy choice, so it has no toggle either.
     stored_env = row["environment"]
     if raw.startswith(_PREFIX_LIVE) and stored_env != "live":
         asyncio.ensure_future(_log_auth_failure(
@@ -1136,6 +1256,24 @@ async def verify_api_key(
                 "INVALID_ENVIRONMENT_KEY",
                 "This dk_test_ key is registered as a live-environment key. "
                 "Check your key configuration.",
+                _get_request_id(request),
+            ),
+        )
+
+    # ── Test key in production — the ONLY toggleable direction ───────────────
+    if is_test_key and _RUNTIME_ENV() == "production" and not row["allow_test_in_production"]:
+        asyncio.ensure_future(_log_auth_failure(
+            request, "auth.env_mismatch",
+            "dk_test_ key used in production environment",
+            raw[:16],
+        ))
+        raise HTTPException(
+            status_code=400,
+            detail=_error_envelope(
+                "INVALID_ENVIRONMENT_KEY",
+                "A dk_test_ key cannot be used in a production environment. "
+                "Enable 'Allow test key in production' on your dashboard if this "
+                "is intentional.",
                 _get_request_id(request),
             ),
         )
@@ -1740,10 +1878,12 @@ async def get_current_user(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT u.id, u.email, u.last_env, u.created_at,
+            SELECT u.id, u.email, u.last_env, u.allow_test_in_production, u.created_at,
                    s.status   AS sub_status,
                    s.plan     AS sub_plan,
-                   s.current_period_end AS sub_period_end
+                   s.current_period_end AS sub_period_end,
+                   s.pending_plan       AS pending_plan,
+                   s.pending_change_at  AS pending_change_at
             FROM   users u
             LEFT JOIN subscriptions s ON s.user_id = u.id
             WHERE  u.id = $1
@@ -1754,13 +1894,16 @@ async def get_current_user(
         raise _unauth()
 
     return {
-        "id":             str(row["id"]),
-        "email":          row["email"],
-        "last_env":       row["last_env"],
-        "created_at":     row["created_at"],
-        "sub_status":     row["sub_status"] or "none",
-        "sub_plan":       row["sub_plan"]   or "free",
-        "sub_period_end": row["sub_period_end"].isoformat() if row["sub_period_end"] else None,
+        "id":                       str(row["id"]),
+        "email":                    row["email"],
+        "last_env":                 row["last_env"],
+        "allow_test_in_production": row["allow_test_in_production"],
+        "created_at":               row["created_at"],
+        "sub_status":               row["sub_status"] or "none",
+        "sub_plan":                 row["sub_plan"]   or "free",
+        "sub_period_end":           row["sub_period_end"].isoformat() if row["sub_period_end"] else None,
+        "pending_plan":             row["pending_plan"] or "",
+        "pending_change_at":        row["pending_change_at"].isoformat() if row["pending_change_at"] else None,
     }
 
 
@@ -1792,6 +1935,51 @@ async def update_last_env(
             env, uuid.UUID(current_user["id"]),
         )
     return JSONResponse(content={"last_env": env})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /auth/me/allow-test-in-production — dashboard toggle for the one
+# direction of the test/live runtime guard in verify_api_key() that's allowed
+# to be relaxed. Defaults to FALSE: dk_test_ keys are rejected while
+# DODMAN_ENV=production. dk_live_ keys requiring DODMAN_ENV=production is a
+# separate, permanent rule with no toggle anywhere — it is not affected by
+# this setting.
+# ---------------------------------------------------------------------------
+
+@auth_router.patch("/me/allow-test-in-production", summary="Toggle whether this user's test keys work in production")
+async def update_allow_test_in_production(
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    body  = await request.json()
+    allow = body.get("allow")
+    if not isinstance(allow, bool):
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                "'allow' must be a boolean.",
+                _get_request_id(request),
+            ),
+        )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET allow_test_in_production = $1 WHERE id = $2",
+            allow, uuid.UUID(current_user["id"]),
+        )
+    log.info("allow_test_in_production changed: user=%s allow=%s", current_user["id"], allow)
+    asyncio.ensure_future(_write_audit_log(
+        pool,
+        action="user.allow_test_in_production_toggle",
+        success=True,
+        user_type="user",
+        target_type="user",
+        target_id=current_user["id"],
+        ip_address=_client_ip(request),
+        details={"allow_test_in_production": allow, "request_id": _get_request_id(request)},
+    ))
+    return JSONResponse(content={"allow_test_in_production": allow})
 
 
 # ===========================================================================
@@ -2087,6 +2275,9 @@ _PLAN_MAP = {
     "pro":     lambda: PAYSTACK_PLAN_PRO,
 }
 
+# Used to decide whether a plan change is an upgrade or a downgrade.
+_PLAN_RANK: dict[str, int] = {"starter": 1, "pro": 2}
+
 _TIER_FROM_PLAN: dict[str, str] = {}   # populated lazily from plan codes
 
 
@@ -2128,31 +2319,59 @@ async def _upsert_subscription(
     period_end:      datetime.datetime | None,
     plan_name:       str,
     raw_event:       dict,
+    email_token:        str = "",
+    authorization_code: str = "",
+    auth_reusable:      bool = False,
 ) -> None:
-    """Insert or update the subscriptions row for a user."""
+    """
+    Insert or update the subscriptions row for a user.
+
+    IMPORTANT — identifier preservation:
+    Not every Paystack event that touches a subscription carries every
+    identifier. A recurring `charge.success` event, for example, does NOT
+    repeat the subscription's `email_token`, and its nested `subscription`
+    object is far sparser than the one on `subscription.create`. If this
+    upsert blindly overwrote paystack_subscription_id / paystack_email_token
+    / paystack_customer_id / paystack_authorization_code with whatever blank
+    string a given event happened to supply, a single recurring payment
+    would silently erase the identifiers needed to cancel or modify the
+    subscription later (this was the cause of the "code is required" error
+    from Paystack on /billing/cancel). So: for these four columns, an empty
+    incoming value NEVER overwrites a previously stored non-empty value —
+    only a genuinely new, non-empty value can replace what's there.
+    status / plan / period dates / last_event_data always reflect the latest
+    event, since those legitimately change on every webhook.
+    """
     async with pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO subscriptions
                 (user_id, paystack_customer_id, paystack_subscription_id,
+                 paystack_email_token, paystack_authorization_code, paystack_auth_reusable,
                  paystack_plan_code, status, plan,
                  current_period_start, current_period_end,
                  last_event_data, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb, NOW())
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb, NOW())
             ON CONFLICT (user_id) DO UPDATE SET
-                paystack_customer_id     = EXCLUDED.paystack_customer_id,
-                paystack_subscription_id = EXCLUDED.paystack_subscription_id,
-                paystack_plan_code       = EXCLUDED.paystack_plan_code,
-                status                   = EXCLUDED.status,
-                plan                     = EXCLUDED.plan,
-                current_period_start     = EXCLUDED.current_period_start,
-                current_period_end       = EXCLUDED.current_period_end,
-                last_event_data          = EXCLUDED.last_event_data,
-                updated_at               = NOW()
+                paystack_customer_id        = COALESCE(NULLIF(EXCLUDED.paystack_customer_id, ''), subscriptions.paystack_customer_id),
+                paystack_subscription_id    = COALESCE(NULLIF(EXCLUDED.paystack_subscription_id, ''), subscriptions.paystack_subscription_id),
+                paystack_email_token        = COALESCE(NULLIF(EXCLUDED.paystack_email_token, ''), subscriptions.paystack_email_token),
+                paystack_authorization_code = COALESCE(NULLIF(EXCLUDED.paystack_authorization_code, ''), subscriptions.paystack_authorization_code),
+                paystack_auth_reusable      = EXCLUDED.paystack_auth_reusable OR subscriptions.paystack_auth_reusable,
+                paystack_plan_code          = EXCLUDED.paystack_plan_code,
+                status                      = EXCLUDED.status,
+                plan                        = EXCLUDED.plan,
+                current_period_start        = EXCLUDED.current_period_start,
+                current_period_end          = EXCLUDED.current_period_end,
+                last_event_data             = EXCLUDED.last_event_data,
+                updated_at                  = NOW()
             """,
             uuid.UUID(user_id),
             customer_id,
             subscription_id,
+            email_token,
+            authorization_code,
+            auth_reusable,
             plan_code,
             status,
             plan_name,
@@ -2160,6 +2379,38 @@ async def _upsert_subscription(
             period_end,
             json.dumps(raw_event),
         )
+
+
+async def _clear_payment_failed(pool: asyncpg.Pool, user_id: str) -> None:
+    """Reset the payment-failure grace-period clock once a charge succeeds again."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE subscriptions SET payment_failed_at = NULL WHERE user_id = $1",
+                uuid.UUID(user_id),
+            )
+    except Exception:
+        log.exception("Failed to clear payment_failed_at for user=%s", user_id)
+
+
+async def _finalize_upgrade_metadata(tx_metadata: dict, user_id: str) -> None:
+    """
+    If a checkout transaction was tagged as an upgrade/plan-change (see
+    /billing/change-plan), disable the prior subscription now that the new
+    one is active — otherwise Paystack keeps auto-renewing the OLD plan too,
+    double-charging the customer every cycle.
+    """
+    if tx_metadata.get("action") not in ("upgrade", "downgrade_immediate"):
+        return
+    old_code  = tx_metadata.get("old_subscription_code", "")
+    old_token = tx_metadata.get("old_email_token", "")
+    if not (old_code and old_token):
+        return
+    try:
+        await _paystack_post("/subscription/disable", {"code": old_code, "token": old_token})
+        log.info("Disabled prior subscription %s after plan change for user=%s", old_code, user_id)
+    except Exception:
+        log.exception("Failed to disable prior subscription %s during plan change for user=%s", old_code, user_id)
 
 
 def _plan_name_from_code(plan_code: str) -> str:
@@ -2740,6 +2991,8 @@ async def billing_callback(
     # Pull subscription details from the verified transaction
     sub      = tx.get("subscription", {}) or {}
     plan     = tx.get("plan",         {}) or {}
+    authorization = tx.get("authorization", {}) or {}
+    tx_metadata   = tx.get("metadata") or {}
 
     if isinstance(plan, str):
         plan = {"plan_code": plan}
@@ -2762,14 +3015,23 @@ async def billing_callback(
         pool,
         user_id,
         customer_id=str(customer.get("id", "")),
-        subscription_id=str(sub.get("id", "")),
+        # Real field is "subscription_code" — see _upsert_subscription docstring.
+        subscription_id=str(sub.get("subscription_code") or sub.get("id") or ""),
         plan_code=plan_code,
         status="active",
         period_start=_parse_dt(period_start_str),
         period_end=_parse_dt(period_end_str),
         plan_name=plan_name,
         raw_event=tx,
+        email_token=str(sub.get("email_token") or ""),
+        authorization_code=str(authorization.get("authorization_code") or ""),
+        auth_reusable=bool(authorization.get("reusable", False)),
     )
+    asyncio.ensure_future(_clear_payment_failed(pool, user_id))
+
+    # If this checkout was an upgrade/plan-change (see /billing/change-plan),
+    # disable the prior subscription now so Paystack doesn't keep renewing it.
+    asyncio.ensure_future(_finalize_upgrade_metadata(tx_metadata, user_id))
 
     # Upgrade live API key tier
     async with pool.acquire() as conn:
@@ -2897,17 +3159,25 @@ async def billing_webhook(
         user_id = await _user_id_from_email(cust_email)
         if user_id:
             sub_code = data.get("subscription", {}) or {}
+            authorization = data.get("authorization", {}) or {}
             await _upsert_subscription(
                 pool, user_id,
                 customer_id=cust_id,
-                subscription_id=str(sub_code.get("id", "")),
+                # Paystack's real field is "subscription_code", not "id" —
+                # this was the bug that wiped paystack_subscription_id on
+                # every recurring renewal (see _upsert_subscription docstring).
+                subscription_id=str(sub_code.get("subscription_code") or sub_code.get("id") or ""),
                 plan_code=plan_code,
                 status="active",
                 period_start=_parse_dt(data.get("paidAt")),
                 period_end=_parse_dt(sub_code.get("next_payment_date")),
                 plan_name=plan_name,
                 raw_event=data,
+                email_token=str(sub_code.get("email_token") or ""),
+                authorization_code=str(authorization.get("authorization_code") or ""),
+                auth_reusable=bool(authorization.get("reusable", False)),
             )
+            asyncio.ensure_future(_clear_payment_failed(pool, user_id))
             asyncio.ensure_future(_write_audit_log(
                 pool, "billing.charge_success", True,
                 user_type="user", target_type="subscription",
@@ -2941,7 +3211,9 @@ async def billing_webhook(
                 period_end=_parse_dt(data.get("next_payment_date")),
                 plan_name=plan_name,
                 raw_event=data,
+                email_token=str(data.get("email_token", "")),
             )
+            asyncio.ensure_future(_clear_payment_failed(pool, user_id))
             asyncio.ensure_future(_write_audit_log(
                 pool, "billing.subscription_created", True,
                 user_type="user", target_type="subscription",
@@ -2971,11 +3243,24 @@ async def billing_webhook(
                 await conn.execute(
                     """
                     UPDATE subscriptions
-                    SET    status = $1, last_event_data = $2::jsonb, updated_at = NOW()
+                    SET    status = $1, last_event_data = $2::jsonb,
+                           pending_plan = '', pending_plan_code = '', pending_change_at = NULL,
+                           updated_at = NOW()
                     WHERE  user_id = $3
                     """,
                     new_status, json.dumps(data), uuid.UUID(user_id),
                 )
+                if new_status == "cancelled":
+                    # This was previously missing entirely: cancelling a
+                    # subscription never revoked the live key, so it kept
+                    # working forever regardless of subscription state.
+                    await conn.execute(
+                        """
+                        UPDATE api_keys SET is_active = FALSE
+                        WHERE  user_id = $1 AND environment = 'live' AND is_active = TRUE
+                        """,
+                        uuid.UUID(user_id),
+                    )
             asyncio.ensure_future(_write_audit_log(
                 pool, "billing.subscription_cancelled", True,
                 user_type="user", target_type="subscription",
@@ -3008,7 +3293,9 @@ async def billing_webhook(
                 await conn.execute(
                     """
                     UPDATE subscriptions
-                    SET    status = 'attention', last_event_data = $1::jsonb, updated_at = NOW()
+                    SET    status = 'attention',
+                           payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                           last_event_data = $1::jsonb, updated_at = NOW()
                     WHERE  user_id = $2
                     """,
                     json.dumps(data), uuid.UUID(user_id),
@@ -3046,9 +3333,11 @@ async def billing_portal(
     current_user: dict = Depends(get_current_user),
 ) -> JSONResponse:
     return JSONResponse(content={
-        "sub_status":     current_user.get("sub_status", "none"),
-        "sub_plan":       current_user.get("sub_plan", "free"),
-        "sub_period_end": current_user.get("sub_period_end"),
+        "sub_status":        current_user.get("sub_status", "none"),
+        "sub_plan":          current_user.get("sub_plan", "free"),
+        "sub_period_end":    current_user.get("sub_period_end"),
+        "pending_plan":      current_user.get("pending_plan", ""),
+        "pending_change_at": current_user.get("pending_change_at"),
     })
 
 
@@ -3462,18 +3751,25 @@ async def billing_verify(
                     _get_request_id(request),
                 ),
             )
+        authorization = tx.get("authorization", {}) or {}
+        tx_metadata   = tx.get("metadata") or {}
         await _upsert_subscription(
             pool,
             current_user["id"],
             customer_id=str(customer.get("id", "")),
-            subscription_id=str(sub.get("id", "")),
+            subscription_id=str(sub.get("subscription_code") or sub.get("id") or ""),
             plan_code=plan_code,
             status="active",
             period_start=_parse_dt(period_start_str),
             period_end=_parse_dt(period_end_str),
             plan_name=plan_name,
             raw_event=tx,
+            email_token=str(sub.get("email_token") or ""),
+            authorization_code=str(authorization.get("authorization_code") or ""),
+            auth_reusable=bool(authorization.get("reusable", False)),
         )
+        asyncio.ensure_future(_clear_payment_failed(pool, current_user["id"]))
+        asyncio.ensure_future(_finalize_upgrade_metadata(tx_metadata, current_user["id"]))
         # Also upgrade the live key tier
         async with pool.acquire() as conn:
             await conn.execute(
@@ -3819,6 +4115,296 @@ async def billing_due(
 
 
 # ---------------------------------------------------------------------------
+# Reconciliation job, part 1: apply scheduled downgrades.
+#
+# When a user downgrades without effective="immediate", /billing/change-plan
+# disables the OLD subscription's auto-renew right away but leaves the user
+# on their current (higher) tier until current_period_end — it stores the
+# target plan in pending_plan/pending_plan_code/pending_change_at instead of
+# switching immediately. This sweep runs periodically and actually starts
+# the new (lower) plan once that date arrives.
+# ---------------------------------------------------------------------------
+
+async def _process_due_plan_changes(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT s.user_id, s.pending_plan, s.pending_plan_code,
+                   s.paystack_authorization_code, s.paystack_auth_reusable,
+                   s.paystack_subscription_id, s.paystack_email_token,
+                   s.paystack_customer_id, u.email
+            FROM   subscriptions s
+            JOIN   users u ON u.id = s.user_id
+            WHERE  s.pending_plan <> '' AND s.pending_change_at <= NOW()
+            """
+        )
+
+    for row in rows:
+        user_id   = str(row["user_id"])
+        new_plan  = row["pending_plan"]
+        new_code  = row["pending_plan_code"]
+        auth_code = (row["paystack_authorization_code"] or "").strip()
+        reusable  = bool(row["paystack_auth_reusable"])
+
+        if auth_code and reusable:
+            try:
+                plan_info   = await _paystack_get(f"/plan/{new_code}")
+                new_amount  = int(plan_info.get("data", {}).get("amount", 0))
+                charge_resp = await _paystack_post("/transaction/charge_authorization", {
+                    "authorization_code": auth_code,
+                    "email":  row["email"],
+                    "amount": max(new_amount, 100),
+                    "plan":   new_code,
+                    "metadata": {"action": "scheduled_downgrade", "user_id": user_id},
+                })
+                charge_status = (charge_resp.get("data", {}) or {}).get("status", "")
+                if charge_status != "success":
+                    raise RuntimeError(f"charge_authorization returned status={charge_status!r}")
+
+                new_sub  = charge_resp.get("data", {}).get("subscription") or {}
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE subscriptions
+                        SET    plan = $1, paystack_plan_code = $2, status = 'active',
+                               paystack_subscription_id = COALESCE(NULLIF($3, ''), paystack_subscription_id),
+                               pending_plan = '', pending_plan_code = '', pending_change_at = NULL,
+                               updated_at = NOW()
+                        WHERE  user_id = $4
+                        """,
+                        new_plan, new_code, str(new_sub.get("subscription_code", "")), uuid.UUID(user_id),
+                    )
+                    await conn.execute(
+                        "UPDATE api_keys SET tier = $1 WHERE user_id = $2 AND environment = 'live' AND is_active = TRUE",
+                        new_plan, uuid.UUID(user_id),
+                    )
+                asyncio.ensure_future(_write_audit_log(
+                    pool, "billing.downgrade_applied", True,
+                    user_type="system", target_type="subscription", target_id=user_id,
+                    ip_address="reconciliation-job",
+                    details={"new_plan": new_plan},
+                ))
+                asyncio.ensure_future(_send_subscription_email(
+                    to=row["email"],
+                    subject="Your Dodman plan has been switched",
+                    heading="Plan Switched",
+                    body=f"<p>Your scheduled downgrade to the {new_plan.title()} plan is now active.</p>",
+                    cta_text="View Dashboard",
+                    cta_url=f"{APP_BASE_URL}/dashboard/",
+                ))
+                continue
+            except Exception:
+                log.exception("Scheduled downgrade charge failed for user=%s — revoking access.", user_id)
+
+        # No reusable card on file, or the charge failed: we can't silently
+        # switch them to a paid lower tier without a successful charge, so
+        # access is revoked and the user is asked to re-subscribe manually.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE subscriptions
+                SET    status = 'cancelled',
+                       pending_plan = '', pending_plan_code = '', pending_change_at = NULL,
+                       updated_at = NOW()
+                WHERE  user_id = $1
+                """,
+                uuid.UUID(user_id),
+            )
+            await conn.execute(
+                "UPDATE api_keys SET is_active = FALSE WHERE user_id = $1 AND environment = 'live' AND is_active = TRUE",
+                uuid.UUID(user_id),
+            )
+        asyncio.ensure_future(_write_audit_log(
+            pool, "billing.downgrade_failed", False,
+            user_type="system", target_type="subscription", target_id=user_id,
+            ip_address="reconciliation-job",
+            details={"attempted_plan": new_plan},
+        ))
+        asyncio.ensure_future(_send_subscription_email(
+            to=row["email"],
+            subject="We couldn't switch your Dodman plan automatically",
+            heading="Action Needed",
+            body=(
+                "<p>We tried to switch your subscription to the new plan you scheduled, "
+                "but couldn't complete the charge automatically.</p>"
+                "<p>Your access has been paused — please re-subscribe to restore your live API key.</p>"
+            ),
+            cta_text="Re-subscribe",
+            cta_url=f"{APP_BASE_URL}/dashboard/",
+        ))
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation job, part 2: enforce payment-failure grace periods and
+# catch subscriptions whose renewal/cancel webhook never arrived.
+#
+# Two independent triggers:
+#   a) status='attention' (invoice.payment_failed fired) and the grace
+#      window (PAYMENT_FAILURE_GRACE_HOURS, default 72h) has elapsed with
+#      no successful retry.
+#   b) status='active' but current_period_end passed 48h+ ago with no
+#      renewal (charge.success) or cancellation webhook ever updating it —
+#      a dropped-webhook safety net, since Paystack delivery isn't 100%.
+# Before revoking, each candidate is re-verified live against Paystack so a
+# webhook that simply arrived late doesn't get incorrectly punished.
+# ---------------------------------------------------------------------------
+
+async def _enforce_payment_grace_periods(pool: asyncpg.Pool) -> None:
+    grace_hours = int(os.getenv("PAYMENT_FAILURE_GRACE_HOURS", "72"))
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT s.user_id, s.status, s.paystack_subscription_id, u.email
+            FROM   subscriptions s
+            JOIN   users u ON u.id = s.user_id
+            WHERE
+                (s.status = 'attention' AND s.payment_failed_at IS NOT NULL
+                    AND s.payment_failed_at <= NOW() - ($1 || ' hours')::interval)
+                OR
+                (s.status = 'active' AND s.current_period_end IS NOT NULL
+                    AND s.current_period_end <= NOW() - INTERVAL '48 hours')
+            """,
+            str(grace_hours),
+        )
+
+    for row in rows:
+        user_id = str(row["user_id"])
+        sub_id  = (row["paystack_subscription_id"] or "").strip()
+
+        # Belt-and-suspenders: re-check with Paystack before revoking, in
+        # case the local row is just waiting on a delayed webhook.
+        if sub_id:
+            try:
+                live = await _paystack_get(f"/subscription/{sub_id}")
+                live_status = (live.get("data", {}) or {}).get("status", "")
+                if live_status == "active":
+                    continue  # still genuinely active on Paystack's side — skip
+            except Exception:
+                log.warning("Could not re-verify subscription=%s for user=%s before grace revocation.", sub_id, user_id)
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE subscriptions SET status = 'cancelled', updated_at = NOW() WHERE user_id = $1",
+                uuid.UUID(user_id),
+            )
+            await conn.execute(
+                "UPDATE api_keys SET is_active = FALSE WHERE user_id = $1 AND environment = 'live' AND is_active = TRUE",
+                uuid.UUID(user_id),
+            )
+
+        if sub_id:
+            try:
+                await _paystack_post("/subscription/disable", {"code": sub_id, "token": ""})
+            except Exception:
+                pass  # best-effort — local revocation is what actually matters
+
+        asyncio.ensure_future(_write_audit_log(
+            pool, "billing.access_revoked_grace_expired", True,
+            user_type="system", target_type="subscription", target_id=user_id,
+            ip_address="reconciliation-job",
+            details={"prior_status": row["status"]},
+        ))
+        asyncio.ensure_future(_send_subscription_email(
+            to=row["email"],
+            subject="Your Dodman subscription has been suspended",
+            heading="Subscription Suspended",
+            body=(
+                "<p>We were unable to confirm an active subscription or successful payment "
+                "for your account, so access to your live API key has been suspended.</p>"
+                "<p>Re-subscribe at any time to restore access.</p>"
+            ),
+            cta_text="Re-subscribe",
+            cta_url=f"{APP_BASE_URL}/dashboard/",
+        ))
+
+
+# ---------------------------------------------------------------------------
+# Credential resolution for /subscription/disable and /subscription/enable.
+#
+# Both of these Paystack endpoints require { "code": subscription_code,
+# "token": email_token }. The email_token is NOT the customer id/code — it's
+# a per-subscription token. If our local row is missing either value (older
+# rows created before email_token capture existed, or a rare webhook race),
+# this refetches the live subscription from Paystack by customer id and
+# persists the recovered values, instead of sending Paystack a blank "code"
+# (which is exactly the "code is required" error this was built to prevent).
+# ---------------------------------------------------------------------------
+
+async def _ensure_subscription_credentials(
+    pool: asyncpg.Pool,
+    user_id: str,
+    local: asyncpg.Record,
+    request: Request,
+) -> tuple[str, str]:
+    sub_id = (local["paystack_subscription_id"] or "").strip()
+    token  = (local["paystack_email_token"] or "").strip()
+    if sub_id and token:
+        return sub_id, token
+
+    cust_id = (local["paystack_customer_id"] or "").strip()
+    if not cust_id:
+        raise HTTPException(
+            status_code=409,
+            detail=_error_envelope(
+                "SUBSCRIPTION_NOT_LINKED",
+                "Your subscription record is missing Paystack identifiers and "
+                "can't be modified automatically. Please contact support.",
+                _get_request_id(request),
+            ),
+        )
+
+    try:
+        listing = await _paystack_get(f"/subscription?customer={cust_id}")
+    except httpx.HTTPStatusError as exc:
+        log.error("Paystack subscription lookup failed for customer=%s: %s", cust_id, exc.response.text)
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Could not look up your subscription on Paystack. Please try again.",
+                _get_request_id(request),
+            ),
+        )
+
+    subs  = listing.get("data", []) or []
+    match = next((s for s in subs if s.get("status") in ("active", "non-renewing")), subs[0] if subs else None)
+    if not match:
+        raise HTTPException(
+            status_code=409,
+            detail=_error_envelope(
+                "SUBSCRIPTION_NOT_LINKED",
+                "No matching subscription was found on Paystack for this account.",
+                _get_request_id(request),
+            ),
+        )
+
+    sub_id = str(match.get("subscription_code", "")).strip()
+    token  = str(match.get("email_token", "")).strip()
+    if not (sub_id and token):
+        raise HTTPException(
+            status_code=409,
+            detail=_error_envelope(
+                "SUBSCRIPTION_NOT_LINKED",
+                "Paystack did not return a complete subscription identifier for this account.",
+                _get_request_id(request),
+            ),
+        )
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE subscriptions
+            SET    paystack_subscription_id = $1, paystack_email_token = $2, updated_at = NOW()
+            WHERE  user_id = $3
+            """,
+            sub_id, token, uuid.UUID(user_id),
+        )
+    log.info("Recovered subscription credentials from Paystack for user=%s sub_id=%s", user_id, sub_id)
+    return sub_id, token
+
+
+# ---------------------------------------------------------------------------
 # POST /billing/cancel
 # User-initiated cancellation: calls Paystack to disable auto-renewal, then
 # marks the local subscription as 'non-renewing'.  The subscription stays
@@ -3846,7 +4432,7 @@ async def billing_cancel(
     async with pool.acquire() as conn:
         local = await conn.fetchrow(
             """
-            SELECT paystack_subscription_id, paystack_customer_id,
+            SELECT paystack_subscription_id, paystack_customer_id, paystack_email_token,
                    status, current_period_end
             FROM   subscriptions
             WHERE  user_id = $1
@@ -3871,14 +4457,20 @@ async def billing_cancel(
             "access_until": local["current_period_end"].isoformat() if local["current_period_end"] else None,
         })
 
-    sub_id  = local["paystack_subscription_id"]
-    cust_id = local["paystack_customer_id"]
+    # Resolve the correct Paystack identifiers. Paystack's /subscription/disable
+    # requires { code: subscription_code, token: email_token } — NOT the
+    # customer id. If our local row is missing either (e.g. an older row, or
+    # a webhook race that never captured email_token), this recovers them
+    # straight from Paystack instead of sending a blank "code".
+    sub_id, email_token = await _ensure_subscription_credentials(
+        pool, current_user["id"], local, request,
+    )
 
     # Call Paystack to disable auto-renewal
     try:
         await _paystack_post("/subscription/disable", {
             "code":  sub_id,
-            "token": cust_id,
+            "token": email_token,
         })
     except httpx.HTTPStatusError as exc:
         log.error("Paystack cancel failed: %s", exc.response.text)
@@ -3963,7 +4555,8 @@ async def billing_reactivate(
 
     async with pool.acquire() as conn:
         local = await conn.fetchrow(
-            "SELECT paystack_subscription_id, paystack_customer_id, status FROM subscriptions WHERE user_id = $1",
+            "SELECT paystack_subscription_id, paystack_customer_id, paystack_email_token, status "
+            "FROM subscriptions WHERE user_id = $1",
             uid,
         )
 
@@ -3973,13 +4566,12 @@ async def billing_reactivate(
             detail=_error_envelope("NOT_FOUND", "No subscription found for this user.", _get_request_id(request)),
         )
 
-    sub_id  = local["paystack_subscription_id"]
-    cust_id = local["paystack_customer_id"]
+    sub_id, email_token = await _ensure_subscription_credentials(pool, user_id, local, request)
 
     try:
         await _paystack_post("/subscription/enable", {
             "code":  sub_id,
-            "token": cust_id,
+            "token": email_token,
         })
     except httpx.HTTPStatusError as exc:
         log.error("Paystack reactivate failed: %s", exc.response.text)
@@ -4010,6 +4602,316 @@ async def billing_reactivate(
         "user_id": user_id,
         "status":  "active",
         "message": "Subscription re-enabled. Auto-renewal is active.",
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /billing/change-plan — upgrade or downgrade the current subscription.
+#
+# Upgrades are always immediate. Downgrades default to "scheduled" (the user
+# keeps their current tier until current_period_end, then a background job
+# switches them over) unless effective="immediate" is passed.
+#
+# Paystack has no native "change plan" call, so this is built out of the
+# primitives that do exist:
+#   - immediate change w/ saved reusable card → /transaction/charge_authorization
+#     (prorated amount), then disable the old subscription so it stops
+#     auto-renewing alongside the new one.
+#   - immediate change w/ no saved card → fall back to a checkout redirect,
+#     same pattern as a fresh /billing/subscribe, tagged in metadata so the
+#     callback/verify handlers disable the old subscription once it lands.
+#   - scheduled downgrade → disable the current subscription's auto-renew
+#     now (no charge), store the target plan + effective date, and let the
+#     reconciliation job (_process_due_plan_changes) start the new plan once
+#     the current period actually ends.
+# ---------------------------------------------------------------------------
+
+@billing_router.post(
+    "/change-plan",
+    summary="Upgrade, downgrade, or re-subscribe to a different plan",
+)
+async def billing_change_plan(
+    request:      Request,
+    current_user: dict         = Depends(get_current_user),
+    pool:         asyncpg.Pool = Depends(get_pool),
+) -> JSONResponse:
+    body        = await request.json()
+    target_plan = str(body.get("plan", "")).strip().lower()
+    effective   = str(body.get("effective", "")).strip().lower()
+
+    if target_plan not in _PLAN_RANK:
+        raise HTTPException(
+            status_code=422,
+            detail=_error_envelope(
+                "VALIDATION_FAILED",
+                f"Invalid plan '{target_plan}'. Must be 'starter' or 'pro'.",
+                _get_request_id(request),
+            ),
+        )
+
+    async with pool.acquire() as conn:
+        local = await conn.fetchrow(
+            """
+            SELECT paystack_subscription_id, paystack_customer_id, paystack_email_token,
+                   paystack_authorization_code, paystack_auth_reusable, paystack_plan_code,
+                   status, plan, current_period_start, current_period_end,
+                   pending_plan, pending_plan_code, pending_change_at
+            FROM   subscriptions
+            WHERE  user_id = $1
+            """,
+            uuid.UUID(current_user["id"]),
+        )
+
+    if not local or local["status"] not in ("active", "non-renewing"):
+        raise HTTPException(
+            status_code=409,
+            detail=_error_envelope(
+                "NO_ACTIVE_SUBSCRIPTION",
+                "You don't have an active subscription to change. Subscribe to a plan first.",
+                _get_request_id(request),
+            ),
+        )
+
+    current_plan = local["plan"] or ""
+
+    if target_plan == current_plan:
+        if local["pending_plan"]:
+            # Cancel a previously-scheduled downgrade and re-enable auto-renew
+            # on the current plan, so the user simply stays where they are.
+            sub_id, email_token = await _ensure_subscription_credentials(
+                pool, current_user["id"], local, request,
+            )
+            try:
+                await _paystack_post("/subscription/enable", {"code": sub_id, "token": email_token})
+            except Exception:
+                log.exception("Failed to re-enable subscription %s while cancelling scheduled downgrade.", sub_id)
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE subscriptions
+                    SET    status = 'active', pending_plan = '', pending_plan_code = '',
+                           pending_change_at = NULL, updated_at = NOW()
+                    WHERE  user_id = $1
+                    """,
+                    uuid.UUID(current_user["id"]),
+                )
+            asyncio.ensure_future(_write_audit_log(
+                pool, "billing.downgrade_cancelled", True,
+                user_type="user", target_type="subscription", target_id=current_user["id"],
+                ip_address=_client_ip(request), details={"plan": current_plan},
+            ))
+            return JSONResponse(content={
+                "status":  "unchanged",
+                "plan":    current_plan,
+                "message": "Scheduled plan change cancelled — you'll stay on your current plan.",
+            })
+        return JSONResponse(content={
+            "status":  "unchanged",
+            "plan":    current_plan,
+            "message": f"You're already on the {target_plan.title()} plan.",
+        })
+
+    is_upgrade = _PLAN_RANK[target_plan] > _PLAN_RANK.get(current_plan, 0)
+
+    target_plan_code = _PLAN_MAP[target_plan]()
+    if not target_plan_code:
+        raise HTTPException(
+            status_code=503,
+            detail=_error_envelope(
+                "CONFIGURATION_ERROR",
+                f"PAYSTACK_PLAN_{target_plan.upper()} is not configured on this server.",
+                _get_request_id(request),
+            ),
+        )
+
+    sub_id, email_token = await _ensure_subscription_credentials(
+        pool, current_user["id"], local, request,
+    )
+
+    # ── Scheduled downgrade (default for downgrades) ───────────────────────
+    if not is_upgrade and effective != "immediate":
+        try:
+            await _paystack_post("/subscription/disable", {"code": sub_id, "token": email_token})
+        except httpx.HTTPStatusError as exc:
+            log.error("Paystack disable (scheduled downgrade) failed: %s", exc.response.text)
+            raise HTTPException(
+                status_code=502,
+                detail=_error_envelope(
+                    "PAYMENT_GATEWAY_ERROR",
+                    "Could not schedule the plan change. Please try again.",
+                    _get_request_id(request),
+                ),
+            )
+
+        change_at = local["current_period_end"] or (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE subscriptions
+                SET    status = 'non-renewing', pending_plan = $1, pending_plan_code = $2,
+                       pending_change_at = $3, updated_at = NOW()
+                WHERE  user_id = $4
+                """,
+                target_plan, target_plan_code, change_at, uuid.UUID(current_user["id"]),
+            )
+
+        asyncio.ensure_future(_write_audit_log(
+            pool, "billing.downgrade_scheduled", True,
+            user_type="user", target_type="subscription", target_id=current_user["id"],
+            ip_address=_client_ip(request),
+            details={"from_plan": current_plan, "to_plan": target_plan, "effective_at": change_at.isoformat()},
+        ))
+
+        return JSONResponse(content={
+            "status":       "scheduled",
+            "current_plan": current_plan,
+            "target_plan":  target_plan,
+            "effective_at": change_at.isoformat(),
+            "message": (
+                f"You'll keep your {current_plan.title()} access until "
+                f"{change_at.date().isoformat()}, then switch to {target_plan.title()}."
+            ),
+        })
+
+    # ── Immediate change: upgrade, or downgrade with effective="immediate" ─
+    try:
+        old_plan_data = await _paystack_get(f"/plan/{local['paystack_plan_code']}") if local["paystack_plan_code"] else {}
+        new_plan_data = await _paystack_get(f"/plan/{target_plan_code}")
+        old_amount = int(old_plan_data.get("data", {}).get("amount", 0) or 0)
+        new_amount = int(new_plan_data.get("data", {}).get("amount", 0) or 0)
+    except Exception:
+        log.exception("Could not fetch plan amounts for proration — falling back to full new-plan amount.")
+        old_amount, new_amount = 0, 0
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    period_start, period_end = local["current_period_start"], local["current_period_end"]
+    if period_start and period_end and period_end > period_start:
+        total_seconds     = (period_end - period_start).total_seconds()
+        remaining_seconds = max((period_end - now).total_seconds(), 0)
+        remaining_fraction = remaining_seconds / total_seconds if total_seconds > 0 else 1.0
+    else:
+        remaining_fraction = 1.0
+
+    if old_amount and new_amount:
+        charge_amount = max(0, round((new_amount - old_amount) * remaining_fraction))
+    else:
+        charge_amount = new_amount  # fallback: full new-plan price if proration inputs are missing
+
+    action_tag = "upgrade" if is_upgrade else "downgrade_immediate"
+    metadata = {
+        "user_id": current_user["id"],
+        "plan": target_plan,
+        "service": "data_cleaning_proxy",
+        "product": "data-cleaner-api",
+        "action": action_tag,
+        "old_subscription_code": sub_id,
+        "old_email_token": email_token,
+    }
+
+    if local["paystack_authorization_code"] and local["paystack_auth_reusable"]:
+        try:
+            charge_resp = await _paystack_post("/transaction/charge_authorization", {
+                "authorization_code": local["paystack_authorization_code"],
+                "email":   current_user["email"],
+                "amount":  max(charge_amount, 100),
+                "plan":    target_plan_code,
+                "metadata": metadata,
+            })
+            charge_status = (charge_resp.get("data", {}) or {}).get("status", "")
+            if charge_status != "success":
+                raise RuntimeError(f"charge_authorization returned status={charge_status!r}")
+        except Exception as exc:
+            log.exception("Plan-change charge_authorization failed for user=%s", current_user["id"])
+            raise HTTPException(
+                status_code=502,
+                detail=_error_envelope(
+                    "PAYMENT_GATEWAY_ERROR",
+                    "Could not process the plan-change charge. Please try again.",
+                    _get_request_id(request),
+                ),
+            )
+
+        new_sub = charge_resp.get("data", {}).get("subscription") or {}
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE subscriptions
+                SET    plan = $1, paystack_plan_code = $2, status = 'active',
+                       paystack_subscription_id = COALESCE(NULLIF($3, ''), paystack_subscription_id),
+                       pending_plan = '', pending_plan_code = '', pending_change_at = NULL,
+                       updated_at = NOW()
+                WHERE  user_id = $4
+                """,
+                target_plan, target_plan_code, str(new_sub.get("subscription_code", "")), uuid.UUID(current_user["id"]),
+            )
+            await conn.execute(
+                "UPDATE api_keys SET tier = $1 WHERE user_id = $2 AND environment = 'live' AND is_active = TRUE",
+                target_plan, uuid.UUID(current_user["id"]),
+            )
+
+        # Stop the OLD subscription from continuing to auto-renew now that
+        # the new one is active.
+        asyncio.ensure_future(_finalize_upgrade_metadata(metadata, current_user["id"]))
+
+        asyncio.ensure_future(_write_audit_log(
+            pool, "billing.plan_changed", True,
+            user_type="user", target_type="subscription", target_id=current_user["id"],
+            ip_address=_client_ip(request),
+            details={"from_plan": current_plan, "to_plan": target_plan, "charged_amount": charge_amount},
+        ))
+        asyncio.ensure_future(_send_subscription_email(
+            to=current_user["email"],
+            subject="Your Dodman plan has changed",
+            heading="Plan Changed",
+            body=f"<p>You're now on the {target_plan.title()} plan, effective immediately.</p>",
+            cta_text="View Dashboard",
+            cta_url=f"{APP_BASE_URL}/dashboard/",
+        ))
+
+        return JSONResponse(content={
+            "status":         "changed",
+            "plan":           target_plan,
+            "charged_amount": charge_amount,
+            "message":        f"You're now on the {target_plan.title()} plan.",
+        })
+
+    # No reusable card on file — fall back to a checkout redirect, same as a
+    # fresh subscribe. Tagged in metadata so callback/verify can disable the
+    # old subscription once this new one activates.
+    try:
+        data = await _paystack_post("/transaction/initialize", {
+            "email":        current_user["email"],
+            "amount":       new_amount or 100,
+            "plan":         target_plan_code,
+            "callback_url": f"{APP_BASE_URL}/billing/callback",
+            "metadata":     metadata,
+        })
+    except httpx.HTTPStatusError as exc:
+        log.error("Paystack initialise (plan change checkout) failed: %s", exc.response.text)
+        raise HTTPException(
+            status_code=502,
+            detail=_error_envelope(
+                "PAYMENT_GATEWAY_ERROR",
+                "Could not initialise the plan-change checkout. Please try again.",
+                _get_request_id(request),
+            ),
+        )
+
+    asyncio.ensure_future(_write_audit_log(
+        pool, "billing.plan_change_checkout_initiated", True,
+        user_type="user", target_type="subscription", target_id=current_user["id"],
+        ip_address=_client_ip(request),
+        details={"from_plan": current_plan, "to_plan": target_plan},
+    ))
+
+    return JSONResponse(content={
+        "status":             "checkout_required",
+        "plan":               target_plan,
+        "authorization_url":  data["data"]["authorization_url"],
+        "access_code":        data["data"]["access_code"],
+        "reference":          data["data"]["reference"],
     })
 
 
@@ -4099,6 +5001,8 @@ async def dashboard(
             "sub_status":     current_user.get("sub_status", "none"),
             "sub_plan":       current_user.get("sub_plan", "free"),
             "sub_period_end": current_user.get("sub_period_end"),
+            "pending_plan":      current_user.get("pending_plan", ""),
+            "pending_change_at": current_user.get("pending_change_at"),
             "paystack_public_key": PAYSTACK_PUBLIC_KEY,
             "billing_alert":  billing_alert,
             "api_keys":       [_serialise_key(k) for k in keys],
@@ -4236,19 +5140,23 @@ def _clean_in_chunks(
     dedupe_all:   bool,
     crypto_salt:  str,
     chunk_size:   int,
+    stats:        dict | None = None,
 ) -> Sheet:
     """
     Pure-Python chunked cleaning, safe to run in a thread pool executor.
     Processes sheet in chunk_size batches then applies a global dedupe pass
-    if dedupe_all is True.
+    if dedupe_all is True. `stats["dupes_removed"]` accumulates duplicates
+    caught both within each chunk and in the final cross-chunk pass.
     """
     cleaned: Sheet = []
     for i in range(0, len(sheet), chunk_size):
         chunk = sheet[i: i + chunk_size]
         cleaned.extend(clean_sheet(chunk, column_rules,
                                    dedupe_all=dedupe_all,
-                                   crypto_salt=crypto_salt))
+                                   crypto_salt=crypto_salt,
+                                   stats=stats))
     if dedupe_all:
+        rows_before_global = len(cleaned)
         seen_g: set[tuple] = set()
         deduped_g: Sheet   = []
         for row in cleaned:
@@ -4257,6 +5165,8 @@ def _clean_in_chunks(
                 seen_g.add(key)
                 deduped_g.append(row)
         cleaned = deduped_g
+        if stats is not None:
+            stats["dupes_removed"] = stats.get("dupes_removed", 0) + (rows_before_global - len(cleaned))
     return cleaned
 
 
@@ -4724,6 +5634,7 @@ def clean_sheet(
     column_rules: dict[str, list[str]],
     dedupe_all:   bool = False,
     crypto_salt:  str  = "",
+    stats:        dict | None = None,
 ) -> Sheet:
     stat_rules  = {"fill_mean", "fill_median"}
     rules_pass1 = {
@@ -4750,6 +5661,7 @@ def clean_sheet(
     # ── Deduplication ────────────────────────────────────────────────────────
     # dedupe_all=True  → deduplicate on every column (whole-row match)
     # "dedupe" rule    → deduplicate on that specific column only
+    rows_before_dedupe = len(sheet)
     if dedupe_all:
         seen:    set[tuple] = set()
         deduped: Sheet      = []
@@ -4770,6 +5682,9 @@ def clean_sheet(
                     seen.add(key)
                     deduped.append(row)
             sheet = deduped
+
+    if stats is not None:
+        stats["dupes_removed"] = stats.get("dupes_removed", 0) + (rows_before_dedupe - len(sheet))
 
     return sheet
 
@@ -4908,8 +5823,12 @@ async def _dispatch_webhook(
     "/clean",
     summary="Upload and clean a CSV or XLSX file",
     responses={
-        200: {"description": "Cleaned file streamed directly (no webhook)"},
-        202: {"description": "Processing queued; payload POSTed to X-Webhook-URL"},
+        200: {"description": "Cleaned file streamed directly (no webhook). Summary stats "
+                              "(rows_in/rows_out/dupes_removed/status) are in the X-Rows-In, "
+                              "X-Rows-Out, X-Dupes-Removed, X-Clean-Status headers, and also in "
+                              "the JSON body under \"summary\" if X-Include-Summary: true was sent."},
+        202: {"description": "Processing queued; payload POSTed to X-Webhook-URL. Response body "
+                              "includes a \"summary\" object."},
         400: {"description": "Environment key mismatch"},
         413: {"description": "File exceeds tier size limit"},
         415: {"description": "Unsupported file type"},
@@ -4933,6 +5852,7 @@ async def clean_file(
     x_dry_run:        str | None = Header(default=None, alias="X-Dry-Run"),
     x_dedupe_all:     str | None = Header(default=None, alias="X-Dedupe-All"),
     x_crypto_salt:    str | None = Header(default=None, alias="X-Crypto-Salt"),
+    x_include_summary: str | None = Header(default=None, alias="X-Include-Summary"),
     api_key:          APIKeyRecord = Security(verify_api_key),
 ) -> Response:
 
@@ -5024,6 +5944,7 @@ async def clean_file(
     else:
         sheet, file_type = parse_file(fname, raw_bytes)
     rows_in = len(sheet)
+    quota_trimmed = False
 
     # ── Monthly row quota check ───────────────────────────────────────────────
     # Sandbox / test keys use the free cap but are also hard-truncated to 20
@@ -5058,8 +5979,9 @@ async def clean_file(
         # If the file would push the user over their cap, trim it rather than
         # reject entirely — they still get value and a clear warning header.
         if rows_in > rows_remaining:
-            sheet    = sheet[:rows_remaining]
-            rows_in  = rows_remaining
+            sheet         = sheet[:rows_remaining]
+            rows_in       = rows_remaining
+            quota_trimmed = True
             log.info(
                 "Quota trim: key=%s rows_requested=%d rows_remaining=%d",
                 api_key.key_prefix, len(sheet) + (rows_in - rows_remaining), rows_remaining,
@@ -5154,22 +6076,37 @@ async def clean_file(
     # ── Clean — chunk-stream for Pro, single-pass for Starter/Test ───────────
     _CHUNK_SIZE = 10_000
     is_pro_live = tier == "pro" and not api_key.is_test
+    clean_stats: dict[str, int] = {}
 
     if is_pro_live and rows_in > _CHUNK_SIZE:
         loop = asyncio.get_event_loop()
         cleaned: Sheet = await loop.run_in_executor(
             None,
-            lambda: _clean_in_chunks(sheet, column_rules, is_dedupe_all, crypto_salt, _CHUNK_SIZE),
+            lambda: _clean_in_chunks(sheet, column_rules, is_dedupe_all, crypto_salt,
+                                      _CHUNK_SIZE, stats=clean_stats),
         )
     else:
         cleaned = clean_sheet(sheet, column_rules,
                               dedupe_all=is_dedupe_all,
-                              crypto_salt=crypto_salt)
+                              crypto_salt=crypto_salt,
+                              stats=clean_stats)
     sanitised = _sanitise_for_json(cleaned)
     rows_out  = len(sanitised)
+    dupes_removed = clean_stats.get("dupes_removed", 0)
 
     # ── Stop the clock ────────────────────────────────────────────────────────
     duration_ms = int((time.perf_counter() - t_start) * 1000)
+
+    # ── Per-request summary — included in every response below ───────────────
+    # "partial" means the input was capped before cleaning even started
+    # (sandbox/test 20-row cap, or a monthly-quota trim), so rows_in here is
+    # already the post-cap count rather than the original upload size.
+    summary = {
+        "rows_in":       rows_in,
+        "rows_out":      rows_out,
+        "dupes_removed": dupes_removed,
+        "status":        "partial" if (truncated or quota_trimmed) else "clean",
+    }
 
     # ── Schedule billing ledger + audit log writes (non-blocking) ───────────
     try:
@@ -5201,8 +6138,10 @@ async def clean_file(
                 "file_type":   file_type,
                 "rows_in":     rows_in,
                 "rows_out":    rows_out,
+                "dupes_removed": dupes_removed,
                 "duration_ms": duration_ms,
                 "truncated":   truncated,
+                "quota_trimmed": quota_trimmed,
                 "webhook":     bool(x_webhook_url),
                 "output_format": resolved_fmt,
                 "request_id":  _get_request_id(request),
@@ -5255,6 +6194,7 @@ async def clean_file(
             "status":         "queued",
             "rows_processed": rows_out,
             "duration_ms":    duration_ms,
+            "summary":        summary,
         }
         if job_id:
             resp_data["job_id"]   = job_id
@@ -5264,16 +6204,28 @@ async def clean_file(
         return JSONResponse(status_code=202, content=resp_data)
 
     # ── Direct streaming mode → 200 ───────────────────────────────────────────
+    # The body here is the cleaned file itself (CSV bytes or a bare JSON array)
+    # so existing integrations keep working unchanged. The summary block is
+    # always exposed via headers; pass X-Include-Summary: true to additionally
+    # get it wrapped into the JSON body as {"summary": ..., "data": [...]}.
+    include_summary = (x_include_summary or "").strip().lower() in ("1", "true", "yes")
     if resolved_fmt == "csv":
         payload     = _to_csv_bytes(cleaned)
         media_type  = "text/csv"
         disposition = "attachment; filename=cleaned_file.csv"
     else:
-        payload     = json.dumps(sanitised, ensure_ascii=False, indent=2).encode()
+        body_obj    = {"summary": summary, "data": sanitised} if include_summary else sanitised
+        payload     = json.dumps(body_obj, ensure_ascii=False, indent=2).encode()
         media_type  = "application/json"
         disposition = "attachment; filename=cleaned_file.json"
 
-    extra_headers: dict[str, str] = {"X-Duration-Ms": str(duration_ms)}
+    extra_headers: dict[str, str] = {
+        "X-Duration-Ms":     str(duration_ms),
+        "X-Rows-In":         str(summary["rows_in"]),
+        "X-Rows-Out":        str(summary["rows_out"]),
+        "X-Dupes-Removed":   str(summary["dupes_removed"]),
+        "X-Clean-Status":    summary["status"],
+    }
     if truncated:
         extra_headers["X-Rows-Truncated"] = str(original_row_count - _SANDBOX_ROW_LIMIT)
     # Expose quota consumption so clients can track usage without a separate API call

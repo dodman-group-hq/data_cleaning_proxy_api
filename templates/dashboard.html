@@ -108,6 +108,15 @@
     .ledger-tab-bar { display: flex; border-bottom: 1px solid #232329; background: #0f0f12; }
     .ledger-tab { padding: 9px 18px; font-size: 10px; font-family: 'IBM Plex Mono', monospace; letter-spacing: .1em; text-transform: uppercase; border: none; background: none; cursor: pointer; border-bottom: 2px solid transparent; color: #6b6b7a; transition: color .12s, border-color .12s; }
 
+    /* ── Toggle switch ── */
+    .switch { position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .switch .slider { position: absolute; inset: 0; cursor: pointer; background: #232329; border-radius: 999px; transition: background .15s; }
+    .switch .slider::before { content: ''; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: #6b6b7a; border-radius: 50%; transition: transform .15s, background .15s; }
+    .switch input:checked + .slider { background: #f59e0b33; }
+    .switch input:checked + .slider::before { transform: translateX(16px); background: #f59e0b; }
+    .switch input:disabled + .slider { opacity: .5; cursor: default; }
+
     ::-webkit-scrollbar { width: 4px; height: 4px; }
     ::-webkit-scrollbar-thumb { background: #3a3a44; border-radius: 2px; }
   </style>
@@ -185,6 +194,23 @@
             <p style="font-size:11px;color:rgba(245,158,11,.55);margin:4px 0 0;">Keys prefixed <code>dk_test_</code>. No billing charges apply.</p>
           </div>
         </div>
+
+        <div style="margin:14px 20px 0;padding:12px 14px;background:#0f0f12;border:1px solid #232329;border-radius:8px;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;">
+          <div style="flex:1;min-width:0;">
+            <p style="font-size:11px;font-weight:600;color:#d0d0e0;margin:0;">Allow test key in production</p>
+            <p style="font-size:11px;color:#6b6b7a;margin:4px 0 0;line-height:1.5;">
+              By default, <code>dk_test_</code> requests are rejected while the platform is running in production mode, so a test key can't quietly consume production rate limits or skew usage accounting. Turn this on if you intentionally want your test key to work against the live deployment — e.g. debugging against real infrastructure before issuing a live key.
+            </p>
+            <p style="font-size:10px;color:#3a3a44;margin:6px 0 0;">This only affects <code>dk_test_</code> keys. <code>dk_live_</code> keys always require production — that rule has no toggle.</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="allow-test-in-prod-toggle"
+                   {% if user.allow_test_in_production %}checked{% endif %}
+                   onchange="toggleAllowTestInProduction(this.checked)">
+            <span class="slider"></span>
+          </label>
+        </div>
+
         <div style="padding:16px 20px;">
           {% set test_key = api_keys | selectattr("environment","equalto","test") | selectattr("is_active","equalto",true) | first | default(none) %}
           {% if test_key %}
@@ -290,7 +316,14 @@
             <p style="font-size:11px;color:#6b6b7a;">Renews {{ sub_period_end[:10] }}</p>
             {% endif %}
           </div>
-          <button class="btn btn-rose" onclick="cancelSubscription()" style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">Cancel Subscription</button>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            {% if sub_plan == 'starter' %}
+            <button class="btn btn-emerald" onclick="changePlan('pro')" style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">↑ Upgrade to Pro</button>
+            {% elif sub_plan == 'pro' %}
+            <button class="btn-ghost" onclick="changePlan('starter')" style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">↓ Switch to Starter</button>
+            {% endif %}
+            <button class="btn btn-rose" onclick="cancelSubscription()" style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">Cancel Subscription</button>
+          </div>
         </div>
 
         {% elif sub_status == 'non-renewing' %}
@@ -299,7 +332,12 @@
             <span class="badge badge-nonrenewing">Non-Renewing</span>
             <span style="font-family:Syne,sans-serif;font-weight:700;font-size:16px;color:#fff;">{{ sub_plan | title }}</span>
           </div>
+          {% if pending_plan %}
+          <p style="font-size:11px;color:rgba(245,158,11,.7);">Switching to <strong>{{ pending_plan | title }}</strong> on {{ pending_change_at[:10] if pending_change_at else 'your renewal date' }}.</p>
+          <button class="btn-ghost" onclick="cancelPlanSwitch('{{ sub_plan }}')" style="margin-top:8px;font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.06em;text-transform:uppercase;">Cancel Switch — Stay on {{ sub_plan | title }}</button>
+          {% else %}
           <p style="font-size:11px;color:rgba(245,158,11,.7);">Auto-renewal is off. Access expires {{ sub_period_end[:10] if sub_period_end else 'soon' }}. Re-subscribe below to continue.</p>
+          {% endif %}
         </div>
 
         {% elif sub_status == 'attention' %}
@@ -529,6 +567,34 @@ function switchLedgerTab(env, updateMain = false) {
 }
 
 // ════════════════════════════════════════════════════════
+// Allow test key in production — toggle
+// ════════════════════════════════════════════════════════
+async function toggleAllowTestInProduction(allow) {
+  const toggle = document.getElementById('allow-test-in-prod-toggle');
+  toggle.disabled = true;
+  try {
+    const res  = await fetch('/auth/me/allow-test-in-production', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', body: JSON.stringify({ allow }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      toggle.checked = !allow;
+      showToast('Failed: ' + (data?.error?.message ?? res.status));
+      return;
+    }
+    showToast(allow
+      ? 'Test keys can now be used while the platform is in production mode.'
+      : 'Test keys are blocked in production mode again.');
+  } catch (err) {
+    toggle.checked = !allow;
+    showToast('Network error: ' + err.message);
+  } finally {
+    toggle.disabled = false;
+  }
+}
+
+// ════════════════════════════════════════════════════════
 // Key re-issue
 // ════════════════════════════════════════════════════════
 async function reissueKey(env) {
@@ -626,6 +692,47 @@ async function cancelSubscription() {
   } catch (err) {
     showToast('Network error: ' + err.message);
   }
+}
+
+// ════════════════════════════════════════════════════════
+// Billing — upgrade / downgrade / cancel a scheduled switch
+// ════════════════════════════════════════════════════════
+async function _submitChangePlan(plan, effective) {
+  try {
+    const res  = await fetch('/billing/change-plan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(effective ? { plan, effective } : { plan }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      showToast('Plan change failed: ' + (data?.error?.message ?? res.status));
+      return;
+    }
+
+    if (data.status === 'checkout_required') {
+      showToast('Redirecting to Paystack to confirm payment…');
+      window.location.href = data.authorization_url;
+      return;
+    }
+
+    showToast(data.message || 'Plan updated.');
+    setTimeout(() => location.reload(), 2000);
+  } catch (err) {
+    showToast('Network error: ' + err.message);
+  }
+}
+
+async function changePlan(plan, effective) {
+  const label = plan.charAt(0).toUpperCase() + plan.slice(1);
+  if (!confirm(`Switch to the ${label} plan?`)) return;
+  await _submitChangePlan(plan, effective);
+}
+
+async function cancelPlanSwitch(currentPlan) {
+  if (!confirm(`Cancel the scheduled plan switch and stay on ${currentPlan.charAt(0).toUpperCase() + currentPlan.slice(1)}?`)) return;
+  await _submitChangePlan(currentPlan);
 }
 
 // ════════════════════════════════════════════════════════
