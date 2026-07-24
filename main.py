@@ -78,6 +78,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
+from email_validator import validate_email, EmailNotValidError
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -5372,26 +5373,28 @@ def clean_encrypt(value: Any, salt: str = "") -> str | None:
 
 
 
-def clean_phone_intl(value: Any, default_region: str = "KE") -> str | None:
+def clean_phone_intl(value: Any, default_region: str = "KE") -> dict:
     """
     Normalise any international phone number to E.164 format (+254...).
     Falls back to the KE-specific cleaner for unrecognised numbers.
     default_region is used when the number has no country code prefix.
     """
     if value is None:
-        return None
+        return {"phone": None, "valid": False, "reason": "empty"}
     raw = str(int(value)) if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
     raw = raw.strip()
     if not raw:
-        return None
+        return {"phone": None, "valid": False, "reason": "empty"}
     try:
         parsed = phonenumbers.parse(raw, default_region)
         if phonenumbers.is_valid_number(parsed):
-            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+            return {"phone": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164), "valid": True, "reason": None}
     except phonenumbers.NumberParseException:
         pass
-    # Fallback to KE-specific cleaner
-    return clean_phone_ke(value)
+    ke = clean_phone_ke(value)
+    if ke:
+        return {"phone": ke, "valid": True, "reason": None}
+    return {"phone": raw, "valid": False, "reason": f"could not determine country for bare number (assumed {default_region})"}
 
 
 # Currency symbol → ISO 4217 code map (extend as needed)
@@ -5484,7 +5487,7 @@ _EMAIL_RE = re.compile(
 )
 
 
-def clean_email(value: Any) -> dict:
+def clean_email(value: Any, check_deliverability: bool = False) -> dict:
     """
     Validate and normalise an email address.
     Returns {"email": str, "valid": bool, "reason": str|None}.
@@ -5501,32 +5504,14 @@ def clean_email(value: Any) -> dict:
     """
     if value is None:
         return {"email": None, "valid": False, "reason": "empty"}
-
-    raw = str(value).strip().lower()
+    raw = str(value).strip()
     if not raw:
         return {"email": None, "valid": False, "reason": "empty"}
-
-    if len(raw) > 254:
-        return {"email": raw, "valid": False, "reason": "address too long (>254 chars)"}
-
-    if not _EMAIL_RE.match(raw):
-        return {"email": raw, "valid": False, "reason": "invalid format"}
-
-    local, domain = raw.rsplit("@", 1)
-
-    if len(local) > 64:
-        return {"email": raw, "valid": False, "reason": "local part too long (>64 chars)"}
-
-    if ".." in local:
-        return {"email": raw, "valid": False, "reason": "consecutive dots in local part"}
-
-    if ".." in domain:
-        return {"email": raw, "valid": False, "reason": "consecutive dots in domain"}
-
-    if "." not in domain:
-        return {"email": raw, "valid": False, "reason": "domain has no TLD"}
-
-    return {"email": raw, "valid": True, "reason": None}
+    try:
+        result = validate_email(raw, check_deliverability=check_deliverability)
+        return {"email": result.normalized.lower(), "valid": True, "reason": None}
+    except EmailNotValidError as e:
+        return {"email": raw.lower(), "valid": False, "reason": str(e)}
 
 
 def clean_email_normalize(value: Any) -> str | None:
