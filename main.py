@@ -1877,20 +1877,22 @@ async def get_current_user(
         raise _unauth()
 
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT u.id, u.email, u.last_env, u.allow_test_in_production, u.created_at,
-                   s.status   AS sub_status,
-                   s.plan     AS sub_plan,
-                   s.current_period_end AS sub_period_end,
-                   s.pending_plan       AS pending_plan,
-                   s.pending_change_at  AS pending_change_at
-            FROM   users u
-            LEFT JOIN subscriptions s ON s.user_id = u.id
-            WHERE  u.id = $1
-            """,
-            uuid.UUID(user_id),
-        )
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_product', 'vett', true)")
+            row = await conn.fetchrow(
+                """
+                SELECT u.id, u.email, u.last_env, u.allow_test_in_production, u.created_at,
+                    s.status   AS sub_status,
+                    s.plan     AS sub_plan,
+                    s.current_period_end AS sub_period_end,
+                    s.pending_plan       AS pending_plan,
+                    s.pending_change_at  AS pending_change_at
+                FROM   users u
+                LEFT JOIN subscriptions s ON s.user_id = u.id AND s.product = 'vett'
+                WHERE  u.id = $1
+                """,
+                uuid.UUID(user_id),
+            )
     if row is None:
         raise _unauth()
 
