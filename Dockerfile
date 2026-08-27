@@ -14,10 +14,13 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
-# System deps needed to compile asyncpg's C extension
+# System deps needed to compile asyncpg's C extension, plus git so pip
+# can clone the private dodman-billing repo below. Builder-stage only -
+# the runtime image never gets git, keeping the final image lean.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         libpq-dev \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
