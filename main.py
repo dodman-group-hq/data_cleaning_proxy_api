@@ -595,7 +595,6 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_user       ON subscriptions (user_id);
 CREATE INDEX        IF NOT EXISTS idx_sub_status     ON subscriptions (status);
 CREATE INDEX        IF NOT EXISTS idx_sub_paystack_id ON subscriptions (paystack_subscription_id);
 -- NOTE: idx_sub_pending references pending_plan/pending_change_at which may not
