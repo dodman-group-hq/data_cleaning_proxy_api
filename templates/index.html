@@ -4,6 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Vett · Data Clean Proxy</title>
+  <meta name="description" content="Vett — data cleaning proxy sandbox. Upload CSV/XLSX, validate and clean rows, and get instant JSON/CSV output.">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Dodman Group">
+  <meta property="og:title" content="Vett · Data Clean Proxy">
+  <meta property="og:description" content="Data cleaning proxy sandbox — upload a file, validate and clean rows, download the result.">
+  <meta property="og:url" content="https://prod-vett-web.onrender.com/">
+  <meta name="twitter:title" content="Vett · Data Clean Proxy">
+  <meta name="twitter:description" content="Data cleaning proxy sandbox — upload a file, validate and clean rows, download the result.">
   <meta name="theme-color" content="#07070a">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%2307070a'/%3E%3Cpath d='M7 12l3.2 3.2L17 8' stroke='%23f59e0b' stroke-width='2.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 
@@ -178,7 +186,7 @@
 
   <!-- ── Breadcrumb / Backlink ──────────────────────────────────────────── -->
   <div class="flex items-center gap-2 text-xs font-mono text-dim">
-    <a href="https://dodman-digital.onrender.com/" class="flex items-center gap-1.5 hover:text-amber-400 transition-colors duration-150">
+    <a href="https://digital.dodman.group/" class="flex items-center gap-1.5 hover:text-amber-400 transition-colors duration-150">
       <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
       </svg>
@@ -424,7 +432,7 @@
   <!-- ── Footer ─────────────────────────────────────────────────────────── -->
   <footer class="text-center text-xs text-muted font-mono py-4 space-y-1">
     <p>
-      <a href="https://dodman-digital.onrender.com/" style="color:#a1a1aa;text-decoration:none;">← Back to Dodman Digital</a>
+      <a href="https://digital.dodman.group/" style="color:#a1a1aa;text-decoration:none;">← Back to Dodman Digital</a>
       <span class="text-border mx-1">·</span>
       <a href="https://dodman.group" target="_blank" style="color:#6b6b7a;text-decoration:none;">Dodman Group</a>
     </p>
@@ -521,8 +529,7 @@ const RULE_GROUPS = [
 ];
 
 // FastAPI backend
-// const ENDPOINT = 'http://127.0.0.1:8000/api/v1/clean';
-const ENDPOINT = 'https://dev-vett.onrender.com/api/v1/clean';
+const ENDPOINT = 'https://prod-vett.onrender.com/api/v1/clean';
 
 // ─── Element refs ────────────────────────────────────────────────────────────
 const dropZone       = document.getElementById('drop-zone');
