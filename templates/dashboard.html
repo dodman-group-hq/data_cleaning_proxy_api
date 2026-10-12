@@ -368,41 +368,63 @@
       <!-- ── Pricing plans ── -->
       {% if sub_status not in ('active',) %}
       <div style="padding:20px;border-bottom:1px solid #232329;">
-        <p style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6b7a;margin-bottom:14px;">Choose a Plan</p>
+        <p style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6b7a;margin-bottom:6px;">Choose a Plan</p>
+        <p style="font-size:11px;color:#6b6b7a;margin-bottom:14px;">Billed monthly in US dollars. You can change or cancel from this tab.</p>
         <div style="display:flex;gap:12px;flex-wrap:wrap;">
 
           <!-- Starter -->
-          <div class="plan-card featured" style="flex:1;min-width:220px;">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <div class="plan-card" style="flex:1;min-width:240px;">
+            <div style="margin-bottom:12px;">
               <span style="font-family:Syne,sans-serif;font-weight:700;font-size:15px;color:#fff;">Starter</span>
-              <span class="badge" style="background:rgba(16,185,129,.1);color:#10b981;border-color:rgba(16,185,129,.25);">Popular</span>
+              <p style="font-size:11px;color:#6b6b7a;margin-top:2px;">For small teams and side projects</p>
             </div>
-            <ul style="list-style:none;font-size:11px;color:#9a9aaa;space-y:4px;margin-bottom:16px;line-height:1.8;">
-              <li>✓ dk_live_ key access</li>
-              <li>✓ 500 requests / hour</li>
-              <li>✓ Full file processing</li>
-              <li>✓ Billing ledger</li>
-              <li>✓ Invoice emails</li>
+            <p style="font-family:Syne,sans-serif;font-weight:800;font-size:28px;color:#fff;margin-bottom:12px;">{{ price_starter | default('$19') }}<span style="font-size:12px;font-weight:400;color:#6b6b7a;"> / month</span></p>
+            <ul style="list-style:none;font-size:11px;color:#9a9aaa;margin-bottom:16px;line-height:1.8;">
+              <li>✓ 500,000 rows per month</li>
+              <li>✓ 1 live API key (dk_live_)</li>
+              <li>✓ Sync and webhook delivery</li>
+              <li>✓ Deduplication on files up to 10,000 rows</li>
+              <li>✓ Files up to 50 MB</li>
+              <li>✓ 500 requests per hour</li>
+              <li>✓ Usage ledger and invoice emails</li>
             </ul>
-            <button class="btn btn-emerald" style="width:100%;" onclick="startSubscription('starter')">Subscribe — Starter</button>
+            <button class="btn btn-emerald" style="width:100%;" onclick="startSubscription('starter')">Subscribe to Starter</button>
           </div>
 
           <!-- Pro -->
-          <div class="plan-card" style="flex:1;min-width:220px;">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <div class="plan-card featured" style="flex:1;min-width:240px;">
+            <div style="margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;">
               <span style="font-family:Syne,sans-serif;font-weight:700;font-size:15px;color:#fff;">Pro</span>
+              <span class="badge" style="background:rgba(16,185,129,.1);color:#10b981;border-color:rgba(16,185,129,.25);">For production</span>
             </div>
-            <ul style="list-style:none;font-size:11px;color:#9a9aaa;space-y:4px;margin-bottom:16px;line-height:1.8;">
-              <li>✓ Everything in Starter</li>
-              <li>✓ Unlimited requests</li>
-              <li>✓ Priority support</li>
-              <li>✓ Webhook delivery</li>
-              <li>✓ Advanced telemetry</li>
+            <p style="font-family:Syne,sans-serif;font-weight:800;font-size:28px;color:#fff;margin-bottom:12px;">{{ price_pro | default('$60') }}<span style="font-size:12px;font-weight:400;color:#6b6b7a;"> / month</span></p>
+            <ul style="list-style:none;font-size:11px;color:#9a9aaa;margin-bottom:16px;line-height:1.8;">
+              <li>✓ Everything in Starter, plus:</li>
+              <li>✓ 5,000,000 rows per month</li>
+              <li>✓ Up to 5 live API keys</li>
+              <li>✓ Deduplication on files of any size</li>
+              <li>✓ Files up to 500 MB</li>
+              <li>✓ ENCRYPT rule (salted one-way SHA-256 hash)</li>
+              <li>✓ Priority rate limits (500 requests per minute burst)</li>
             </ul>
-            <button class="btn btn-emerald" style="width:100%;background:#6b6b7a;" onmouseover="this.style.background='#9a9aaa'" onmouseout="this.style.background='#6b6b7a'" onclick="startSubscription('pro')">Subscribe — Pro</button>
+            <button class="btn btn-emerald" style="width:100%;" onclick="startSubscription('pro')">Subscribe to Pro</button>
           </div>
         </div>
+        <p style="font-size:11px;color:#6b6b7a;margin-top:12px;">Need higher volumes or an SLA? <a href="mailto:inquiries@dodman.group?subject=Vett%20Enterprise" style="color:#10b981;">Talk to us</a>.</p>
         <div id="subscribe-result" style="display:none;margin-top:14px;padding:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:6px;font-size:12px;color:#10b981;"></div>
+      </div>
+      {% endif %}
+
+      {% if sub_status == 'active' and sub_plan == 'starter' %}
+      <div style="padding:20px;border-bottom:1px solid #232329;">
+        <p style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6b7a;margin-bottom:12px;">What Pro adds</p>
+        <ul style="list-style:none;font-size:12px;color:#9a9aaa;line-height:1.9;margin-bottom:14px;">
+          <li>✓ 10 times the monthly rows (5,000,000)</li>
+          <li>✓ Up to 5 live API keys</li>
+          <li>✓ Deduplication on files of any size, and files up to 500 MB</li>
+          <li>✓ The ENCRYPT rule for sensitive columns</li>
+        </ul>
+        <button class="btn btn-emerald" onclick="changePlan('pro')">Upgrade to Pro, {{ price_pro | default('$60') }} / month</button>
       </div>
       {% endif %}
 

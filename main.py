@@ -2501,6 +2501,13 @@ async def data_cleaner_page(
         context={"user": current_user},
     )
 
+@dash_router.get("/billing", include_in_schema=False)
+async def billing_redirect(status: str = ""):
+    # The billing package and several API error messages point here.
+    # dashboard.html reads ?billing= (success | failed) and opens the Billing tab.
+    alert = {"success": "success", "failed": "failed", "error": "failed"}.get(status, "view")
+    return RedirectResponse(url=f"/dashboard/?billing={alert}", status_code=303)
+
 
 # ===========================================================================
 # Parsing helpers
